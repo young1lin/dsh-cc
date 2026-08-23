@@ -1,0 +1,5 @@
+# Lab-only overlay: bind the webserver away from the real GUI instance.
+- id: webserver
+  config:
+    host: 127.0.0.1
+    port: 3081

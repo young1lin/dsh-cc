@@ -1,0 +1,21 @@
+# dsh-cc bundle layer: inserts the Claude Code bridge into the profile tree.
+# The browser half needs no row: the client-modules scan discovers it through
+# the package.json "dsh.client" declaration automatically.
+#
+# Config defaults live in the plugin schema; override any subset here, e.g.:
+#
+# - id: dsh-cc
+#   config:
+#     model: claude-sonnet-4-5
+#     permissionMode: acceptEdits
+#     env:
+#       HTTPS_PROXY: http://127.0.0.1:7890
+#       ANTHROPIC_BASE_URL: https://api.example.com
+#       ANTHROPIC_AUTH_TOKEN: sk-xxx
+#
+# NOTE: an id-targeted patch replaces the WHOLE config — restate every field
+# you care about, not only the ones you change.
+
+- insert:
+    - id: dsh-cc
+      name: dsh-cc
