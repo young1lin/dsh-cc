@@ -1,17 +1,21 @@
 /**
- * dsh-cc browser half: registers one sidebar footer action as its mount
- * point, but renders the launcher as a fixed vertical dock on the right
- * screen edge. Everything portals into document.body (light DOM) with the
- * plugin stylesheet injected once, so the host markdown styles apply inside
- * the transcript. Product copy is Chinese; comments are English.
+ * dsh-cc browser half: one entry in the host frame's `shell.overlay` layer.
+ *
+ * That layer is absolutely positioned over every column, click-through by
+ * default, with each entry opting back into pointer events — so the launcher
+ * dock and the full-bleed Claude Code surface both live there and neither
+ * needs a portal or a z-index of its own. Rendering inside the host frame is
+ * also what makes the host theme tokens apply without a bridge.
+ *
+ * Product copy is Chinese; comments are English.
  *
  * @module dsh-cc/client
  */
 
 import { useEffect, useState, type ReactElement } from 'react'
-import { createPortal } from 'react-dom'
 import { CcApp } from './App.tsx'
-import { CSS, injectOnce } from './styles.ts'
+import { mountCss } from './css.ts'
+import './theme.ts'
 
 /** The slice of the client context this plugin touches. */
 interface ApplyContext {
@@ -24,7 +28,7 @@ interface ApplyContext {
 /** Required client services. */
 export const inject: string[] = ['slots']
 
-/** The terminal glyph used by the dock launcher. */
+/** The terminal glyph the dock is marked with. */
 function TerminalIcon(): ReactElement {
   return (
     <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true" style={{ flexShrink: 0 }}>
@@ -36,54 +40,35 @@ function TerminalIcon(): ReactElement {
 }
 
 /**
- * The slot occupant: renders nothing in the sidebar; instead it portals the
- * right-edge dock and overlay into document.body. The dock hides while the
- * overlay is open.
+ * The slot occupant: the right-edge dock, replaced by the full surface while
+ * open. Escape is owned by the surface itself, so a dialog inside it consumes
+ * the key first instead of the whole surface closing under an open dialog.
  *
- * @returns the portal node.
+ * @returns the dock or the open surface.
  */
-function DockHost(): ReactElement {
+function ClaudeCodeLayer(): ReactElement {
   const [open, setOpen] = useState(false)
 
   useEffect(() => {
-    injectOnce('dsh-cc-styles', CSS)
+    mountCss()
   }, [])
 
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') setOpen(false)
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [])
-
-  return createPortal(
-    <>
-      {!open && (
-        <button
-          type="button"
-          className="cc-dock"
-          title="打开 Claude Code"
-          onClick={() => setOpen(true)}
-        >
-          <TerminalIcon />
-          <span className="cc-dock-label">Claude Code</span>
-        </button>
-      )}
-      {open && <CcApp onClose={() => setOpen(false)} />}
-    </>,
-    document.body,
+  if (open) return <CcApp onClose={() => setOpen(false)} />
+  return (
+    <button type="button" className="cc-dock" title="打开 Claude Code" onClick={() => setOpen(true)}>
+      <TerminalIcon />
+      <span className="cc-dock-label">Claude Code</span>
+    </button>
   )
 }
 
 /**
- * Client plugin body: register the footer action as the mount point; the
- * component renders only the always-on right-edge dock host.
+ * Client plugin body: contribute one entry to the frame-wide overlay layer.
  * @param ctx - client root context.
  */
 export function apply(ctx: ApplyContext): void {
-  ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register(
-    { name: 'sidebar.footer.action', id: 'claude-code', order: 20 },
-    DockHost,
+  ctx.slots.inject('shell.overlay', () => ctx.slots.register(
+    { name: 'shell.overlay', id: 'claude-code' },
+    ClaudeCodeLayer,
   ))
 }
