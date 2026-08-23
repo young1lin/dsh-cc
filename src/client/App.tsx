@@ -185,8 +185,13 @@ export function CcApp(props: { onClose(): void }): ReactElement {
       if (dialogOpen) return
       props.onClose()
     }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    // Capture phase, deliberately: a dialog closes itself from a `document`
+    // bubble listener, and React flushes that state update at the microtask
+    // checkpoint BETWEEN the two listeners — re-registering this one with
+    // `dialogOpen` already false, which then closed the surface too. Capture
+    // runs before any of that, while the dialog is still open.
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
   }, [dialogOpen, props.onClose])
 
   const decide = (requestId: string, answer: PermissionAnswer): void => {
