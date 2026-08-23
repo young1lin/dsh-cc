@@ -16,7 +16,7 @@ import type { ResolvedConfig } from './config.ts'
 import { SessionEngine, type EngineHooks } from './engine.ts'
 import { SessionStore } from './store.ts'
 import type {
-  CcEvent, CcEventInput, CcSettings, ConfigSummary, DirListing, WireMessage,
+  CcEvent, CcEventInput, CcSettings, ConfigLayer, ConfigSummary, DirListing, EffectiveEnvEntry, WireMessage,
 } from './types.ts'
 
 const MAX_BODY_BYTES = 1024 * 1024
@@ -453,7 +453,7 @@ export class CcRuntime {
       defaultCwd: this.baseConfig.cwd,
       model: effective.model,
       permissionMode: effective.permissionMode,
-      envKeys: Object.keys(effective.env).sort(),
+      env: effectiveEnvEntries(this.baseConfig.env, this.settings.env),
       liveSessions: this.engines.size,
       sdkVersion: this.sdkVersion,
     }
@@ -594,4 +594,43 @@ function readSdkVersion(): string {
   } catch {
     return ''
   }
+}
+
+/** Keys whose values are credentials; the page only ever sees them masked. */
+const SECRET_KEY = /(TOKEN|KEY|SECRET|PASSWORD|COOKIE)$/i
+
+/**
+ * Project the environment layered onto the claude process, recording which
+ * layer supplied each winning value so the page can show where a setting
+ * actually comes from. Secret values are masked here — the raw value never
+ * leaves the host.
+ * @param plugin - the cordis plugin config env.
+ * @param settings - the page-editable settings env, which replaces it when non-empty.
+ * @returns one entry per variable, sorted by key.
+ */
+function effectiveEnvEntries(
+  plugin: Record<string, string>,
+  settings: Record<string, string>,
+): EffectiveEnvEntry[] {
+  const winner = new Map<string, { value: string; layer: ConfigLayer }>()
+  for (const [key, value] of Object.entries(plugin)) winner.set(key, { value, layer: 'plugin' })
+  if (Object.keys(settings).length > 0) {
+    winner.clear()
+    for (const [key, value] of Object.entries(settings)) winner.set(key, { value, layer: 'settings' })
+  }
+  return [...winner.entries()]
+    .map(([key, { value, layer }]) => SECRET_KEY.test(key)
+      ? { key, value: maskSecret(value), masked: true, layer }
+      : { key, value, masked: false, layer })
+    .sort((left, right) => left.key.localeCompare(right.key))
+}
+
+/**
+ * Mask a credential down to a recognizable stub.
+ * @param value - the raw secret.
+ * @returns the masked form, e.g. `90cd…4e83`.
+ */
+function maskSecret(value: string): string {
+  if (value.length <= 8) return '••••'
+  return `${value.slice(0, 4)}…${value.slice(-4)}`
 }

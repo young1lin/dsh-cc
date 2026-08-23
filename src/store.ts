@@ -99,6 +99,7 @@ export class SessionStore {
       model,
       createdAt: now,
       updatedAt: now,
+      origin: 'dsh-cc',
       status: 'idle',
       messageCount: 0,
       totalCostUsd: 0,
