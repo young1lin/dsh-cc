@@ -119,9 +119,12 @@ export function CcApp(props: { onClose(): void }): ReactElement {
    * mid-turn (selection, reload, reconnect gap) catches up without ever
    * regressing a turn it has been watching all along.
    * @param sessionId - the session the snapshot belongs to.
-   * @param snapshot - the server fold with its delta counter.
+   * @param snapshot - the server fold with its delta counter; an old server
+   *   half serves no `live` field at all, which degrades to a no-op rather
+   *   than a crash (a rebuilt client can briefly outlive its server process).
    */
-  const applyLiveSnapshot = (sessionId: string, snapshot: LiveTurnSnapshot): void => {
+  const applyLiveSnapshot = (sessionId: string, snapshot: LiveTurnSnapshot | undefined): void => {
+    if (snapshot === undefined || typeof snapshot.seq !== 'number') return
     if (snapshot.seq < (liveSeqsRef.current[sessionId] ?? 0)) return
     liveSeqsRef.current[sessionId] = snapshot.seq
     setLiveBySession(previous => ({ ...previous, [sessionId]: { seq: snapshot.seq, turn: snapshot.turn ?? undefined } }))
@@ -251,15 +254,19 @@ export function CcApp(props: { onClose(): void }): ReactElement {
         case 'delta': {
           const { sessionId, seq } = message
           const last = liveSeqsRef.current[sessionId] ?? 0
-          liveSeqsRef.current[sessionId] = seq
-          // A counter jump means frames were lost on the way here; fold what
-          // arrives, but line the session up for a server-fold catch-up.
-          if (last > 0 && seq > last + 1) scheduleLiveCatchUp(sessionId)
+          // An old server half sends no counter; the fold still works, only
+          // the reconcile bookkeeping stays inert until an upgrade.
+          if (typeof seq === 'number') {
+            liveSeqsRef.current[sessionId] = seq
+            // A counter jump means frames were lost on the way here; fold what
+            // arrives, but line the session up for a server-fold catch-up.
+            if (last > 0 && seq > last + 1) scheduleLiveCatchUp(sessionId)
+          }
           // No currency filter: background turns fold too, so switching back
           // to them restores the stream instead of losing it.
           setLiveBySession(previous => {
             const turn = reduceDelta(previous[sessionId]?.turn, message.delta)
-            return { ...previous, [sessionId]: { seq, turn } }
+            return { ...previous, [sessionId]: { seq: typeof seq === 'number' ? seq : last, turn } }
           })
           break
         }
