@@ -43,6 +43,47 @@ registerCss('shell', `
 .cc-rail-head { padding: 12px; }
 .cc-rail-list { flex: 1; overflow-y: auto; padding: 0 8px 8px; }
 
+/* A project group: sticky header so the directory stays visible while its
+   sessions scroll under it. Sits above the (positioned) rows. */
+.cc-group-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 6px 4px;
+  border: none;
+  background: var(--dsw-specific-sidebar-fill);
+  color: var(--dsw-alias-label-tertiary);
+  font: var(--dsw-font-xxs-12);
+  cursor: pointer;
+  user-select: none;
+}
+
+.cc-group-head:hover { color: var(--dsw-alias-label-secondary); }
+
+.cc-group-caret {
+  flex: none;
+  width: 12px;
+  text-align: center;
+  transition: transform var(--ds-transition-duration-fast) var(--ds-ease-in-out);
+}
+
+.cc-group-head[data-open='false'] .cc-group-caret { transform: rotate(-90deg); }
+
+.cc-group-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+
+.cc-group-count { flex: none; font: var(--dsw-font-xxs-12); opacity: 0.7; }
+
 .cc-rail-foot {
   display: flex;
   align-items: center;
@@ -254,6 +295,6 @@ registerCss('shell', `
 
 @media (prefers-reduced-motion: reduce) {
   .cc-overlay { animation: none; }
-  .cc-dock, .cc-session, .cc-session-action { transition: none; }
+  .cc-dock, .cc-session, .cc-session-action, .cc-group-caret { transition: none; }
 }
 `)

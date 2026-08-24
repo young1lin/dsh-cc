@@ -5,7 +5,7 @@
  * @module dsh-cc/client/SessionRail
  */
 
-import { useState, type ReactElement } from 'react'
+import { useEffect, useState, type ReactElement } from 'react'
 import { Button, Input, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
 import { DirectoryPicker } from './DirectoryPicker.tsx'
 import { registerCss } from './css.ts'
@@ -29,6 +29,51 @@ const MODEL_CHOICES: { value: string; label: string }[] = [
   { value: 'sonnet', label: 'sonnet' },
   { value: 'haiku', label: 'haiku' },
 ]
+
+/** One project directory and the sessions that ran in it, in list order. */
+interface SessionGroup {
+  cwd: string
+  sessions: SessionMeta[]
+}
+
+/**
+ * Bucket the newest-first session list by project directory.
+ *
+ * The catalog list arrives globally sorted by update time, so taking groups
+ * in first-appearance order makes the most recently used project come first,
+ * and pushing sessions in arrival order keeps each group newest-first too —
+ * no re-sorting anywhere.
+ * @param sessions - the merged catalog list, newest first.
+ * @returns the groups, most recently used first.
+ */
+function groupByProject(sessions: SessionMeta[]): SessionGroup[] {
+  const groups: SessionGroup[] = []
+  const byCwd = new Map<string, SessionGroup>()
+  for (const session of sessions) {
+    const cwd = session.cwd.trim()
+    let group = byCwd.get(cwd)
+    if (group === undefined) {
+      group = { cwd, sessions: [] }
+      byCwd.set(cwd, group)
+      groups.push(group)
+    }
+    group.sessions.push(session)
+  }
+  return groups
+}
+
+/**
+ * Short label for a project group: the directory's final path segment, with
+ * the full path kept on the header's tooltip. Sessions that never ran a turn
+ * carry no cwd and label as unclassified.
+ * @param cwd - the group's working directory, possibly empty.
+ * @returns the label.
+ */
+function groupLabel(cwd: string): string {
+  if (cwd.length === 0) return '未分类'
+  const segments = cwd.split(/[\\/]/).filter(segment => segment.length > 0)
+  return segments[segments.length - 1] ?? cwd
+}
 
 /**
  * Map a session's lifecycle to the host's four-state dot.
@@ -126,6 +171,62 @@ function SessionRow(props: {
       >
         ×
       </button>
+    </div>
+  )
+}
+
+/**
+ * One project directory's collapsible section of the session list.
+ *
+ * Opens by default only when it holds the selected session (or when it is the
+ * most recently used group and nothing is selected), so a long catalog shows
+ * its structure instead of 200 rows. A selection that later moves into the
+ * group — a newly created session, a resume — re-reveals it; a deliberate
+ * manual collapse is still respected until that happens.
+ * @param props - the group, the selected session id, whether the group is the
+ *   default-open one, and the row callbacks.
+ * @returns the section node.
+ */
+function ProjectGroup(props: {
+  group: SessionGroup
+  currentId: string | undefined
+  defaultOpen: boolean
+  onSelect(id: string): void
+  onDelete(id: string): void
+  onRename(id: string, name: string): void
+}): ReactElement {
+  const containsCurrent =
+    props.currentId !== undefined && props.group.sessions.some(session => session.id === props.currentId)
+  const [open, setOpen] = useState(containsCurrent || props.defaultOpen)
+
+  useEffect(() => {
+    if (containsCurrent) setOpen(true)
+  }, [containsCurrent])
+
+  return (
+    <div className="cc-group">
+      <button
+        type="button"
+        className="cc-group-head"
+        data-open={open}
+        title={props.group.cwd.length > 0 ? props.group.cwd : '尚未运行过回合的会话，没有记录工作目录'}
+        aria-expanded={open}
+        onClick={() => setOpen(value => !value)}
+      >
+        <span className="cc-group-caret" aria-hidden>▾</span>
+        <span className="cc-group-name">{groupLabel(props.group.cwd)}</span>
+        <span className="cc-group-count">{props.group.sessions.length}</span>
+      </button>
+      {open && props.group.sessions.map(session => (
+        <SessionRow
+          key={session.id}
+          session={session}
+          active={session.id === props.currentId}
+          onSelect={() => props.onSelect(session.id)}
+          onDelete={() => props.onDelete(session.id)}
+          onRename={name => props.onRename(session.id, name)}
+        />
+      ))}
     </div>
   )
 }
@@ -230,14 +331,15 @@ export function SessionRail(props: {
         />
       )}
       <div className="cc-rail-list">
-        {props.sessions.map(session => (
-          <SessionRow
-            key={session.id}
-            session={session}
-            active={session.id === props.currentId}
-            onSelect={() => props.onSelect(session.id)}
-            onDelete={() => props.onDelete(session.id)}
-            onRename={name => props.onRename(session.id, name)}
+        {groupByProject(props.sessions).map((group, index) => (
+          <ProjectGroup
+            key={group.cwd}
+            group={group}
+            currentId={props.currentId}
+            defaultOpen={index === 0}
+            onSelect={props.onSelect}
+            onDelete={props.onDelete}
+            onRename={props.onRename}
           />
         ))}
         {props.sessions.length === 0 && !creating && <div className="cc-empty">暂无会话</div>}
