@@ -457,7 +457,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                 </div>
                 <Composer
                   busy={current.status === 'busy'}
-                  foreignBusy={current.status === 'busy' && current.origin === 'cli'}
+                  readOnly={current.terminalOwned === true}
                   onSend={(text, images) => {
                     sendMessage(current.id, text, images).catch(fail)
                   }}

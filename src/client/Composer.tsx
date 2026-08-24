@@ -95,15 +95,15 @@ const EXTENSIONS: Record<ImageRef['mediaType'], string> = {
 
 /**
  * Render the composer.
- * @param props - busy state plus send and interrupt callbacks. `foreignBusy`
- *   marks a turn another client — a terminal CLI — owns: the box turns
- *   read-only with a reason, because no stop signal of ours can reach that
- *   process and a second writer would interleave with it.
+ * @param props - busy state plus send and interrupt callbacks. `readOnly`
+ *   marks a session a live CLI process holds open: the box turns read-only
+ *   with a reason, because that process is a concurrent writer and no stop
+ *   signal of ours can reach its turn.
  * @returns the composer node.
  */
 export function Composer(props: {
   busy: boolean
-  foreignBusy?: boolean
+  readOnly?: boolean
   onSend(text: string, images: ImageRef[]): void
   onStop(): void
 }): ReactElement {
@@ -116,7 +116,7 @@ export function Composer(props: {
   const empty = value.trim().length === 0 && images.length === 0
 
   const submit = (): void => {
-    if (empty || uploading > 0 || props.foreignBusy === true) return
+    if (empty || uploading > 0 || props.readOnly === true) return
     setValue('')
     setImages([])
     props.onSend(value.trim(), images)
@@ -195,9 +195,9 @@ export function Composer(props: {
           className="cc-input"
           rows={1}
           value={value}
-          readOnly={props.foreignBusy === true}
-          placeholder={props.foreignBusy === true
-            ? '这个会话正在终端里运行，此处只读镜像；回合结束后即可在这里继续'
+          readOnly={props.readOnly === true}
+          placeholder={props.readOnly === true
+            ? '这个会话正被一个终端进程使用（claude ps 可见），此处只读镜像'
             : props.busy
               ? '正在工作中，消息会排队发出…'
               : '向 Claude Code 发送消息，Enter 发送，Shift+Enter 换行，可粘贴或拖入图片'}
@@ -211,7 +211,7 @@ export function Composer(props: {
             }
           }}
         />
-        {props.busy && props.foreignBusy === true
+        {props.busy && props.readOnly === true
           ? <Button size="sm" icon={<IconStopFill16 />} disabled title="回合属于另一个客户端（终端），网页无法中断它">停止</Button>
           : props.busy
             ? <Button size="sm" icon={<IconStopFill16 />} onClick={props.onStop}>停止</Button>

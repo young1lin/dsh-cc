@@ -143,6 +143,7 @@ function SessionRow(props: {
       tabIndex={0}
       className="cc-session"
       data-active={props.active}
+      title={props.session.terminalOwned === true ? '正由终端进程使用，网页端只读' : undefined}
       onClick={props.onSelect}
       onKeyDown={event => {
         if (event.key === 'Enter') props.onSelect()
