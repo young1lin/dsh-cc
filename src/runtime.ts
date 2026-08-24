@@ -495,11 +495,19 @@ export class CcRuntime {
       attachments.push({ mediaType: image.mediaType, data: bytes.toString('base64') })
     }
     let engine = this.engines.get(id)
+    const base = this.effectiveConfig()
+    const merged = Object.keys(session.env ?? {}).length > 0
+      ? { ...base, env: { ...base.env, ...session.env } }
+      : base
+    // Environment is spawn-time: an engine that outlived a session-env edit
+    // (the save happened mid-turn, when recycling a busy engine would have
+    // killed the turn) must not serve the next message from the stale layer.
+    if (engine !== undefined && !engine.isClosed && !engine.busy
+      && JSON.stringify(engine.spawnEnv) !== JSON.stringify(merged.env)) {
+      await this.closeEngine(id)
+      engine = undefined
+    }
     if (!engine || engine.isClosed) {
-      const base = this.effectiveConfig()
-      const merged = Object.keys(session.env ?? {}).length > 0
-        ? { ...base, env: { ...base.env, ...session.env } }
-        : base
       engine = new SessionEngine(
         { sessionId: id, cwd: session.cwd, model: session.model, claudeSessionId: session.claudeSessionId },
         merged,

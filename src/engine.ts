@@ -161,6 +161,16 @@ export class SessionEngine {
     return this.closed
   }
 
+  /**
+   * The environment layer this engine's process was spawned with. Environment
+   * is spawn-time only, so the host compares this against the session's
+   * current layer on send and recycles a stale idle engine instead of reusing
+   * it — the case the save-time recycler misses when the turn was running.
+   */
+  get spawnEnv(): Readonly<Record<string, string>> {
+    return this.config.env
+  }
+
   constructor(
     private readonly startSpec: EngineStart,
     private readonly config: ResolvedConfig,
