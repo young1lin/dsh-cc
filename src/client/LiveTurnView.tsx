@@ -11,7 +11,7 @@
 
 import type { ReactElement } from 'react'
 import { registerCss } from './css.ts'
-import type { LiveTurn } from './stream.ts'
+import type { LiveTurn } from '../live-turn.ts'
 
 registerCss('live-turn', `
 .cc-live { display: flex; flex-direction: column; gap: 8px; }

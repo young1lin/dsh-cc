@@ -1,46 +1,35 @@
 /**
  * Fold the live {@link StreamDelta} frames of one in-flight assistant turn
- * into renderable blocks, so the page shows text as the model writes it
+ * into renderable blocks, so a surface shows text as the model writes it
  * instead of waiting for the whole message.
+ *
+ * Both halves fold with this one reducer: the node half keeps the folded turn
+ * per session so a page that joins mid-turn (or switches away and back) can be
+ * handed the in-flight state, and the browser half folds incoming frames into
+ * its per-session map. One reducer guarantees the two never disagree about
+ * what a frame sequence means.
  *
  * Live blocks are display state only: nothing here is persisted, and every
  * block is superseded by the committed transcript event that follows it. The
- * surface drops the whole live turn the moment a committed event arrives,
- * which is what keeps a streamed block from rendering twice.
+ * surface drops the whole live turn once the turn's result commits, which is
+ * what keeps a streamed block from rendering twice.
  *
- * @module dsh-cc/client/stream
+ * @module dsh-cc/live-turn
  */
 
-import type { StreamDelta } from '../types.ts'
+import type { LiveBlock, LiveTurn, StreamDelta } from './types.ts'
 
-/** One content block of the in-flight turn, accumulated from its deltas. */
-export interface LiveBlock {
-  index: number
-  type: 'text' | 'thinking' | 'tool_use'
-  /** Accumulated text; empty for a tool block, whose arguments stay unparsed. */
-  text: string
-  toolName?: string
-  toolUseId?: string
-  /** True once the block's `block-stop` arrived. */
-  closed: boolean
-}
-
-/** The assistant turn currently being written. */
-export interface LiveTurn {
-  messageId: string
-  /** Milliseconds from request to first token, when the CLI reported it. */
-  ttftMs?: number
-  blocks: LiveBlock[]
-  /** True once `turn-stop` arrived; the turn stays visible until it commits. */
-  stopped: boolean
-}
+export type { LiveBlock, LiveTurn }
 
 /**
  * Apply one delta frame to the live turn.
  *
  * Frames for a block that never opened are ignored rather than synthesising a
- * block: the SSE stream can be joined mid-turn by a page that connects late,
- * and a half-block rendered without its type reads as corruption.
+ * block: a consumer can join the frame stream mid-block (a page that connects
+ * late, or a reconnect that missed the opening), and a half-block rendered
+ * without its type reads as corruption. The server-side fold never joins
+ * mid-block — it sees every frame from the engine — so its snapshot is the
+ * repair path for a consumer with holes.
  *
  * @param turn - the current live turn, or undefined before one starts.
  * @param delta - the incoming frame.

@@ -53,8 +53,8 @@ const fakeCtx = {
 plugin.apply(fakeCtx)
 console.log('registrations:', JSON.stringify(registrations))
 const expected = JSON.stringify([
-  ['inject', 'sidebar.footer.action'],
-  ['register', 'sidebar.footer.action', 'claude-code', 'function'],
+  ['inject', 'shell.overlay'],
+  ['register', 'shell.overlay', 'claude-code', 'function'],
   ['registered', 'function'],
 ])
 if (JSON.stringify(registrations) !== expected) {

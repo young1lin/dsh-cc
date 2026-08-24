@@ -20,7 +20,7 @@ import { PermissionCard, QuestionCard } from './Interaction.tsx'
 import { SessionRail } from './SessionRail.tsx'
 import { StatusBar } from './StatusBar.tsx'
 import { LiveTurnView } from './LiveTurnView.tsx'
-import { reduceDelta, type LiveTurn } from './stream.ts'
+import { reduceDelta, type LiveTurn } from '../live-turn.ts'
 import { Transcript } from './Transcript.tsx'
 import { SettingsModal } from './settings/SettingsModal.tsx'
 import { SessionEnvModal } from './settings/SessionEnvModal.tsx'
@@ -31,7 +31,9 @@ import {
 } from './api/sessions.ts'
 import { fetchConfig } from './api/settings.ts'
 import { fetchContext, fetchUsage, type ContextUsage, type UsageInfo } from './api/telemetry.ts'
-import type { CcEvent, ConfigSummary, PermissionAnswer, PermissionRequest, SessionMeta } from '../types.ts'
+import type {
+  CcEvent, ConfigSummary, LiveTurnSnapshot, PermissionAnswer, PermissionRequest, SessionMeta,
+} from '../types.ts'
 
 /** One pending permission request, tagged with the session it belongs to. */
 interface PendingPermission {
@@ -44,6 +46,12 @@ interface PendingDialog {
   sessionId: string
   id: string
   payload: Record<string, unknown>
+}
+
+/** One session's folded live turn plus the delta counter it was folded to. */
+interface LiveEntry {
+  seq: number
+  turn: LiveTurn | undefined
 }
 
 /**
@@ -60,13 +68,24 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   const [context, setContext] = useState<ContextUsage | undefined>()
   const [permissions, setPermissions] = useState<PendingPermission[]>([])
   const [dialogs, setDialogs] = useState<PendingDialog[]>([])
-  const [live, setLive] = useState<LiveTurn | undefined>()
+  /**
+   * The in-flight turn of EVERY session, not just the selected one: a turn
+   * keeps streaming while its session is in the background, and switching
+   * back must restore it rather than restart the view from scratch.
+   */
+  const [liveBySession, setLiveBySession] = useState<Record<string, LiveEntry>>({})
   const [connected, setConnected] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [envSessionId, setEnvSessionId] = useState<string | undefined>()
   const [error, setError] = useState<string | undefined>()
   const currentIdRef = useRef(currentId)
   const scrollRef = useRef<HTMLDivElement>(null)
+  /** Last delta counter folded per session; the ref mirror survives renders. */
+  const liveSeqsRef = useRef<Record<string, number>>({})
+  /** Sessions whose server fold needs re-fetching after a frame gap. */
+  const liveGapPending = useRef<Set<string>>(new Set())
+  /** Debounce for that re-fetch, so one reconnect costs one request. */
+  const liveGapTimer = useRef<ReturnType<typeof setTimeout>>(undefined)
   /** Last native-session update mirrored into the page, per session. */
   const foreignSync = useRef<{ id: string; updatedAt: string } | undefined>(undefined)
   /** Debounce for that mirror, so a burst of frames collapses into one read. */
@@ -74,6 +93,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
 
   const current = sessions.find(session => session.id === currentId)
   const dialogOpen = showSettings || envSessionId !== undefined
+  const live = currentId !== undefined ? liveBySession[currentId]?.turn : undefined
 
   const fail = (cause: unknown): void => {
     setError(cause instanceof Error ? cause.message : String(cause))
@@ -82,6 +102,53 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   useEffect(() => {
     currentIdRef.current = currentId
   }, [currentId])
+
+  /** Remove one session's folded turn; its result committed or it errored. */
+  const dropLive = (sessionId: string): void => {
+    setLiveBySession(previous => {
+      if (!(sessionId in previous)) return previous
+      const next = { ...previous }
+      delete next[sessionId]
+      return next
+    })
+  }
+
+  /**
+   * Adopt the server's folded turn for one session when it is not behind the
+   * frames already folded locally — the snapshot is how a page that joins
+   * mid-turn (selection, reload, reconnect gap) catches up without ever
+   * regressing a turn it has been watching all along.
+   * @param sessionId - the session the snapshot belongs to.
+   * @param snapshot - the server fold with its delta counter.
+   */
+  const applyLiveSnapshot = (sessionId: string, snapshot: LiveTurnSnapshot): void => {
+    if (snapshot.seq < (liveSeqsRef.current[sessionId] ?? 0)) return
+    liveSeqsRef.current[sessionId] = snapshot.seq
+    setLiveBySession(previous => ({ ...previous, [sessionId]: { seq: snapshot.seq, turn: snapshot.turn ?? undefined } }))
+  }
+
+  /**
+   * Re-fetch the server fold for sessions whose frame stream jumped — the
+   * local fold has holes the reducer will not fill on its own. Debounced so
+   * one reconnect costs one request, not one per missed frame.
+   * @param sessionId - the session whose stream showed a counter gap.
+   */
+  const scheduleLiveCatchUp = (sessionId: string): void => {
+    if (liveGapPending.current.has(sessionId)) return
+    liveGapPending.current.add(sessionId)
+    clearTimeout(liveGapTimer.current)
+    liveGapTimer.current = setTimeout(() => {
+      const ids = [...liveGapPending.current]
+      liveGapPending.current.clear()
+      for (const id of ids) {
+        fetchSession(id)
+          .then(result => applyLiveSnapshot(id, result.live))
+          .catch(() => {
+            // Best effort; the next gap (or the next selection) retries.
+          })
+      }
+    }, 250)
+  }
 
   /**
    * Refresh the telemetry snapshots for one session.
@@ -123,6 +190,23 @@ export function CcApp(props: { onClose(): void }): ReactElement {
           break
         case 'sessions': {
           setSessions(message.sessions)
+          // A live entry whose session is no longer busy belongs to a turn
+          // that finished while its result frame was missed (an SSE
+          // reconnect); the committed transcript carries the content now.
+          const busy = new Set(message.sessions
+            .filter(session => session.status === 'busy')
+            .map(session => session.id))
+          setLiveBySession(previous => {
+            let changed = false
+            const next = { ...previous }
+            for (const id of Object.keys(next)) {
+              if (!busy.has(id)) {
+                delete next[id]
+                changed = true
+              }
+            }
+            return changed ? next : previous
+          })
           // A native session whose transcript advances with no engine of ours
           // is being driven from a terminal CLI; mirror its new events into
           // the open page. Web-owned sessions already stream through 'event'
@@ -149,22 +233,36 @@ export function CcApp(props: { onClose(): void }): ReactElement {
           break
         }
         case 'event':
+          // The turn's own end retires its live tail in every session, watched
+          // or not — a background entry would otherwise ghost-render when the
+          // user switches to it. Within a turn nothing is cleared: blocks
+          // commit one at a time (the thinking event lands while the text
+          // block is still streaming), and a block already committed is
+          // hidden by its `closed` flag instead.
+          if (message.event.kind === 'result' || message.event.kind === 'error') {
+            dropLive(message.sessionId)
+          }
           if (message.sessionId !== currentIdRef.current) break
           setEvents(previous => [...previous, message.event])
-          // Only the turn's own end clears the live tail. Blocks commit one at
-          // a time WITHIN a turn — the thinking event lands while the text
-          // block is still streaming — so clearing on every committed event
-          // would drop the rest of the turn. A block that has already been
-          // committed is hidden by its `closed` flag instead.
           if (message.event.kind === 'result') {
-            setLive(undefined)
             refreshTelemetry(currentIdRef.current)
           }
           break
-        case 'delta':
-          if (message.sessionId !== currentIdRef.current) break
-          setLive(previous => reduceDelta(previous, message.delta))
+        case 'delta': {
+          const { sessionId, seq } = message
+          const last = liveSeqsRef.current[sessionId] ?? 0
+          liveSeqsRef.current[sessionId] = seq
+          // A counter jump means frames were lost on the way here; fold what
+          // arrives, but line the session up for a server-fold catch-up.
+          if (last > 0 && seq > last + 1) scheduleLiveCatchUp(sessionId)
+          // No currency filter: background turns fold too, so switching back
+          // to them restores the stream instead of losing it.
+          setLiveBySession(previous => {
+            const turn = reduceDelta(previous[sessionId]?.turn, message.delta)
+            return { ...previous, [sessionId]: { seq, turn } }
+          })
           break
+        }
         case 'permission':
           setPermissions(previous => [...previous, { sessionId: message.sessionId, request: message.request }])
           break
@@ -191,12 +289,12 @@ export function CcApp(props: { onClose(): void }): ReactElement {
     return () => {
       disposed = true
       clearTimeout(foreignSyncTimer.current)
+      clearTimeout(liveGapTimer.current)
       dispose()
     }
   }, [])
 
   useEffect(() => {
-    setLive(undefined)
     if (currentId === undefined) {
       setEvents([])
       return
@@ -204,7 +302,12 @@ export function CcApp(props: { onClose(): void }): ReactElement {
     let stale = false
     fetchSession(currentId)
       .then(result => {
-        if (!stale) setEvents(result.events)
+        if (stale) return
+        setEvents(result.events)
+        // The selection may land mid-turn (page opened on a running session,
+        // or reloaded): adopt the server's fold unless local frames already
+        // ran ahead of it.
+        applyLiveSnapshot(currentId, result.live)
       })
       .catch(cause => {
         if (!stale) fail(cause)

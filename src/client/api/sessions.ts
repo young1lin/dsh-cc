@@ -5,7 +5,7 @@
  * @module dsh-cc/client/api/sessions
  */
 
-import type { CcEvent, ImageRef, SessionMeta } from '../../types.ts'
+import type { CcEvent, ImageRef, LiveTurnSnapshot, SessionMeta } from '../../types.ts'
 import { api } from './http.ts'
 
 /** GET /sessions — every session the store knows, newest first. */
@@ -14,12 +14,17 @@ export function fetchSessions(): Promise<{ sessions: SessionMeta[] }> {
 }
 
 /**
- * GET /sessions/:id — metadata plus the transcript tail.
+ * GET /sessions/:id — metadata, the transcript tail, and the server's fold of
+ * the in-flight turn (null turn when none is running).
  * @param id - session id.
- * @returns the session and its events.
+ * @returns the session, its events, and its live-turn snapshot.
  */
-export function fetchSession(id: string): Promise<{ session: SessionMeta; events: CcEvent[] }> {
-  return api<{ session: SessionMeta; events: CcEvent[] }>(`/sessions/${id}`)
+export function fetchSession(id: string): Promise<{
+  session: SessionMeta
+  events: CcEvent[]
+  live: LiveTurnSnapshot
+}> {
+  return api<{ session: SessionMeta; events: CcEvent[]; live: LiveTurnSnapshot }>(`/sessions/${id}`)
 }
 
 /**

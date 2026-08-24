@@ -184,7 +184,8 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
  * One incremental piece of a turn, pushed while the model is still writing.
  * Deltas are never persisted: the final `CcEvent` carrying the same content is
  * the authoritative record, and the page drops its delta buffer once that
- * arrives. A page connecting mid-turn simply misses the earlier deltas.
+ * arrives. Deltas ARE folded in memory on both halves, so a page that joins
+ * mid-turn is handed the folded turn instead of missing the earlier frames.
  */
 export type StreamDelta =
   /** A new assistant message began; `messageId` correlates it with the final event. */
@@ -272,12 +273,46 @@ export interface SlashCommand {
   aliases?: string[]
 }
 
+/** One content block of the in-flight turn, accumulated from its deltas. */
+export interface LiveBlock {
+  index: number
+  type: 'text' | 'thinking' | 'tool_use'
+  /** Accumulated text; empty for a tool block, whose arguments stay unparsed. */
+  text: string
+  toolName?: string
+  toolUseId?: string
+  /** True once the block's `block-stop` arrived. */
+  closed: boolean
+}
+
+/** The assistant turn currently being written. */
+export interface LiveTurn {
+  messageId: string
+  /** Milliseconds from request to first token, when the CLI reported it. */
+  ttftMs?: number
+  blocks: LiveBlock[]
+  /** True once `turn-stop` arrived; the turn stays visible until it commits. */
+  stopped: boolean
+}
+
+/**
+ * The folded in-flight turn of one session, as the server hands it to a page
+ * that arrives mid-turn (session fetch) and as the page reconciles against its
+ * own fold.
+ */
+export interface LiveTurnSnapshot {
+  /** Monotonic per-session delta counter at the moment of the snapshot. */
+  seq: number
+  /** The folded turn, or null when no turn is in flight. */
+  turn: LiveTurn | null
+}
+
 /** Server-to-browser push message (the SSE data payload). */
 export type WireMessage =
   | { t: 'hello'; config: ConfigSummary }
   | { t: 'sessions'; sessions: SessionMeta[] }
   | { t: 'event'; sessionId: string; event: CcEvent }
-  | { t: 'delta'; sessionId: string; delta: StreamDelta }
+  | { t: 'delta'; sessionId: string; seq: number; delta: StreamDelta }
   | { t: 'permission'; sessionId: string; request: PermissionRequest }
   | { t: 'permission-done'; sessionId: string; requestId: string; behavior: 'allow' | 'deny' }
   | { t: 'dialog'; sessionId: string; request: { id: string; kind: string; payload: Record<string, unknown> } }

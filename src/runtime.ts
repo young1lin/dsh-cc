@@ -16,11 +16,12 @@ import type { ResolvedConfig } from './config.ts'
 import { SessionEngine, type EngineHooks, type SendImage } from './engine.ts'
 import { BlobStore, isImageMediaType } from './blobs.ts'
 import { SessionCatalog } from './catalog.ts'
+import { reduceDelta, type LiveTurn } from './live-turn.ts'
 import { deleteNativeSession, renameNativeSession } from './native-sessions.ts'
 import { SessionStore } from './store.ts'
 import type {
   AccountSummary, CcEvent, CcEventInput, CcSettings, ConfigLayer, ConfigSummary, DirListing,
-  EffectiveEnvEntry, ImageRef, PermissionDestination, WireMessage,
+  EffectiveEnvEntry, ImageRef, LiveTurnSnapshot, PermissionDestination, WireMessage,
 } from './types.ts'
 import { DEFAULT_EFFORT_LEVELS } from './types.ts'
 
@@ -71,6 +72,18 @@ export class CcRuntime {
   /** Image bytes attached to user messages. */
   private readonly blobs: BlobStore
   private readonly engines = new Map<string, SessionEngine>()
+  /**
+   * The in-flight turn per session, folded from the same deltas the page
+   * receives. This is what a page that arrives mid-turn is handed, so a
+   * session switch (or a reload) never loses the streamed thinking.
+   */
+  private readonly liveTurns = new Map<string, LiveTurn>()
+  /**
+   * Monotonic per-session delta counters. Never reset while the runtime
+   * lives: a page compares its last-seen counter against a snapshot's to know
+   * which side is ahead, and resetting would break that comparison.
+   */
+  private readonly liveSeqs = new Map<string, number>()
   private readonly clients = new Set<ServerResponse>()
   private readonly sdkVersion: string
   private heartbeat: ReturnType<typeof setInterval> | undefined
@@ -263,7 +276,11 @@ export class CcRuntime {
         if (parts.length === 2 && method === 'GET') {
           const session = this.store.get(id) ?? await this.catalog.adopt(id)
           if (!session) return json(res, { error: '会话不存在' }, 404)
-          return json(res, { session, events: await this.catalog.transcript(session) })
+          return json(res, {
+            session,
+            events: await this.catalog.transcript(session),
+            live: this.liveSnapshot(id),
+          })
         }
         if (parts.length === 2 && method === 'DELETE') {
           const session = this.catalog.get(id)
@@ -532,7 +549,15 @@ export class CcRuntime {
         await this.patchMeta(sessionId, patch)
       },
       delta: delta => {
-        this.broadcast({ t: 'delta', sessionId, delta })
+        // Fold first, then broadcast with the fold's sequence number: a page
+        // that fetches the snapshot right after this frame can compare seqs
+        // and keep whichever side is ahead.
+        const seq = (this.liveSeqs.get(sessionId) ?? 0) + 1
+        this.liveSeqs.set(sessionId, seq)
+        const turn = reduceDelta(this.liveTurns.get(sessionId), delta)
+        if (turn === undefined) this.liveTurns.delete(sessionId)
+        else this.liveTurns.set(sessionId, turn)
+        this.broadcast({ t: 'delta', sessionId, seq, delta })
       },
       permissionRequest: request => {
         this.broadcast({ t: 'permission', sessionId, request })
@@ -583,11 +608,24 @@ export class CcRuntime {
   }
 
   private async emitEvent(sessionId: string, input: CcEventInput): Promise<void> {
+    // The turn's own end commits its content, so the folded live turn dies
+    // with it; keeping it would ghost-render beside the committed transcript.
+    if (input.kind === 'result' || input.kind === 'error') this.liveTurns.delete(sessionId)
     const event = { ...input, seq: this.store.nextSeq(sessionId), ts: new Date().toISOString() } as CcEvent
     if (SessionCatalog.persists(this.store.get(sessionId), event)) {
       await this.store.append(sessionId, event)
     }
     this.broadcast({ t: 'event', sessionId, event })
+  }
+
+  /**
+   * The reconcile-ready view of one session's in-flight turn: the fold plus
+   * the delta counter it was taken at.
+   * @param sessionId - the session to snapshot.
+   * @returns the snapshot; seq 0 and a null turn when nothing ever streamed.
+   */
+  private liveSnapshot(sessionId: string): LiveTurnSnapshot {
+    return { seq: this.liveSeqs.get(sessionId) ?? 0, turn: this.liveTurns.get(sessionId) ?? null }
   }
 
   private async patchMeta(sessionId: string, patch: Parameters<SessionStore['update']>[1]): Promise<void> {
@@ -679,6 +717,9 @@ export class CcRuntime {
     const engine = this.engines.get(id)
     if (!engine) return
     this.engines.delete(id)
+    // A closed engine can still be mid-turn (recycling, disposal); its fold
+    // would never be cleared by a result event, so it dies with the engine.
+    this.liveTurns.delete(id)
     await engine.close()
   }
 }
