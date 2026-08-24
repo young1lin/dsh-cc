@@ -158,7 +158,16 @@ export class SessionCatalog {
     if (existing !== undefined) return existing
     const native = this.native.find(meta => meta.id === id)
     if (native === undefined) return undefined
-    return await this.store.adopt({ ...native, claudeSessionId: native.id, origin: 'cli' })
+    // The persisted row must not inherit the native row's live-derived
+    // display state: `terminalOwned` and `status` describe whoever is driving
+    // the session at this instant, and snapshotting them would freeze a
+    // mid-turn writer into the record — a read-only, running-looking row long
+    // after that writer exited. Nothing on this page is driving the session
+    // yet, so the record starts idle and unowned; this page's own engines set
+    // status live through the store as they run turns.
+    const snapshot: SessionMeta = { ...native, status: 'idle', claudeSessionId: native.id, origin: 'cli' }
+    delete snapshot.terminalOwned
+    return await this.store.adopt(snapshot)
   }
 
   /**
@@ -219,4 +228,10 @@ function mergeNativeInto(own: SessionMeta, native: SessionMeta): void {
   if (native.summary !== undefined) own.summary = native.summary
   if (native.gitBranch !== undefined) own.gitBranch = native.gitBranch
   if (native.updatedAt.localeCompare(own.updatedAt) > 0) own.updatedAt = native.updatedAt
+  // A sidecar row is never terminal-owned: this page's own engines register
+  // in the CLI registry under the same session id, so ownership cannot be
+  // told apart for them and must not be claimed. A flag that did get
+  // persisted (an adopt from before this rule) is stale by construction and
+  // is dropped here rather than served forever.
+  own.terminalOwned = false
 }
