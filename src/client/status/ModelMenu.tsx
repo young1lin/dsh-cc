@@ -16,6 +16,7 @@
 import { useEffect, useState, type ReactElement } from 'react'
 import { IconChevronDownOutline14, Menu, type MenuEntry } from '@deepseek-ai/dsh-client-ui-primitives'
 import { fetchModels, setEffort, setModel, type ModelRow } from '../api/telemetry.ts'
+import { DEFAULT_EFFORT_LEVELS } from '../../types.ts'
 import { registerCss } from '../css.ts'
 
 registerCss('status-model-menu', `
@@ -125,8 +126,14 @@ export function ModelMenu(props: { sessionId: string }): ReactElement {
 
   const loaded = catalog.rows.length > 0
   const selectedRow = catalog.rows.find(row => row.value === catalog.current)
-  const supportsEffort = selectedRow?.supportsEffort === true
-  const effortLevels = selectedRow?.supportedEffortLevels ?? []
+  // The catalog's effort opinion is advisory: a custom gateway model has no
+  // matching row at all, and unknown rows carry no levels — the standing rule
+  // is that every model here accepts the standard ladder, so absence never
+  // disables the picker. Only an explicit false from the CLI wins.
+  const supportsEffort = selectedRow?.supportsEffort !== false
+  const effortLevels = selectedRow?.supportedEffortLevels !== undefined && selectedRow.supportedEffortLevels.length > 0
+    ? selectedRow.supportedEffortLevels
+    : [...DEFAULT_EFFORT_LEVELS]
 
   const modelItems: MenuEntry[] = [
     { id: '', label: '默认模型' },

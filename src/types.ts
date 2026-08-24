@@ -13,6 +13,15 @@
 export type SessionStatus = 'idle' | 'busy' | 'error'
 
 /**
+ * The full reasoning-effort ladder, used wherever a catalog row carries no
+ * effort opinion of its own. The CLI marks unknown gateway models with no
+ * `supportedEffortLevels` at all, and this deployment's standing rule is that
+ * every model accepts the standard ladder, so absent data defaults to on
+ * rather than to a disabled picker.
+ */
+export const DEFAULT_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+
+/**
  * Which layer supplied a resolved configuration value. Later layers win:
  * a session override beats page settings, which beat the cordis plugin
  * config, which beats the environment dsh itself was launched with.

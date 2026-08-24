@@ -22,6 +22,7 @@ import type {
   AccountSummary, CcEvent, CcEventInput, CcSettings, ConfigLayer, ConfigSummary, DirListing,
   EffectiveEnvEntry, ImageRef, PermissionDestination, WireMessage,
 } from './types.ts'
+import { DEFAULT_EFFORT_LEVELS } from './types.ts'
 
 const MAX_BODY_BYTES = 1024 * 1024
 
@@ -39,6 +40,25 @@ const STATIC_MODEL_FALLBACK = [
   { value: 'opus', displayName: 'Opus' },
   { value: 'haiku', displayName: 'Haiku' },
 ]
+
+/**
+ * Fill the effort ladder into catalog rows that carry no effort opinion.
+ *
+ * The CLI's `supportedModels()` leaves `supportsEffort`/`supportedEffortLevels`
+ * unset for models it does not know — every gateway model — and the static
+ * fallback rows never had them, so the page read "unsupported" for exactly the
+ * models this deployment runs. Rows that do state their own levels keep them.
+ * @param rows - the catalog rows as the engine reported them.
+ * @returns the rows, each now carrying a non-empty effort ladder.
+ */
+function withEffortDefaults(rows: readonly unknown[]): unknown[] {
+  return rows.map(row => {
+    if (typeof row !== 'object' || row === null) return row
+    const declared = (row as { supportedEffortLevels?: unknown }).supportedEffortLevels
+    if (Array.isArray(declared) && declared.length > 0) return row
+    return { ...row, supportsEffort: true, supportedEffortLevels: [...DEFAULT_EFFORT_LEVELS] }
+  })
+}
 
 /**
  * The dsh-cc host runtime. One instance per mounted plugin; disposal closes
@@ -322,7 +342,7 @@ export class CcRuntime {
             // Cold session: no live catalog yet; static aliases still switch.
             return json(res, {
               available: false,
-              models: STATIC_MODEL_FALLBACK,
+              models: withEffortDefaults(STATIC_MODEL_FALLBACK),
               current: current === '' ? 'default' : current,
               effort: this.effort,
             })
@@ -330,7 +350,7 @@ export class CcRuntime {
           const models = await engine.supportedModels()
           return json(res, {
             available: models !== undefined,
-            models: models ?? STATIC_MODEL_FALLBACK,
+            models: withEffortDefaults(models ?? STATIC_MODEL_FALLBACK),
             current: current === '' ? 'default' : current,
             effort: this.effort,
           })
