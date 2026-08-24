@@ -64,6 +64,13 @@ export interface SessionMeta {
   totalCostUsd: number
   /** Git branch the CLI recorded for the session, when it knows one. */
   gitBranch?: string
+  /**
+   * A live CLI process (terminal REPL, `claude -p`, another SDK client)
+   * currently holds this session open, per the `~/.claude/sessions`
+   * registry. The page is read-only for such a session: the other process
+   * is a concurrent writer, and no signal of ours can reach its turn.
+   */
+  terminalOwned?: boolean
   /** The CLI's own one-line summary of the conversation. */
   summary?: string
   /** Per-session environment layered over the plugin settings; e.g. relay endpoints. */

@@ -19,6 +19,8 @@
 import type { BlobStore } from './blobs.ts'
 import { listNativeSessions } from './native-sessions.ts'
 import { readNativeTranscript } from './native-transcript.ts'
+import type { PeerSession } from './peer-sessions.ts'
+import { readPeerSessions } from './peer-sessions.ts'
 import type { SessionStore } from './store.ts'
 import type { CcEvent, SessionMeta } from './types.ts'
 
@@ -66,24 +68,43 @@ export class SessionCatalog {
   ) {}
 
   /**
-   * Re-read the CLI's session store across every project directory.
+   * Re-read the CLI's session store across every project directory and the
+   * live-process registry alongside it.
    *
-   * A failure here is not fatal: the CLI store may be absent on a machine that
-   * has only ever run Claude Code through this page, and the sidecar alone
-   * still serves a working list.
-   * @returns whether anything native changed — a moved `updatedAt` or a
-   *   flipped status — so a poller can skip broadcasting a quiet store.
+   * A failure here is not fatal: the CLI store may be absent on a machine
+   * that has only ever run Claude Code through this page, and the sidecar
+   * alone still serves a working list.
+   * @returns whether anything native changed — a moved `updatedAt`, a
+   *   flipped status, or a changed ownership — so a poller can skip
+   *   broadcasting a quiet store.
    */
   async refresh(): Promise<boolean> {
     let fresh: SessionMeta[]
+    let peers: Map<string, PeerSession>
     try {
-      fresh = await listNativeSessions()
+      ;[fresh, peers] = await Promise.all([listNativeSessions(), readPeerSessions()])
     } catch {
       // No readable CLI store: the sidecar list stands on its own.
       return false
     }
+    // Sessions the sidecar adopted are driven by this page's own engines;
+    // their engine process registers in the CLI registry too, and they must
+    // not read as terminal-owned. (The merge in list() already keeps the
+    // sidecar row for them, so setting the flag only on the rest is enough.)
+    const adopted = new Set<string>()
+    for (const meta of this.store.list()) {
+      if (meta.claudeSessionId !== undefined) adopted.add(meta.claudeSessionId)
+    }
+    for (const meta of fresh) {
+      if (adopted.has(meta.id)) continue
+      meta.terminalOwned = peers.has(meta.id)
+      // A fresh transcript with no live writer is a crashed or finished
+      // turn, not a running one — the mtime heuristic alone would call it
+      // busy for the full recency window after a `kill -9`.
+      if (meta.status === 'busy' && meta.terminalOwned !== true) meta.status = 'idle'
+    }
     this.native = fresh
-    const signature = JSON.stringify(fresh.map(meta => `${meta.id}\n${meta.updatedAt}\n${meta.status}`))
+    const signature = JSON.stringify(fresh.map(meta => `${meta.id}\n${meta.updatedAt}\n${meta.status}\n${meta.terminalOwned === true}`))
     if (signature === this.signature) return false
     this.signature = signature
     return true
