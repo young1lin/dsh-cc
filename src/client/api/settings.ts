@@ -7,10 +7,23 @@
 
 import type { CcSettings, ConfigSummary, DirListing } from '../../types.ts'
 import { api } from './http.ts'
+import type { ModelRow } from './telemetry.ts'
 
 /** GET /config — the configuration actually in force, with secrets masked. */
 export function fetchConfig(): Promise<{ config: ConfigSummary }> {
   return api<{ config: ConfigSummary }>('/config')
+}
+
+/**
+ * GET /models — the model catalog under the current global configuration.
+ *
+ * This is where a gateway's own aliases and model ids come from; nothing in
+ * the page can know them. Reading it costs a CLI start on a host with no live
+ * session, so call it when the settings dialog opens, not on every render.
+ * @returns the catalog, and whether a CLI actually answered.
+ */
+export function fetchGlobalModels(): Promise<{ available: boolean; models: ModelRow[]; current: string }> {
+  return api<{ available: boolean; models: ModelRow[]; current: string }>('/models')
 }
 
 /** GET /settings — the page-editable layer only, not the resolved values. */

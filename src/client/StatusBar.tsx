@@ -30,6 +30,8 @@ registerCss('status-bar', `
 /**
  * Render the status strip.
  * @param props.sessionId - the session id, for the model/effort catalog.
+ * @param props.busy - whether a turn is running, which is when a live CLI
+ * process (and therefore the real model catalog) exists to be read.
  * @param props.context - the session's latest context-window snapshot; absent for a cold session.
  * @param props.usage - the session's latest usage snapshot; absent for a cold session.
  * @param props.fallbackCostUsd - the session's cumulative cost from the session
@@ -39,13 +41,14 @@ registerCss('status-bar', `
  */
 export function StatusBar(props: {
   sessionId: string
+  busy: boolean
   context: ContextUsage | undefined
   usage: UsageInfo | undefined
   fallbackCostUsd?: number
 }): ReactElement {
   return (
     <div className="cc-status">
-      <ModelMenu sessionId={props.sessionId} />
+      <ModelMenu sessionId={props.sessionId} busy={props.busy} />
       {props.context !== undefined && <ContextMeter context={props.context} />}
       <UsageReadout info={props.usage} fallbackCostUsd={props.fallbackCostUsd} />
     </div>

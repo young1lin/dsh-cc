@@ -155,6 +155,17 @@ export class SessionEngine {
   busy = false
   /** Last activity timestamp; the live-cap eviction order. */
   lastUsed = Date.now()
+  /**
+   * The most recent submission, kept verbatim so the host can replay it when
+   * the process dies mid-turn.
+   *
+   * The transcript cannot answer "what was just sent" for a session the CLI
+   * owns: that store is read as a bounded tail and its own copy of the message
+   * is written by the process that then failed. Keeping the submission here is
+   * what makes a model fallback replay the message that failed rather than
+   * some earlier one — attachments included.
+   */
+  lastSend: { text: string; images: SendImage[] } | undefined
 
   /** Whether close() already ran; a closed engine restarts through a new instance. */
   get isClosed(): boolean {
@@ -230,6 +241,7 @@ export class SessionEngine {
   async send(text: string, images: SendImage[] = []): Promise<void> {
     if (this.closed) throw new Error('dsh-cc: engine is closed')
     this.lastUsed = Date.now()
+    this.lastSend = { text, images }
     this.ensureStarted()
     this.busy = true
     // Images lead the content list: the model reads the attachment before the
@@ -248,6 +260,20 @@ export class SessionEngine {
       parent_tool_use_id: null,
     } as SDKUserMessage
     this.input.push(message)
+  }
+
+  /**
+   * Start the CLI process without submitting anything.
+   *
+   * The control channel — the model catalog, the account, the context
+   * accounting — is answered by a live process out of its own resolved
+   * configuration and costs no API call, so a caller that needs only those can
+   * start a query and never send a turn.
+   */
+  warmUp(): void {
+    if (this.closed) throw new Error('dsh-cc: engine is closed')
+    this.lastUsed = Date.now()
+    this.ensureStarted()
   }
 
   /**

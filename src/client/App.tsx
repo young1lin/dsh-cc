@@ -210,12 +210,16 @@ export function CcApp(props: { onClose(): void }): ReactElement {
             }
             return changed ? next : previous
           })
-          // A native session whose transcript advances with no engine of ours
-          // is being driven from a terminal CLI; mirror its new events into
-          // the open page. Web-owned sessions already stream through 'event'
-          // frames, so the refetch stays scoped to origin 'cli'.
+          // A session a terminal CLI holds open advances its transcript with
+          // no engine of ours involved, so nothing streams into the page for
+          // it; re-reading is the only way to mirror it.
+          //
+          // `origin` cannot gate this: adopting a CLI session leaves origin
+          // 'cli' even while this page drives it, so every web-driven turn was
+          // re-reading — and overwriting — the events it had just streamed.
+          // Ownership is the fact that actually distinguishes the two.
           const current = message.sessions.find(session => session.id === currentIdRef.current)
-          if (current !== undefined && current.origin === 'cli'
+          if (current !== undefined && current.terminalOwned === true
             && (foreignSync.current === undefined
               || foreignSync.current.id !== current.id
               || foreignSync.current.updatedAt !== current.updatedAt)) {
@@ -409,6 +413,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
         {current !== undefined && (
           <StatusBar
             sessionId={current.id}
+            busy={current.status === 'busy'}
             context={context}
             usage={usage}
             fallbackCostUsd={current.totalCostUsd}
@@ -458,9 +463,9 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                 <Composer
                   busy={current.status === 'busy'}
                   readOnly={current.terminalOwned === true}
-                  onSend={(text, images) => {
-                    sendMessage(current.id, text, images).catch(fail)
-                  }}
+                  // Returned, not caught here: the composer restores the
+                  // draft it optimistically cleared when a send never lands.
+                  onSend={(text, images) => sendMessage(current.id, text, images)}
                   onStop={() => {
                     stopSession(current.id).catch(fail)
                   }}

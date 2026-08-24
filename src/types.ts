@@ -251,7 +251,7 @@ export interface CcSettings {
   model: string
   /** Permission posture; empty = keep the cordis config default. */
   permissionMode: string
-  /** Environment for the claude process; replaces the cordis config env when non-empty. */
+  /** Environment for the claude process, layered over the cordis config env per key. */
   env: Record<string, string>
 }
 

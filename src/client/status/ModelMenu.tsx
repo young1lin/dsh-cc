@@ -13,7 +13,7 @@
  * @module dsh-cc/client/status/ModelMenu
  */
 
-import { useEffect, useState, type ReactElement } from 'react'
+import { useEffect, useRef, useState, type ReactElement } from 'react'
 import { IconChevronDownOutline14, Menu, type MenuEntry } from '@deepseek-ai/dsh-client-ui-primitives'
 import { fetchModels, setEffort, setModel, type ModelRow } from '../api/telemetry.ts'
 import { DEFAULT_EFFORT_LEVELS } from '../../types.ts'
@@ -102,15 +102,36 @@ function modelLabel(row: ModelRow): ReactElement {
 /**
  * Render the model and effort pickers.
  * @param props.sessionId - the session whose catalog to fetch and mutate.
+ * @param props.busy - whether a turn is running on this session.
  * @returns the two picker controls.
  */
-export function ModelMenu(props: { sessionId: string }): ReactElement {
+export function ModelMenu(props: { sessionId: string; busy: boolean }): ReactElement {
   const [catalog, setCatalog] = useState<Catalog>(EMPTY_CATALOG)
   const [openMenu, setOpenMenu] = useState<'model' | 'effort' | null>(null)
+  /** Bumped to re-read the catalog; see the turn-start effect below. */
+  const [reload, setReload] = useState(0)
+  const wasBusy = useRef(false)
+
+  // Switching sessions must not leave the previous session's selection on
+  // screen while the new catalog loads. A reload of the SAME session keeps
+  // what is already there, so the picker never blinks mid-turn.
+  useEffect(() => {
+    setCatalog(EMPTY_CATALOG)
+  }, [props.sessionId])
+
+  // A cold session can only be answered with the static aliases: the real
+  // catalog — the gateway's own rows and their effort ladders — exists only
+  // while a CLI process does, and the first message is what starts one. The
+  // rising edge alone triggers the re-read; keying off `busy` itself would
+  // spend a second control-channel round trip when the turn ends.
+  useEffect(() => {
+    const started = props.busy && !wasBusy.current
+    wasBusy.current = props.busy
+    if (started) setReload(value => value + 1)
+  }, [props.busy])
 
   useEffect(() => {
     let stale = false
-    setCatalog(EMPTY_CATALOG)
     fetchModels(props.sessionId)
       .then(result => {
         if (stale) return
@@ -122,7 +143,7 @@ export function ModelMenu(props: { sessionId: string }): ReactElement {
     return () => {
       stale = true
     }
-  }, [props.sessionId])
+  }, [props.sessionId, reload])
 
   const loaded = catalog.rows.length > 0
   const selectedRow = catalog.rows.find(row => row.value === catalog.current)

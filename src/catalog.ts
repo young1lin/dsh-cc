@@ -61,10 +61,16 @@ export class SessionCatalog {
   /**
    * @param store - the dsh-cc sidecar.
    * @param blobs - where inline images from a native transcript are rehydrated.
+   * @param drivesNative - whether one of the HOST's own engines currently
+   *   holds a native session open. Those engines register in the CLI's
+   *   live-process registry under the same session id a terminal would, so
+   *   without this the two are indistinguishable and ownership can only be
+   *   answered by refusing to answer it.
    */
   constructor(
     private readonly store: SessionStore,
     private readonly blobs: BlobStore,
+    private readonly drivesNative: (claudeSessionId: string) => boolean = () => false,
   ) {}
 
   /**
@@ -87,21 +93,15 @@ export class SessionCatalog {
       // No readable CLI store: the sidecar list stands on its own.
       return false
     }
-    // Sessions the sidecar adopted are driven by this page's own engines;
-    // their engine process registers in the CLI registry too, and they must
-    // not read as terminal-owned. (The merge in list() already keeps the
-    // sidecar row for them, so setting the flag only on the rest is enough.)
-    const adopted = new Set<string>()
-    for (const meta of this.store.list()) {
-      if (meta.claudeSessionId !== undefined) adopted.add(meta.claudeSessionId)
-    }
     for (const meta of fresh) {
-      if (adopted.has(meta.id)) continue
-      meta.terminalOwned = peers.has(meta.id)
-      // A fresh transcript with no live writer is a crashed or finished
+      // A live peer holds the session open — unless that peer is one of the
+      // host's own engines, which is this page driving the session rather than
+      // a terminal holding it.
+      meta.terminalOwned = peers.has(meta.id) && !this.drivesNative(meta.id)
+      // A fresh transcript with no live writer at all is a crashed or finished
       // turn, not a running one — the mtime heuristic alone would call it
       // busy for the full recency window after a `kill -9`.
-      if (meta.status === 'busy' && meta.terminalOwned !== true) meta.status = 'idle'
+      if (meta.status === 'busy' && !peers.has(meta.id)) meta.status = 'idle'
     }
     this.native = fresh
     const signature = JSON.stringify(fresh.map(meta => `${meta.id}\n${meta.updatedAt}\n${meta.status}\n${meta.terminalOwned === true}`))
@@ -115,21 +115,25 @@ export class SessionCatalog {
    *
    * A session present in both is emitted once, with the sidecar's operational
    * fields over the CLI's identity fields.
+   *
+   * Every row is a copy. This is a read — it runs on every broadcast — and the
+   * merge below writes CLI-derived state onto the row it returns; folding that
+   * into the store's own records would carry it into the next index write and
+   * persist a live fact as a stored one.
    * @returns the merged list.
    */
   list(): SessionMeta[] {
-    const sidecar = this.store.list()
     const adopted = new Map<string, SessionMeta>()
-    for (const meta of sidecar) {
-      if (meta.claudeSessionId !== undefined) adopted.set(meta.claudeSessionId, meta)
+    const merged: SessionMeta[] = []
+    for (const meta of this.store.list()) {
+      const row = { ...meta }
+      merged.push(row)
+      if (row.claudeSessionId !== undefined) adopted.set(row.claudeSessionId, row)
     }
-    const merged = [
-      ...sidecar,
-      ...this.native.filter(meta => !adopted.has(meta.id)),
-    ]
-    for (const meta of this.native) {
-      const own = adopted.get(meta.id)
-      if (own !== undefined) mergeNativeInto(own, meta)
+    for (const native of this.native) {
+      const own = adopted.get(native.id)
+      if (own === undefined) merged.push({ ...native })
+      else mergeNativeInto(own, native)
     }
     return merged.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
   }
@@ -218,20 +222,25 @@ export class SessionCatalog {
 }
 
 /**
- * Fold the CLI's identity fields into a sidecar record in place. The CLI owns
- * the summary, the branch, and the recorded activity time; the sidecar owns
+ * Fold the CLI's identity fields into one merged row. The CLI owns the
+ * summary, the branch, and the recorded activity time; the sidecar owns
  * everything about how dsh-cc runs the session.
- * @param own - the sidecar record to update.
+ *
+ * `own` is a copy made by {@link SessionCatalog.list}, never a stored record,
+ * so the live facts written here reach the page without being persisted.
+ * @param own - the merged row to update.
  * @param native - the CLI's record for the same session.
  */
 function mergeNativeInto(own: SessionMeta, native: SessionMeta): void {
   if (native.summary !== undefined) own.summary = native.summary
   if (native.gitBranch !== undefined) own.gitBranch = native.gitBranch
   if (native.updatedAt.localeCompare(own.updatedAt) > 0) own.updatedAt = native.updatedAt
-  // A sidecar row is never terminal-owned: this page's own engines register
-  // in the CLI registry under the same session id, so ownership cannot be
-  // told apart for them and must not be claimed. A flag that did get
-  // persisted (an adopt from before this rule) is stale by construction and
-  // is dropped here rather than served forever.
-  own.terminalOwned = false
+  // Ownership is resolved live on every refresh, so an adopted session that a
+  // terminal later picked up reads as terminal-owned here even though nothing
+  // about that was stored when the page adopted it.
+  own.terminalOwned = native.terminalOwned === true
+  // While a terminal holds the session, that process is the only writer and
+  // the authority on whether a turn is running; the sidecar's own status only
+  // ever tracked turns this page drove.
+  if (own.terminalOwned) own.status = native.status
 }

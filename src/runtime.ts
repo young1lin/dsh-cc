@@ -21,11 +21,30 @@ import { deleteNativeSession, renameNativeSession } from './native-sessions.ts'
 import { SessionStore } from './store.ts'
 import type {
   AccountSummary, CcEvent, CcEventInput, CcSettings, ConfigLayer, ConfigSummary, DirListing,
-  EffectiveEnvEntry, ImageRef, LiveTurnSnapshot, PermissionDestination, WireMessage,
+  EffectiveEnvEntry, ImageRef, LiveTurnSnapshot, PermissionDestination, SessionMeta, WireMessage,
 } from './types.ts'
 import { DEFAULT_EFFORT_LEVELS } from './types.ts'
 
 const MAX_BODY_BYTES = 1024 * 1024
+
+/** Session id of the throwaway engine started only to read the model catalog. */
+const CATALOG_PROBE_ID = 'dsh-cc:catalog-probe'
+
+/** How long that probe is given before the catalog is reported unavailable. */
+const CATALOG_PROBE_TIMEOUT_MS = 15_000
+
+/**
+ * Hooks for an engine started to read the control channel and nothing else.
+ * It belongs to no session, so everything it would publish is dropped rather
+ * than persisted against an id the store has never heard of.
+ */
+const SILENT_HOOKS: EngineHooks = {
+  emit: async () => {},
+  updateMeta: async () => {},
+  delta: () => {},
+  permissionRequest: () => {},
+  dialogRequest: () => {},
+}
 
 /**
  * Largest single image accepted for upload. Matches the Anthropic API's
@@ -99,6 +118,12 @@ export class CcRuntime {
    * close; a credential change is picked up by the next engine start.
    */
   private account: AccountSummary | undefined
+  /**
+   * The model catalog under the current configuration, cached because reading
+   * it can cost a process start. Cleared whenever the settings that produced
+   * it change.
+   */
+  private modelCatalog: readonly unknown[] | undefined
 
   constructor(
     private readonly ctx: Context,
@@ -107,7 +132,7 @@ export class CcRuntime {
     this.store = new SessionStore(baseConfig.dataDir)
     this.store.load()
     this.blobs = new BlobStore(baseConfig.dataDir)
-    this.catalog = new SessionCatalog(this.store, this.blobs)
+    this.catalog = new SessionCatalog(this.store, this.blobs, id => this.drivesNative(id))
     // The CLI store is read from disk, so the first list is served from the
     // sidecar alone and the broadcast that follows fills in the rest.
     void this.catalog.refresh().then(() => this.broadcastSessions())
@@ -137,6 +162,11 @@ export class CcRuntime {
   /**
    * The cordis config with page-editable settings layered on top: a non-empty
    * settings field replaces its base counterpart, an empty one keeps the base.
+   *
+   * `env` layers per key rather than wholesale. Replacing the whole map made
+   * one unrelated page edit — a proxy, a timeout — silently retire every
+   * variable the cordis config supplied, endpoint and credential included,
+   * with nothing on screen naming what had just been dropped.
    */
   private effectiveConfig(): ResolvedConfig {
     const overrides = this.settings
@@ -146,9 +176,83 @@ export class CcRuntime {
       permissionMode: overrides.permissionMode !== ''
         ? overrides.permissionMode as ResolvedConfig['permissionMode']
         : this.baseConfig.permissionMode,
-      env: Object.keys(overrides.env).length > 0 ? { ...overrides.env } : this.baseConfig.env,
+      env: { ...this.baseConfig.env, ...overrides.env },
       ...(this.effort !== undefined ? { effort: this.effort } : {}),
     }
+  }
+
+  /**
+   * The effective config with one session's own environment layer folded in.
+   *
+   * Environment is spawn-time, so every path that starts a process for a
+   * session — a submitted message, a fallback replay — has to resolve it the
+   * same way, or a session pinned to its own gateway silently runs against the
+   * global one.
+   * @param session - the session about to get a process.
+   * @returns the config that process is spawned with.
+   */
+  private configFor(session: SessionMeta): ResolvedConfig {
+    const base = this.effectiveConfig()
+    if (Object.keys(session.env ?? {}).length === 0) return base
+    return { ...base, env: { ...base.env, ...session.env } }
+  }
+
+  /**
+   * The model catalog as the CLI resolves it under the current configuration:
+   * a gateway's own aliases and whatever `ANTHROPIC_MODEL` names, rather than
+   * a list hardcoded here that cannot know either.
+   *
+   * A live session answers for free. With none running, a throwaway process is
+   * started purely to ask — `supportedModels()` is served out of the CLI's own
+   * resolved config, so it makes no API call, writes no transcript, and
+   * unlinks its process-registry entry on close.
+   * @returns the catalog, or undefined when no CLI could answer.
+   */
+  private async globalModels(): Promise<readonly unknown[] | undefined> {
+    if (this.modelCatalog !== undefined) return this.modelCatalog
+    for (const engine of this.engines.values()) {
+      if (engine.isClosed) continue
+      const live = await engine.supportedModels()
+      if (live !== undefined) {
+        this.modelCatalog = live
+        return live
+      }
+    }
+    const probe = new SessionEngine(
+      { sessionId: CATALOG_PROBE_ID, cwd: this.baseConfig.cwd, model: '' },
+      this.effectiveConfig(),
+      SILENT_HOOKS,
+    )
+    try {
+      probe.warmUp()
+      // A CLI that never answers must not hold the settings dialog open.
+      const models = await Promise.race([
+        probe.supportedModels(),
+        new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), CATALOG_PROBE_TIMEOUT_MS)),
+      ])
+      if (models !== undefined) this.modelCatalog = models
+      return models
+    } catch (error) {
+      this.ctx.logger?.warn?.(`dsh-cc: could not read the model catalog: ${String(error)}`)
+      return undefined
+    } finally {
+      await probe.close()
+    }
+  }
+
+  /**
+   * Whether one of this runtime's own engines currently holds a native session
+   * open. Our engines register in the CLI's live-process registry exactly as a
+   * terminal `claude` does, so this is the only thing separating "a terminal
+   * is driving it" from "this page is driving it".
+   * @param claudeSessionId - the native session id to test.
+   * @returns true when a live engine of ours is attached to it.
+   */
+  private drivesNative(claudeSessionId: string): boolean {
+    for (const engine of this.engines.values()) {
+      if (!engine.isClosed && engine.claudeSessionId === claudeSessionId) return true
+    }
+    return false
   }
 
   private async saveSettings(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -156,7 +260,7 @@ export class CcRuntime {
     if (body === undefined) return json(res, { error: '请求体不能为空' }, 400)
     const model = typeof body.model === 'string' ? body.model.trim() : ''
     const permissionMode = typeof body.permissionMode === 'string' ? body.permissionMode : ''
-    if (permissionMode !== '' && !['default', 'acceptEdits', 'plan', 'bypassPermissions', 'auto'].includes(permissionMode)) {
+    if (permissionMode !== '' && !['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions', 'auto'].includes(permissionMode)) {
       return json(res, { error: '无效的权限模式' }, 400)
     }
     const env: Record<string, string> = {}
@@ -169,6 +273,8 @@ export class CcRuntime {
     }
     this.settings = { model, permissionMode, env }
     persistSettings(this.baseConfig.dataDir, this.settings)
+    // The catalog is derived from the environment that just changed.
+    this.modelCatalog = undefined
     // Idle engines keep their spawn-time environment; recycle them so the
     // next message spawns with the new settings.
     for (const [id, engine] of [...this.engines]) {
@@ -248,6 +354,14 @@ export class CcRuntime {
       if (parts[0] === 'config' && parts.length === 1 && method === 'GET') {
         return json(res, { config: this.configSummary() })
       }
+      if (parts[0] === 'models' && parts.length === 1 && method === 'GET') {
+        const models = await this.globalModels()
+        return json(res, {
+          available: models !== undefined,
+          models: withEffortDefaults(models ?? STATIC_MODEL_FALLBACK),
+          current: this.settings.model,
+        })
+      }
       if (parts[0] === 'settings' && parts.length === 1 && method === 'GET') return json(res, { settings: this.settings })
       if (parts[0] === 'settings' && parts.length === 1 && method === 'PUT') {
         return await this.saveSettings(req, res)
@@ -286,6 +400,7 @@ export class CcRuntime {
           const session = this.catalog.get(id)
           if (!session) return json(res, { error: '会话不存在' }, 404)
           await this.closeEngine(id)
+          this.liveSeqs.delete(id)
           await this.store.remove(id)
           // The CLI's own copy is the conversation; leaving it behind would
           // make a deleted session reappear on the next refresh.
@@ -495,10 +610,7 @@ export class CcRuntime {
       attachments.push({ mediaType: image.mediaType, data: bytes.toString('base64') })
     }
     let engine = this.engines.get(id)
-    const base = this.effectiveConfig()
-    const merged = Object.keys(session.env ?? {}).length > 0
-      ? { ...base, env: { ...base.env, ...session.env } }
-      : base
+    const merged = this.configFor(session)
     // Environment is spawn-time: an engine that outlived a session-env edit
     // (the save happened mid-turn, when recycling a busy engine would have
     // killed the turn) must not serve the next message from the stale layer.
@@ -514,7 +626,7 @@ export class CcRuntime {
         this.hooks(id),
       )
       this.engines.set(id, engine)
-      this.enforceLiveCap()
+      this.enforceLiveCap(id)
     }
     await this.emitEvent(id, { kind: 'user', text, ...(images.length > 0 ? { images } : {}) })
     await engine.send(text, attachments)
@@ -589,27 +701,33 @@ export class CcRuntime {
   private async recoverWithLastGoodModel(sessionId: string, error: Error): Promise<void> {
     const session = this.store.get(sessionId)
     if (session === undefined) return
+    const from = session.model
     const fallback = session.lastGoodModel
-    if (fallback === undefined || fallback === '' || fallback === session.model) return
-    // Find the last user message to replay.
-    const events = await this.catalog.transcript(session, 40)
-    const lastUser = [...events].reverse().find(event => event.kind === 'user')
-    if (lastUser === undefined) return
+    if (fallback === undefined || fallback === '' || fallback === from) return
+    // The dead engine knows what it was given, attachments included. Reading
+    // it back out of the transcript instead would resolve to some earlier
+    // message: a CLI-owned session's store is read as a bounded tail, and the
+    // failed turn's own record is written by the process that just died.
+    const replay = this.engines.get(sessionId)?.lastSend
+    if (replay === undefined) return
     await this.patchMeta(sessionId, { model: fallback, lastError: undefined, status: 'idle' })
     await this.emitEvent(sessionId, {
       kind: 'system',
       subtype: 'model-fallback',
-      data: { from: session.model, to: fallback, reason: error.message },
+      data: { from, to: fallback, reason: error.message },
     })
     this.ctx.logger?.warn?.(`dsh-cc: session ${sessionId} fell back to ${fallback}: ${error.message}`)
-    // Replay through a fresh engine (the old one is dead).
+    // Close the dead engine before its replacement takes the key: it still
+    // holds the map slot, and closing it denies whatever it left pending.
+    await this.closeEngine(sessionId)
     const engine = new SessionEngine(
       { sessionId, cwd: session.cwd, model: fallback, claudeSessionId: session.claudeSessionId },
-      this.effectiveConfig(),
+      this.configFor(session),
       this.hooks(sessionId),
     )
     this.engines.set(sessionId, engine)
-    await engine.send(lastUser.text)
+    this.enforceLiveCap(sessionId)
+    await engine.send(replay.text, replay.images)
     this.refreshAccount(engine)
     await this.patchMeta(sessionId, { status: 'busy' })
     this.broadcastSessions()
@@ -664,7 +782,11 @@ export class CcRuntime {
       'x-accel-buffering': 'no',
     })
     this.write(res, { t: 'hello', config: this.configSummary() })
-    this.write(res, { t: 'sessions', sessions: this.store.list() })
+    // The merged catalog, exactly like every later broadcast: the sidecar
+    // alone is a small subset of it, and the rescan only broadcasts when the
+    // native store actually moves — so a sidecar-only frame here would leave
+    // the page short of every CLI session until something unrelated changed.
+    this.write(res, { t: 'sessions', sessions: this.catalog.list() })
     this.clients.add(res)
     const remove = (): void => {
       this.clients.delete(res)
@@ -708,10 +830,16 @@ export class CcRuntime {
     })
   }
 
-  /** Close idle engines beyond the live cap, oldest use first. */
-  private enforceLiveCap(): void {
+  /**
+   * Close idle engines beyond the live cap, oldest use first.
+   * @param keep - the session whose engine must survive, i.e. the one this
+   *   call was made for. It is idle until its first message is pushed, so
+   *   without this a host at its cap with every other session busy evicts the
+   *   engine it just created and the send that follows finds it closed.
+   */
+  private enforceLiveCap(keep?: string): void {
     const idle = [...this.engines.entries()]
-      .filter(([, engine]) => !engine.busy)
+      .filter(([id, engine]) => id !== keep && !engine.busy)
       .sort((a, b) => a[1].lastUsed - b[1].lastUsed)
     let overflow = this.engines.size - this.baseConfig.maxLiveSessions
     for (const [id] of idle) {
@@ -732,8 +860,21 @@ export class CcRuntime {
   }
 }
 
-/** Write one JSON response. */
+/**
+ * Write one JSON response.
+ *
+ * A handler that already began its response — the SSE stream, a blob body —
+ * cannot restate a late failure as JSON; writing a second set of headers would
+ * throw inside the error path itself, so the socket is simply ended.
+ * @param res - the response to write.
+ * @param body - the JSON body.
+ * @param status - the HTTP status.
+ */
 function json(res: ServerResponse, body: unknown, status = 200): void {
+  if (res.headersSent) {
+    res.end()
+    return
+  }
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
   res.end(JSON.stringify(body))
 }
@@ -940,7 +1081,7 @@ const SECRET_KEY = /(TOKEN|KEY|SECRET|PASSWORD|COOKIE)$/i
  * actually comes from. Secret values are masked here — the raw value never
  * leaves the host.
  * @param plugin - the cordis plugin config env.
- * @param settings - the page-editable settings env, which replaces it when non-empty.
+ * @param settings - the page-editable settings env, layered over it per key.
  * @returns one entry per variable, sorted by key.
  */
 function effectiveEnvEntries(
@@ -957,15 +1098,12 @@ function effectiveEnvEntries(
     if (!CLI_ENV_KEY.test(key) || CLI_ENV_INJECTED.test(key)) continue
     winner.set(key, { value, layer: 'process' })
   }
-  // Settings replace the plugin's env map wholesale rather than merging into
-  // it (see effectiveConfig), so a non-empty settings layer retires every
-  // plugin entry. The process layer survives either way: the CLI inherits it
-  // from the spawn regardless of which dsh-cc layer wins.
-  if (Object.keys(settings).length > 0) {
-    for (const [key, value] of Object.entries(settings)) winner.set(key, { value, layer: 'settings' })
-  } else {
-    for (const [key, value] of Object.entries(plugin)) winner.set(key, { value, layer: 'plugin' })
-  }
+  // Each layer overwrites the previous one key by key, mirroring
+  // effectiveConfig: a settings entry beats the plugin entry of the same name,
+  // and a plugin entry the settings layer never mentions survives. The process
+  // layer underpins both — the CLI inherits it from the spawn regardless.
+  for (const [key, value] of Object.entries(plugin)) winner.set(key, { value, layer: 'plugin' })
+  for (const [key, value] of Object.entries(settings)) winner.set(key, { value, layer: 'settings' })
   return [...winner.entries()]
     .map(([key, { value, layer }]) => SECRET_KEY.test(key)
       ? { key, value: maskSecret(value), masked: true, layer }

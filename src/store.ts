@@ -7,7 +7,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs'
 import { appendFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import type { CcEvent, SessionMeta } from './types.ts'
@@ -21,12 +21,33 @@ export class SessionStore {
 
   constructor(private readonly dataDir: string) {}
 
-  /** Create the store layout and load the session index synchronously. */
+  /**
+   * Create the store layout and load the session index synchronously.
+   *
+   * An unreadable index must not stop the plugin from mounting, and it must
+   * not be silently overwritten either: the next metadata write would replace
+   * a recoverable file with an empty list. A bad index is therefore moved
+   * aside under a timestamped name and the store starts empty.
+   */
   load(): void {
     mkdirSync(join(this.dataDir, 'sessions'), { recursive: true })
     const indexPath = join(this.dataDir, 'index.json')
     if (!existsSync(indexPath)) return
-    const raw = JSON.parse(readFileSync(indexPath, 'utf8')) as SessionMeta[]
+    let raw: SessionMeta[]
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(indexPath, 'utf8'))
+      if (!Array.isArray(parsed)) throw new Error('index.json is not an array')
+      raw = parsed as SessionMeta[]
+    } catch (error) {
+      const aside = `${indexPath}.corrupt-${Date.now()}`
+      try {
+        renameSync(indexPath, aside)
+      } catch {
+        // Nothing else to try; starting empty still beats failing to mount.
+      }
+      console.warn(`dsh-cc: unreadable session index, moved to ${aside}`, error)
+      return
+    }
     for (const meta of raw) {
       // No engine survives the process, so a persisted busy flag is stale.
       if (meta.status === 'busy') meta.status = 'idle'
@@ -158,12 +179,19 @@ export class SessionStore {
   }
 
   /**
-   * The next transcript sequence number for a session (not yet stored).
+   * Reserve the next transcript sequence number for a session.
+   *
+   * Reserving rather than peeking is what keeps the counter monotonic for a
+   * session whose conversation the CLI owns: most of its events are broadcast
+   * without ever being appended here, and a counter that only advanced on
+   * append would hand every one of them the same number.
    * @param id - session id.
-   * @returns seq + 1.
+   * @returns the reserved seq.
    */
   nextSeq(id: string): number {
-    return (this.seq.get(id) ?? 0) + 1
+    const next = (this.seq.get(id) ?? 0) + 1
+    this.seq.set(id, next)
+    return next
   }
 
   /**
@@ -172,7 +200,7 @@ export class SessionStore {
    * @param event - the complete event (seq/ts already assigned).
    */
   async append(id: string, event: CcEvent): Promise<void> {
-    this.seq.set(id, event.seq)
+    this.seq.set(id, Math.max(this.seq.get(id) ?? 0, event.seq))
     await appendFile(join(this.dataDir, 'sessions', `${id}.jsonl`), `${JSON.stringify(event)}\n`, 'utf8')
   }
 

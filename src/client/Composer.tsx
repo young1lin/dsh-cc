@@ -104,7 +104,11 @@ const EXTENSIONS: Record<ImageRef['mediaType'], string> = {
 export function Composer(props: {
   busy: boolean
   readOnly?: boolean
-  onSend(text: string, images: ImageRef[]): void
+  /**
+   * Submit one message. Whatever the send resolves to is ignored; only a
+   * rejection matters here, and it restores the cleared draft.
+   */
+  onSend(text: string, images: ImageRef[]): void | Promise<unknown>
   onStop(): void
 }): ReactElement {
   const [value, setValue] = useState('')
@@ -117,9 +121,19 @@ export function Composer(props: {
 
   const submit = (): void => {
     if (empty || uploading > 0 || props.readOnly === true) return
+    const text = value.trim()
+    const attachments = images
+    // Cleared optimistically so the box is ready for the next message. A send
+    // that never lands — an expired attachment, a closed engine — puts the
+    // draft back instead of discarding what was typed.
     setValue('')
     setImages([])
-    props.onSend(value.trim(), images)
+    setFailure(undefined)
+    void Promise.resolve(props.onSend(text, attachments)).catch((error: unknown) => {
+      setFailure(error instanceof Error ? error.message : String(error))
+      setValue(previous => (previous === '' ? text : previous))
+      setImages(previous => (previous.length === 0 ? attachments : previous))
+    })
   }
 
   /**

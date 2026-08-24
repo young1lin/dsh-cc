@@ -17,7 +17,8 @@ import { AccountPanel } from './AccountPanel.tsx'
 import { EnvEditor, fromRows, toRows, type EnvRow } from './EnvEditor.tsx'
 import { ProviderForm } from './ProviderForm.tsx'
 import { LAYER_LABELS, omitStructuredKeys, pickStructuredKeys } from './providerFields.ts'
-import { fetchSettings, saveSettings } from '../api/settings.ts'
+import { fetchGlobalModels, fetchSettings, saveSettings } from '../api/settings.ts'
+import type { ModelRow } from '../api/telemetry.ts'
 import { registerCss } from '../css.ts'
 import type { ConfigSummary } from '../../types.ts'
 
@@ -75,6 +76,8 @@ registerCss('settings-modal', `
   color: var(--dsw-alias-label-tertiary);
 }
 
+.cc-field-note { font: var(--dsw-font-xxs-12); color: var(--dsw-alias-label-tertiary); }
+
 .cc-settings-disclosure-title { font: var(--dsw-font-xs-strong-13); }
 .cc-settings-disclosure-body { padding: 8px 2px 0; display: flex; flex-direction: column; gap: 10px; }
 
@@ -88,13 +91,33 @@ registerCss('settings-modal', `
 }
 `)
 
-/** The model aliases offered as the global default. */
-const MODEL_CHOICES = [
-  { value: '', label: '默认（跟随 dsh 启动配置）' },
-  { value: 'opus', label: 'opus' },
-  { value: 'sonnet', label: 'sonnet' },
-  { value: 'haiku', label: 'haiku' },
-]
+/**
+ * The default-model choices, built from the catalog the CLI reports under the
+ * current configuration rather than from a fixed list — a relay's aliases and
+ * its raw model ids (`glm-5.3[1m]` and the like) exist only there.
+ *
+ * The CLI's own `default` row is folded into dsh-cc's empty value so there is
+ * one canonical "unset" instead of two rows that mean the same thing.
+ * @param rows - the catalog rows.
+ * @param saved - the currently persisted value.
+ * @returns the option list, in catalog order.
+ */
+function modelChoices(rows: ModelRow[], saved: string): { value: string; label: string }[] {
+  const choices = [{ value: '', label: '默认（跟随 dsh 启动配置）' }]
+  for (const row of rows) {
+    if (row.value === '' || row.value === 'default') continue
+    const resolved = row.resolvedModel !== undefined && row.resolvedModel !== row.value
+      ? ` → ${row.resolvedModel}`
+      : ''
+    choices.push({ value: row.value, label: `${row.value}${resolved}` })
+  }
+  // A saved value the catalog no longer lists stays selectable: dropping it
+  // would silently reset the setting the next time the dialog is saved.
+  if (saved !== '' && !choices.some(choice => choice.value === saved)) {
+    choices.push({ value: saved, label: `${saved}（当前配置未列出）` })
+  }
+  return choices
+}
 
 /** Permission postures the CLI accepts, with what each one means here. */
 const PERMISSION_CHOICES = [
@@ -124,8 +147,19 @@ export function SettingsModal(props: {
   const [message, setMessage] = useState<string | undefined>()
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [showFullEnv, setShowFullEnv] = useState(false)
+  const [models, setModels] = useState<ModelRow[]>([])
+  const [modelsLive, setModelsLive] = useState(false)
 
   useEffect(() => {
+    fetchGlobalModels()
+      .then(result => {
+        setModels(result.models)
+        setModelsLive(result.available)
+      })
+      .catch(() => {
+        // The catalog is a convenience: the field still saves what is picked,
+        // and ANTHROPIC_MODEL below remains the free-form escape hatch.
+      })
     fetchSettings()
       .then(result => {
         setModel(result.settings.model)
@@ -180,8 +214,15 @@ export function SettingsModal(props: {
         <label className="cc-field">
           默认模型
           <select value={model} onChange={event => setModel(event.target.value)}>
-            {MODEL_CHOICES.map(choice => <option key={choice.value} value={choice.value}>{choice.label}</option>)}
+            {modelChoices(models, model).map(choice => (
+              <option key={choice.value} value={choice.value}>{choice.label}</option>
+            ))}
           </select>
+          <span className="cc-field-note">
+            {modelsLive
+              ? '当前配置下 Claude Code 报告的可选模型；箭头后是该别名实际解析到的模型。'
+              : '暂时读不到实时模型目录，以下为通用别名；也可用上方 ANTHROPIC_MODEL 直接指定模型 id。'}
+          </span>
         </label>
         <label className="cc-field">
           权限模式

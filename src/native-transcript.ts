@@ -18,10 +18,16 @@ import type { CcEvent, CcEventInput, ImageRef } from './types.ts'
 export interface ReadNativeTranscriptOptions {
   /** Project directory the session belongs to; omit to search every project. */
   cwd?: string
-  /** Maximum number of underlying SDK messages to read. */
+  /**
+   * Maximum number of underlying SDK messages to map, counted from the END of
+   * the transcript.
+   *
+   * The SDK's own `limit`/`offset` page from the START of the session, which
+   * is the opposite of what a transcript view wants: a long conversation would
+   * render its opening and never its recent turns. The tail is therefore taken
+   * here rather than pushed down to `getSessionMessages`.
+   */
   limit?: number
-  /** Number of underlying SDK messages to skip from the start. */
-  offset?: number
   /**
    * Persist one inline image from the transcript and return the reference to
    * record on the event. Native transcripts carry image bytes inline as
@@ -41,23 +47,26 @@ export interface ReadNativeTranscriptOptions {
  * sequentially over the flattened event list, not over the source messages.
  *
  * @param sessionId - native session UUID.
- * @param options - project directory and pagination, forwarded to `getSessionMessages`.
- * @returns the mapped events; empty when the session has no messages.
+ * @param options - project directory and the tail cap; see {@link ReadNativeTranscriptOptions.limit}.
+ * @returns the mapped events, oldest kept first; empty when the session has no messages.
  */
 export async function readNativeTranscript(
   sessionId: string,
   options: ReadNativeTranscriptOptions = {},
 ): Promise<CcEvent[]> {
-  let messages: SessionMessage[]
+  let all: SessionMessage[]
   try {
-    messages = await getSessionMessages(sessionId, {
-      dir: options.cwd,
-      limit: options.limit,
-      offset: options.offset,
-    })
+    all = await getSessionMessages(sessionId, { dir: options.cwd })
   } catch (error) {
     throw new Error(`dsh-cc: failed to read native transcript for session ${sessionId}`, { cause: error })
   }
+  // Reading unpaged costs one JSONL parse the SDK performs for any page
+  // anyway; only the kept messages are mapped, so a capped read still does the
+  // bounded work — image rehydration included.
+  const limit = options.limit
+  const messages = limit !== undefined && limit > 0 && all.length > limit
+    ? all.slice(all.length - limit)
+    : all
 
   const events: CcEvent[] = []
   let seq = 0

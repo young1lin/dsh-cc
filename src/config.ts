@@ -58,7 +58,7 @@ export interface ClaudeCodeConfig {
   /** Default model id (e.g. claude-sonnet-4-5); empty = Claude Code picks. */
   model?: string
   /** Native permission posture for queries; the page can answer prompts in default mode. */
-  permissionMode?: 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions' | 'auto'
+  permissionMode?: 'default' | 'acceptEdits' | 'plan' | 'dontAsk' | 'bypassPermissions' | 'auto'
   /** Structured provider/proxy settings, resolved into `env` before `env` itself is layered on. */
   provider?: ClaudeCodeProviderConfig
   /** Extra environment for the claude process, layered over the inherited environment. */
@@ -98,6 +98,7 @@ export const Config: z<ClaudeCodeConfig> = z.object({
     z.const('default'),
     z.const('acceptEdits'),
     z.const('plan'),
+    z.const('dontAsk'),
     z.const('bypassPermissions'),
     z.const('auto'),
   ]),
