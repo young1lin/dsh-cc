@@ -318,8 +318,8 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                 </div>
                 <Composer
                   busy={current.status === 'busy'}
-                  onSend={text => {
-                    sendMessage(current.id, text).catch(fail)
+                  onSend={(text, images) => {
+                    sendMessage(current.id, text, images).catch(fail)
                   }}
                   onStop={() => {
                     stopSession(current.id).catch(fail)

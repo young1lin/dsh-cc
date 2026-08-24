@@ -26,6 +26,7 @@ import type { ResolvedConfig } from './config.ts'
 import type {
   AccountSummary,
   CcEventInput,
+  ImageRef,
   PermissionAnswer,
   PermissionRequest,
   SessionMeta,
@@ -55,6 +56,13 @@ export interface EngineHooks {
   dialogRequest(request: DialogRequest): void
   /** Optional failure hook: the runtime may auto-recover with a fallback model. */
   onEngineFailure?(error: Error): Promise<void> | void
+}
+
+/** One image to attach to a user message, already base64-encoded for the SDK. */
+export interface SendImage {
+  mediaType: ImageRef['mediaType']
+  /** Base64 body without a data: URL prefix. */
+  data: string
 }
 
 /** One blocking dialog awaiting a page answer. */
@@ -209,14 +217,23 @@ export class SessionEngine {
    * Submit one user text message, starting the CLI query on first use.
    * @param text - the message body.
    */
-  async send(text: string): Promise<void> {
+  async send(text: string, images: SendImage[] = []): Promise<void> {
     if (this.closed) throw new Error('dsh-cc: engine is closed')
     this.lastUsed = Date.now()
     this.ensureStarted()
     this.busy = true
+    // Images lead the content list: the model reads the attachment before the
+    // sentence about it, which is the order the CLI's own client uses.
+    const content = [
+      ...images.map(image => ({
+        type: 'image',
+        source: { type: 'base64', media_type: image.mediaType, data: image.data },
+      })),
+      ...(text.length > 0 ? [{ type: 'text', text }] : []),
+    ]
     const message = {
       type: 'user',
-      message: { role: 'user', content: [{ type: 'text', text }] },
+      message: { role: 'user', content },
       session_id: this.claudeSessionId ?? '',
       parent_tool_use_id: null,
     } as SDKUserMessage

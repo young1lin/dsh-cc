@@ -12,7 +12,7 @@
  */
 
 import { getSessionMessages, type SessionMessage } from '@anthropic-ai/claude-agent-sdk'
-import type { CcEvent, CcEventInput } from './types.ts'
+import type { CcEvent, CcEventInput, ImageRef } from './types.ts'
 
 /** Options for reading one session's historical transcript from native storage. */
 export interface ReadNativeTranscriptOptions {
@@ -22,6 +22,13 @@ export interface ReadNativeTranscriptOptions {
   limit?: number
   /** Number of underlying SDK messages to skip from the start. */
   offset?: number
+  /**
+   * Persist one inline image from the transcript and return the reference to
+   * record on the event. Native transcripts carry image bytes inline as
+   * base64, while `CcEvent` refers to them by blob id, so rehydrating them
+   * needs somewhere to put the bytes. Omit to drop images instead.
+   */
+  storeImage?: (mediaType: ImageRef['mediaType'], base64: string) => Promise<ImageRef>
 }
 
 /**
@@ -58,13 +65,66 @@ export async function readNativeTranscript(
   for (const message of messages) {
     const ts = resolveTimestamp(message, lastTs)
     lastTs = ts
-    for (const input of mapSessionMessage(message)) {
+    const inputs = mapSessionMessage(message)
+    const images = options.storeImage === undefined
+      ? []
+      : await storeMessageImages(message, options.storeImage)
+    for (const input of attachImages(inputs, images)) {
       seq += 1
       events.push({ ...input, seq, ts } as CcEvent)
     }
   }
   return events
 }
+
+/**
+ * Attach a user message's images to the event that represents it.
+ *
+ * One native record holds every content block of a turn, so its images belong
+ * to that turn's single user event rather than to events of their own. A
+ * message that is nothing but images still produces one event, with empty
+ * text, so the attachment is not silently lost.
+ * @param inputs - the events mapped from the record.
+ * @param images - the record's stored images.
+ * @returns the events with images attached.
+ */
+function attachImages(inputs: CcEventInput[], images: ImageRef[]): CcEventInput[] {
+  if (images.length === 0) return inputs
+  const index = inputs.findIndex(input => input.kind === 'user')
+  if (index < 0) return [{ kind: 'user', text: '', images }, ...inputs]
+  return inputs.map((input, at) => (at === index ? { ...input, images } : input))
+}
+
+/**
+ * Store every inline image of one native record.
+ * @param message - the record to scan.
+ * @param store - the sink that persists one image.
+ * @returns the references, in content order; empty for a record with no images.
+ */
+async function storeMessageImages(
+  message: SessionMessage,
+  store: NonNullable<ReadNativeTranscriptOptions['storeImage']>,
+): Promise<ImageRef[]> {
+  if (message.type !== 'user') return []
+  const content = readMessageContent(message.message)
+  if (content === undefined || typeof content === 'string') return []
+  const refs: ImageRef[] = []
+  for (const block of content) {
+    if (block.type !== 'image') continue
+    const source = block.source
+    if (typeof source !== 'object' || source === null) continue
+    const { type, media_type: mediaType, data } = source as Record<string, unknown>
+    if (type !== 'base64' || typeof mediaType !== 'string' || typeof data !== 'string') continue
+    if (!IMAGE_MEDIA_TYPES.includes(mediaType as ImageRef['mediaType'])) continue
+    refs.push(await store(mediaType as ImageRef['mediaType'], data))
+  }
+  return refs
+}
+
+/** Image types `CcEvent` can carry; any other inline type is dropped. */
+const IMAGE_MEDIA_TYPES: readonly ImageRef['mediaType'][] = [
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp',
+]
 
 /**
  * Map one `SessionMessage` to zero or more transcript events, without

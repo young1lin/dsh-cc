@@ -18,7 +18,7 @@ import { DisclosureRow, IconThinkOutline14, MarkdownText } from '@deepseek-ai/ds
 import { registerCss } from './css.ts'
 import { ToolRow } from './tool/ToolRow.tsx'
 import { stringField } from './tool/wire.ts'
-import type { CcEvent } from '../types.ts'
+import type { CcEvent, ImageRef } from '../types.ts'
 
 registerCss('transcript', `
 /* The user's own turn, drawn from the host's own bubble token and geometry
@@ -85,7 +85,31 @@ registerCss('transcript', `
 }
 
 .cc-tail-sep { color: var(--dsw-alias-border-l3); }
+
+/* Attachments sit above the sentence inside the user bubble, matching the
+   order the model receives them in. */
+.cc-user-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.cc-user-images img {
+  display: block;
+  max-width: 180px;
+  max-height: 180px;
+  border-radius: 10px;
+}
 `)
+
+/** URL extension per image type, mirroring the host's blob route. */
+const IMAGE_EXTENSIONS: Record<ImageRef['mediaType'], string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+}
 
 /** One tool call with its result, or any other transcript entry. */
 type Item =
@@ -244,7 +268,28 @@ function EventItem(props: { event: CcEvent }): ReactElement | null {
   const { event } = props
   switch (event.kind) {
     case 'user':
-      return <div className="cc-user">{event.text}</div>
+      return (
+        <div className="cc-user">
+          {event.images !== undefined && event.images.length > 0 && (
+            <div className="cc-user-images">
+              {event.images.map(image => (
+                <a
+                  key={image.id}
+                  href={`/cc/api/blobs/${image.id}.${IMAGE_EXTENSIONS[image.mediaType]}`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  <img
+                    src={`/cc/api/blobs/${image.id}.${IMAGE_EXTENSIONS[image.mediaType]}`}
+                    alt={image.name ?? '附件'}
+                  />
+                </a>
+              ))}
+            </div>
+          )}
+          {event.text}
+        </div>
+      )
     case 'assistant':
       return (
         <div className="cc-assistant">

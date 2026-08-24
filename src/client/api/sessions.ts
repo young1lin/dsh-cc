@@ -5,7 +5,7 @@
  * @module dsh-cc/client/api/sessions
  */
 
-import type { CcEvent, SessionMeta } from '../../types.ts'
+import type { CcEvent, ImageRef, SessionMeta } from '../../types.ts'
 import { api } from './http.ts'
 
 /** GET /sessions — every session the store knows, newest first. */
@@ -58,8 +58,11 @@ export function renameSession(id: string, name: string): Promise<{ ok: boolean }
  * @param text - message body.
  * @returns the acknowledgement; the turn itself arrives over SSE.
  */
-export function sendMessage(id: string, text: string): Promise<{ ok: boolean }> {
-  return api<{ ok: boolean }>(`/sessions/${id}/messages`, { method: 'POST', body: JSON.stringify({ text }) })
+export function sendMessage(id: string, text: string, images: ImageRef[] = []): Promise<{ ok: boolean }> {
+  return api<{ ok: boolean }>(`/sessions/${id}/messages`, {
+    method: 'POST',
+    body: JSON.stringify({ text, ...(images.length > 0 ? { images } : {}) }),
+  })
 }
 
 /**
@@ -79,4 +82,24 @@ export function stopSession(id: string): Promise<{ ok: boolean }> {
  */
 export function setSessionEnv(id: string, env: Record<string, string>): Promise<{ ok: boolean }> {
   return api<{ ok: boolean }>(`/sessions/${id}/env`, { method: 'PUT', body: JSON.stringify({ env }) })
+}
+
+/**
+ * Upload one pasted or dropped image, returning the reference to attach to a
+ * message. The body is the raw file; the server reads its type from the
+ * `content-type` header rather than parsing a multipart envelope.
+ * @param file - the image to upload.
+ * @returns the stored reference.
+ */
+export function uploadImage(file: File): Promise<{ image: ImageRef }> {
+  return api<{ image: ImageRef }>('/images', {
+    method: 'POST',
+    headers: {
+      'content-type': file.type,
+      // Header values must be Latin-1; a Chinese file name would otherwise
+      // throw before the request is sent.
+      'x-image-name': encodeURIComponent(file.name),
+    },
+    body: file,
+  })
 }

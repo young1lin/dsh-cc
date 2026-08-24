@@ -13,16 +13,24 @@ import { createRequire } from 'node:module'
 import { dirname, join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ResolvedConfig } from './config.ts'
-import { SessionEngine, type EngineHooks } from './engine.ts'
+import { SessionEngine, type EngineHooks, type SendImage } from './engine.ts'
+import { BlobStore, isImageMediaType } from './blobs.ts'
 import { SessionCatalog } from './catalog.ts'
 import { deleteNativeSession, renameNativeSession } from './native-sessions.ts'
 import { SessionStore } from './store.ts'
 import type {
   AccountSummary, CcEvent, CcEventInput, CcSettings, ConfigLayer, ConfigSummary, DirListing,
-  EffectiveEnvEntry, PermissionDestination, WireMessage,
+  EffectiveEnvEntry, ImageRef, PermissionDestination, WireMessage,
 } from './types.ts'
 
 const MAX_BODY_BYTES = 1024 * 1024
+
+/**
+ * Largest single image accepted for upload. Matches the Anthropic API's
+ * per-image limit, so an image the page accepts is one the model can be sent
+ * rather than one that fails at request time.
+ */
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
 /** Static model aliases shown before a live CLI catalog exists. */
 const STATIC_MODEL_FALLBACK = [
@@ -40,6 +48,8 @@ export class CcRuntime {
   readonly store: SessionStore
   /** The merged view over the CLI's session store and the dsh-cc sidecar. */
   readonly catalog: SessionCatalog
+  /** Image bytes attached to user messages. */
+  private readonly blobs: BlobStore
   private readonly engines = new Map<string, SessionEngine>()
   private readonly clients = new Set<ServerResponse>()
   private readonly sdkVersion: string
@@ -61,7 +71,8 @@ export class CcRuntime {
   ) {
     this.store = new SessionStore(baseConfig.dataDir)
     this.store.load()
-    this.catalog = new SessionCatalog(this.store)
+    this.blobs = new BlobStore(baseConfig.dataDir)
+    this.catalog = new SessionCatalog(this.store, this.blobs)
     // The CLI store is read from disk, so the first list is served from the
     // sidecar alone and the broadcast that follows fills in the rest.
     void this.catalog.refresh().then(() => this.broadcastSessions())
@@ -123,6 +134,56 @@ export class CcRuntime {
     return json(res, { ok: true, settings: this.settings })
   }
 
+  /**
+   * Accept one pasted or dropped image. The body is the raw bytes and the
+   * `content-type` names the image type, so there is no multipart parse and
+   * no temporary file.
+   * @param req - the upload request.
+   * @param res - the response to write.
+   */
+  private async uploadImage(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const mediaType = (req.headers['content-type'] ?? '').split(';')[0]?.trim() ?? ''
+    if (!isImageMediaType(mediaType)) {
+      return json(res, { error: `不支持的图片类型：${mediaType || '未指定'}` }, 415)
+    }
+    let bytes: Buffer
+    try {
+      bytes = await readBytes(req, MAX_IMAGE_BYTES)
+    } catch {
+      return json(res, { error: '图片超过 5MB 上限' }, 413)
+    }
+    if (bytes.length === 0) return json(res, { error: '图片内容为空' }, 400)
+    const name = req.headers['x-image-name']
+    const image = await this.blobs.put(
+      bytes,
+      mediaType,
+      typeof name === 'string' && name !== '' ? decodeURIComponent(name) : undefined,
+    )
+    return json(res, { image })
+  }
+
+  /**
+   * Serve one stored image for display. The id encodes the content, so the
+   * response is immutable and cached indefinitely.
+   * @param file - the `<id>.<ext>` path segment.
+   * @param res - the response to write.
+   */
+  private async serveBlob(file: string, res: ServerResponse): Promise<void> {
+    const [id = '', ext = ''] = file.split('.')
+    const mediaType = BLOB_EXTENSION_TYPES[ext]
+    if (mediaType === undefined || !/^[0-9a-f]{32}$/.test(id)) {
+      return json(res, { error: '无效的图片地址' }, 404)
+    }
+    const bytes = await this.blobs.get(id, mediaType)
+    if (bytes === undefined) return json(res, { error: '图片不存在' }, 404)
+    res.writeHead(200, {
+      'content-type': mediaType,
+      'content-length': String(bytes.length),
+      'cache-control': 'public, max-age=31536000, immutable',
+    })
+    res.end(bytes)
+  }
+
   private async listDir(pathname: string | undefined, res: ServerResponse): Promise<void> {
     try {
       return json(res, await readDirListing(pathname))
@@ -145,6 +206,12 @@ export class CcRuntime {
       if (parts[0] === 'settings' && parts.length === 1 && method === 'GET') return json(res, { settings: this.settings })
       if (parts[0] === 'settings' && parts.length === 1 && method === 'PUT') {
         return await this.saveSettings(req, res)
+      }
+      if (parts[0] === 'blobs' && parts.length === 2 && method === 'GET') {
+        return await this.serveBlob(parts[1] ?? '', res)
+      }
+      if (parts[0] === 'images' && parts.length === 1 && method === 'POST') {
+        return await this.uploadImage(req, res)
       }
       if (parts[0] === 'fs' && parts[1] === 'list' && parts.length === 2 && method === 'GET') {
         return await this.listDir(url.searchParams.get('path') ?? undefined, res)
@@ -266,7 +333,15 @@ export class CcRuntime {
           // restarts); busy processes also hot-switch in place.
           await this.patchMeta(id, { model })
           const engine = this.engines.get(id)
-          if (engine !== undefined && engine.busy) void engine.setModel(model === '' ? undefined : model)
+          if (engine !== undefined && engine.busy) {
+            // Detached on purpose — the next turn already uses the persisted
+            // model, so the hot-switch is a courtesy to the running turn. It
+            // still needs its own catch: an unhandled rejection here would
+            // take down the host process.
+            engine.setModel(model === '' ? undefined : model).catch((error: unknown) => {
+              this.ctx.logger?.warn?.(`dsh-cc: live model switch failed for ${id}: ${String(error)}`)
+            })
+          }
           return json(res, { ok: true, model })
         }
         if (parts.length === 3 && parts[2] === 'effort' && method === 'POST') {
@@ -279,8 +354,13 @@ export class CcRuntime {
           }
           this.effort = level === '' ? undefined : level as 'low' | 'medium' | 'high' | 'xhigh' | 'max'
           for (const [engineId, engine] of [...this.engines]) {
-            if (engine.busy) void engine.setEffort(this.effort)
-            else await this.closeEngine(engineId)
+            if (engine.busy) {
+              // Same reasoning as the live model switch: detached, but caught,
+              // so a refusing CLI cannot fault the host process.
+              engine.setEffort(this.effort).catch((error: unknown) => {
+                this.ctx.logger?.warn?.(`dsh-cc: live effort switch failed for ${engineId}: ${String(error)}`)
+              })
+            } else await this.closeEngine(engineId)
           }
           return json(res, { ok: true, effort: this.effort ?? '' })
         }
@@ -352,7 +432,18 @@ export class CcRuntime {
     if (!session) return json(res, { error: '会话不存在' }, 404)
     const body = await readJson(req)
     const text = typeof body?.text === 'string' ? body.text : ''
-    if (text.trim().length === 0) return json(res, { error: '消息不能为空' }, 400)
+    const images = readImageRefs(body?.images)
+    if (text.trim().length === 0 && images.length === 0) {
+      return json(res, { error: '消息不能为空' }, 400)
+    }
+    // Resolve every reference before starting the turn: a message whose image
+    // has been evicted must fail as a request, not half-send.
+    const attachments: SendImage[] = []
+    for (const image of images) {
+      const bytes = await this.blobs.get(image.id, image.mediaType)
+      if (bytes === undefined) return json(res, { error: '图片已失效，请重新粘贴' }, 409)
+      attachments.push({ mediaType: image.mediaType, data: bytes.toString('base64') })
+    }
     let engine = this.engines.get(id)
     if (!engine || engine.isClosed) {
       const base = this.effectiveConfig()
@@ -367,8 +458,8 @@ export class CcRuntime {
       this.engines.set(id, engine)
       this.enforceLiveCap()
     }
-    await this.emitEvent(id, { kind: 'user', text })
-    await engine.send(text)
+    await this.emitEvent(id, { kind: 'user', text, ...(images.length > 0 ? { images } : {}) })
+    await engine.send(text, attachments)
     // After send, never before: the engine creates its query lazily on the
     // first message, and an account can only be read from a live query.
     this.refreshAccount(engine)
@@ -565,6 +656,23 @@ function json(res: ServerResponse, body: unknown, status = 200): void {
   res.end(JSON.stringify(body))
 }
 
+/**
+ * Read one raw request body with a size cap.
+ * @param req - the request to drain.
+ * @param limit - maximum bytes to accept.
+ * @returns the body bytes.
+ */
+async function readBytes(req: IncomingMessage, limit: number): Promise<Buffer> {
+  const chunks: Buffer[] = []
+  let size = 0
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length
+    if (size > limit) throw new Error('请求体过大')
+    chunks.push(chunk as Buffer)
+  }
+  return Buffer.concat(chunks)
+}
+
 /** Read and parse one JSON request body with a size cap. */
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown> | undefined> {
   const chunks: Buffer[] = []
@@ -594,6 +702,39 @@ const CLI_ENV_KEY = /^(ANTHROPIC_|CLAUDE_CODE_|API_TIMEOUT_MS$|(HTTPS?|NO)_PROXY
  * parent session, which must not be rendered onto a settings page.
  */
 const CLI_ENV_INJECTED = /^CLAUDE_CODE_(SESSION_ID|CHILD_SESSION|ENTRYPOINT|EXECPATH|MESSAGING_.*)$/
+
+/**
+ * Narrow the page-supplied image list. The page is an untrusted wire peer and
+ * these ids select files to read, so an entry that is not a well-formed
+ * reference is dropped rather than reaching the blob store.
+ * @param value - the raw `images` field from the request body.
+ * @returns the valid references, in order.
+ */
+function readImageRefs(value: unknown): ImageRef[] {
+  if (!Array.isArray(value)) return []
+  const refs: ImageRef[] = []
+  for (const entry of value) {
+    if (typeof entry !== 'object' || entry === null) continue
+    const { id, mediaType, name, bytes } = entry as Record<string, unknown>
+    if (typeof id !== 'string' || !/^[0-9a-f]{32}$/.test(id)) continue
+    if (typeof mediaType !== 'string' || !isImageMediaType(mediaType)) continue
+    refs.push({
+      id,
+      mediaType,
+      ...(typeof name === 'string' ? { name } : {}),
+      bytes: typeof bytes === 'number' ? bytes : 0,
+    })
+  }
+  return refs
+}
+
+/** Blob URL extensions, the inverse of the blob store's own extension table. */
+const BLOB_EXTENSION_TYPES: Record<string, ImageRef['mediaType'] | undefined> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+}
 
 /** Rule destinations the CLI accepts; anything else from the page is dropped. */
 const PERMISSION_DESTINATIONS: readonly PermissionDestination[] = [

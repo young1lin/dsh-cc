@@ -16,6 +16,7 @@
  * @module dsh-cc/catalog
  */
 
+import type { BlobStore } from './blobs.ts'
 import { listNativeSessions } from './native-sessions.ts'
 import { readNativeTranscript } from './native-transcript.ts'
 import type { SessionStore } from './store.ts'
@@ -53,7 +54,14 @@ export class SessionCatalog {
   /** Native sessions from the last {@link refresh}, most recent first. */
   private native: SessionMeta[] = []
 
-  constructor(private readonly store: SessionStore) {}
+  /**
+   * @param store - the dsh-cc sidecar.
+   * @param blobs - where inline images from a native transcript are rehydrated.
+   */
+  constructor(
+    private readonly store: SessionStore,
+    private readonly blobs: BlobStore,
+  ) {}
 
   /**
    * Re-read the CLI's session store across every project directory.
@@ -137,7 +145,11 @@ export class SessionCatalog {
     if (meta.claudeSessionId === undefined) return await this.store.transcript(meta.id, limit)
     let native: CcEvent[]
     try {
-      native = await readNativeTranscript(meta.claudeSessionId, { cwd: meta.cwd, limit })
+      native = await readNativeTranscript(meta.claudeSessionId, {
+        cwd: meta.cwd,
+        limit,
+        storeImage: (mediaType, base64) => this.blobs.put(Buffer.from(base64, 'base64'), mediaType),
+      })
     } catch {
       // The CLI file was removed or is mid-write; the sidecar is all we have.
       return await this.store.transcript(meta.id, limit)
