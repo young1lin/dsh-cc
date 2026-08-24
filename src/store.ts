@@ -112,6 +112,25 @@ export class SessionStore {
   }
 
   /**
+   * Insert a sidecar record for a session that already exists in the CLI's own
+   * store, preserving its native id so the two stores agree on one identity.
+   *
+   * Unlike {@link create} this mints no id: adopting a CLI session under a new
+   * id would make the page resume a conversation it lists under a different
+   * key, and the transcript would be read from the wrong file.
+   * @param meta - the record to insert.
+   * @returns the inserted record, or the existing one when the id is taken.
+   */
+  async adopt(meta: SessionMeta): Promise<SessionMeta> {
+    const existing = this.sessions.get(meta.id)
+    if (existing !== undefined) return existing
+    this.sessions.set(meta.id, meta)
+    this.seq.set(meta.id, this.lastSeq(meta.id))
+    await this.persistIndex()
+    return meta
+  }
+
+  /**
    * Patch one session's metadata and refresh its updatedAt.
    * @param id - session id.
    * @param patch - fields to overwrite.

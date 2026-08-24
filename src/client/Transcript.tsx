@@ -7,25 +7,17 @@
  * pure function of the event list, so a re-render never depends on arrival
  * order.
  *
+ * This module owns the projection and the dispatch; how a given tool draws
+ * lives under `tool/`.
+ *
  * @module dsh-cc/client/Transcript
  */
 
-import { useState, type ReactElement, type ReactNode } from 'react'
-import {
-  DisclosureRow,
-  IconAgentPresetOutline16,
-  IconChecklistOutline14,
-  IconCodeOutline16,
-  IconEditOutline16,
-  IconGlobeOutline14,
-  IconListPenOutline16,
-  IconSearchOutline16,
-  IconThinkOutline14,
-  IconWarningOutline16,
-  MarkdownText,
-  StateDot,
-} from '@deepseek-ai/dsh-client-ui-primitives'
+import { useState, type ReactElement } from 'react'
+import { DisclosureRow, IconThinkOutline14, MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
 import { registerCss } from './css.ts'
+import { ToolRow } from './tool/ToolRow.tsx'
+import { stringField } from './tool/wire.ts'
 import type { CcEvent } from '../types.ts'
 
 registerCss('transcript', `
@@ -53,69 +45,8 @@ registerCss('transcript', `
 .cc-assistant :where(table) { margin: 0.5em 0; border-collapse: collapse; }
 .cc-assistant :where(th, td) { padding: 4px 10px; border: 1px solid var(--dsw-alias-border-l2); }
 
-.cc-tool { align-self: stretch; }
-
-.cc-tool-row { position: relative; overflow: hidden; }
-
-.cc-tool-title { font: var(--dsw-font-s-14); font-weight: 400; color: var(--dsw-alias-label-primary); }
-
-.cc-tool-sep {
-  flex: none;
-  width: 2px;
-  height: 2px;
-  margin: 0 8px;
-  border-radius: 1px;
-  background: var(--dsw-alias-label-caption);
-}
-
-.cc-tool-summary {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font: var(--dsw-font-s-14);
-  color: var(--dsw-alias-label-tertiary);
-}
-
-.cc-tool-summary[data-error='true'] { color: var(--dsw-alias-state-error-primary); }
-
-/* Expanded IN/OUT card: the host's gutter-labelled two-section layout on the
-   code-block surface. */
-.cc-io {
-  display: flex;
-  flex-direction: column;
-  margin: 4px 0 4px 4px;
-  border: 1px solid var(--dsw-alias-border-l1);
-  border-radius: 12px;
-  background: var(--dsw-alias-markdown-code-block);
-  font: var(--dsw-font-markdown-code-block-small);
-  font-family: var(--ds-font-family-code);
-}
-
-.cc-io-section {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  column-gap: 14px;
-  align-items: baseline;
-  max-height: 220px;
-  padding: 10px 14px;
-  overflow: auto;
-}
-
-.cc-io-label { position: sticky; top: 0; align-self: start; color: var(--dsw-alias-label-caption); }
-.cc-io-divider { flex: none; height: 1px; background: var(--dsw-alias-border-l2); }
-
-.cc-io-text {
-  min-width: 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-  color: var(--dsw-alias-label-secondary);
-}
-
-.cc-io-text[data-error='true'] { color: var(--dsw-alias-state-error-primary); }
-
 .cc-think { align-self: stretch; }
+.cc-think-title { font: var(--dsw-font-s-14); font-weight: 400; color: var(--dsw-alias-label-primary); }
 .cc-think-body {
   margin: 2px 0 4px 22px;
   white-space: pre-wrap;
@@ -198,26 +129,10 @@ export function projectTranscript(events: CcEvent[]): Item[] {
   return items
 }
 
-/** Tool names whose row carries a specific icon and title. */
-const TOOL_ICONS: Record<string, ReactNode> = {
-  Bash: <IconCodeOutline16 />,
-  BashOutput: <IconCodeOutline16 />,
-  Read: <IconListPenOutline16 />,
-  NotebookEdit: <IconEditOutline16 />,
-  Edit: <IconEditOutline16 />,
-  Write: <IconEditOutline16 />,
-  Grep: <IconSearchOutline16 />,
-  Glob: <IconSearchOutline16 />,
-  WebFetch: <IconGlobeOutline14 />,
-  WebSearch: <IconGlobeOutline14 />,
-  TodoWrite: <IconChecklistOutline14 />,
-  Task: <IconAgentPresetOutline16 />,
-  Agent: <IconAgentPresetOutline16 />,
-}
-
 /**
  * The one-line summary shown beside a tool's name while collapsed: the single
- * argument that identifies the call, not its whole JSON.
+ * argument that identifies the call, not its whole JSON. A card may override it
+ * once the call's own material is known.
  *
  * @param name - wire tool name.
  * @param input - the call arguments.
@@ -233,8 +148,9 @@ export function toolSummary(name: string, input: unknown): string {
     case 'Read':
     case 'Edit':
     case 'Write':
-    case 'NotebookEdit':
       return pick('file_path')
+    case 'NotebookEdit':
+      return pick('notebook_path')
     case 'Grep':
     case 'Glob':
       return pick('pattern')
@@ -254,83 +170,20 @@ export function toolSummary(name: string, input: unknown): string {
 }
 
 /**
- * Collapse a payload to its first line for a one-line summary.
- * @param text - the raw text.
- * @returns the first line, capped.
+ * The session's working directory, as the CLI reported it when the conversation
+ * opened. It labels the terminal prompt and shortens every path a card shows,
+ * so it is read from the transcript rather than threaded through the page: the
+ * last init wins, since a resumed session re-announces its cwd.
+ *
+ * @param events - the transcript in order.
+ * @returns the working directory, or undefined when no init event carried one.
  */
-function firstLine(text: string): string {
-  const line = text.split('\n', 1)[0] ?? ''
-  return line.length > 120 ? `${line.slice(0, 120)}…` : line
-}
-
-/**
- * Render one tool call as a single disclosure row.
- * @param props - the paired call and result.
- * @returns the row node.
- */
-function ToolItem(props: { item: Extract<Item, { k: 'tool' }> }): ReactElement {
-  const [open, setOpen] = useState(false)
-  const { call, result } = props.item
-  const name = call?.name ?? '工具'
-  const failed = result?.isError === true
-  const running = result === undefined
-  const inputText = call === undefined ? '' : safeJson(call.input)
-  const summary = failed && result !== undefined
-    ? firstLine(result.text)
-    : call === undefined ? '' : toolSummary(name, call.input)
-
-  return (
-    <div className="cc-tool">
-      <DisclosureRow
-        rowClassName="cc-tool-row"
-        titleClassName="cc-tool-title"
-        icon={failed ? <StateDot state="error" /> : running ? <StateDot state="ongoing" /> : TOOL_ICONS[name] ?? <IconWarningOutline16 />}
-        title={name}
-        open={open}
-        expandable
-        expandOnRowClick
-        keepContentWhenOpen
-        onToggle={() => setOpen(value => !value)}
-        collapsedContent={summary !== '' && (
-          <>
-            <span className="cc-tool-sep" aria-hidden />
-            <span className="cc-tool-summary" data-error={failed}>{summary}</span>
-          </>
-        )}
-      >
-        <div className="cc-io">
-          {inputText !== '' && (
-            <div className="cc-io-section">
-              <span className="cc-io-label">IN</span>
-              <span className="cc-io-text">{inputText}</span>
-            </div>
-          )}
-          {inputText !== '' && result !== undefined && <div className="cc-io-divider" />}
-          {result !== undefined && (
-            <div className="cc-io-section">
-              <span className="cc-io-label">OUT</span>
-              <span className="cc-io-text" data-error={failed}>{result.text}</span>
-            </div>
-          )}
-        </div>
-      </DisclosureRow>
-    </div>
-  )
-}
-
-/**
- * Stringify tool arguments for the expanded input section.
- * @param value - the arguments.
- * @returns pretty JSON, or the value's string form when it cannot be encoded.
- */
-function safeJson(value: unknown): string {
-  try {
-    return JSON.stringify(value, null, 2) ?? ''
-  } catch {
-    // Tool arguments come from the model as JSON, so a cycle is not reachable
-    // through the wire; a host-side caller passing one still gets a readable row.
-    return String(value)
+function sessionCwd(events: CcEvent[]): string | undefined {
+  let cwd: string | undefined
+  for (const event of events) {
+    if (event.kind === 'system' && event.subtype === 'init') cwd = stringField(event.data, 'cwd') ?? cwd
   }
+  return cwd
 }
 
 /** Thinking, shown as its own collapsed disclosure ahead of what it produced. */
@@ -339,7 +192,7 @@ function ThinkingItem(props: { text: string }): ReactElement {
   return (
     <div className="cc-think">
       <DisclosureRow
-        titleClassName="cc-tool-title"
+        titleClassName="cc-think-title"
         icon={<IconThinkOutline14 />}
         title="思考过程"
         open={open}
@@ -431,16 +284,37 @@ function EventItem(props: { event: CcEvent }): ReactElement | null {
 }
 
 /**
+ * Render one paired tool call.
+ * @param props.item - the paired call and result.
+ * @param props.cwd - the session working directory.
+ * @returns the row element.
+ */
+function ToolItem(props: { item: Extract<Item, { k: 'tool' }>; cwd: string | undefined }): ReactElement {
+  const { call, result } = props.item
+  const name = call?.name ?? '工具'
+  return (
+    <ToolRow
+      name={name}
+      input={call?.input}
+      result={result === undefined ? undefined : { text: result.text, isError: result.isError }}
+      summary={call === undefined ? '' : toolSummary(name, call.input)}
+      cwd={props.cwd}
+    />
+  )
+}
+
+/**
  * Render a whole transcript.
  * @param props - the ordered events.
  * @returns the transcript nodes.
  */
 export function Transcript(props: { events: CcEvent[] }): ReactElement {
   const items = projectTranscript(props.events)
+  const cwd = sessionCwd(props.events)
   return (
     <>
       {items.map((item, index) => item.k === 'tool'
-        ? <ToolItem key={`tool:${item.id}`} item={item} />
+        ? <ToolItem key={`tool:${item.id}`} item={item} cwd={cwd} />
         : <EventItem key={`event:${item.event.seq}:${index}`} event={item.event} />)}
     </>
   )

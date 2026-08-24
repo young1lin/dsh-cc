@@ -1,0 +1,193 @@
+/**
+ * Maps the Claude Agent SDK's historical session-message read
+ * (`getSessionMessages`) onto dsh-cc's own `CcEvent` transcript shape.
+ *
+ * `SessionMessage.message` is typed `unknown` in the SDK — it is the raw
+ * Anthropic `BetaMessage` (assistant) or `MessageParam` (user) written by
+ * another process (the `claude` CLI, or a concurrent SDK query), so every
+ * field this module reads is validated before use; a block this module does
+ * not recognize is skipped rather than thrown on.
+ *
+ * @module dsh-cc/native-transcript
+ */
+
+import { getSessionMessages, type SessionMessage } from '@anthropic-ai/claude-agent-sdk'
+import type { CcEvent, CcEventInput } from './types.ts'
+
+/** Options for reading one session's historical transcript from native storage. */
+export interface ReadNativeTranscriptOptions {
+  /** Project directory the session belongs to; omit to search every project. */
+  cwd?: string
+  /** Maximum number of underlying SDK messages to read. */
+  limit?: number
+  /** Number of underlying SDK messages to skip from the start. */
+  offset?: number
+}
+
+/**
+ * Read one session's transcript from the Claude Code CLI's own on-disk
+ * store and map it onto dsh-cc's `CcEvent` union in chronological order.
+ *
+ * One `SessionMessage` can expand into zero or more `CcEvent`s: an assistant
+ * turn's text/thinking/tool_use content blocks each become one event, and a
+ * user turn's text/tool_result content blocks likewise. `seq` is assigned
+ * sequentially over the flattened event list, not over the source messages.
+ *
+ * @param sessionId - native session UUID.
+ * @param options - project directory and pagination, forwarded to `getSessionMessages`.
+ * @returns the mapped events; empty when the session has no messages.
+ */
+export async function readNativeTranscript(
+  sessionId: string,
+  options: ReadNativeTranscriptOptions = {},
+): Promise<CcEvent[]> {
+  let messages: SessionMessage[]
+  try {
+    messages = await getSessionMessages(sessionId, {
+      dir: options.cwd,
+      limit: options.limit,
+      offset: options.offset,
+    })
+  } catch (error) {
+    throw new Error(`dsh-cc: failed to read native transcript for session ${sessionId}`, { cause: error })
+  }
+
+  const events: CcEvent[] = []
+  let seq = 0
+  let lastTs = new Date(0).toISOString()
+  for (const message of messages) {
+    const ts = resolveTimestamp(message, lastTs)
+    lastTs = ts
+    for (const input of mapSessionMessage(message)) {
+      seq += 1
+      events.push({ ...input, seq, ts } as CcEvent)
+    }
+  }
+  return events
+}
+
+/**
+ * Map one `SessionMessage` to zero or more transcript events, without
+ * `seq`/`ts` (the caller assigns those over the full flattened sequence).
+ * @param message - one record from `getSessionMessages`.
+ * @returns the mapped events in the order their source content blocks appeared;
+ *   empty for a record kind this module does not render (e.g. `system`).
+ */
+export function mapSessionMessage(message: SessionMessage): CcEventInput[] {
+  const content = readMessageContent(message.message)
+  if (content === undefined) return []
+  const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : content
+  if (message.type === 'assistant') return blocks.flatMap(mapAssistantBlock)
+  if (message.type === 'user') return blocks.flatMap(mapUserBlock)
+  // 'system' SessionMessage records (compaction boundaries, etc.) carry no
+  // `message` payload through getSessionMessages — nothing to render.
+  return []
+}
+
+/** One Anthropic content block as it appears in a native transcript record. */
+interface RawBlock {
+  type: string
+  [key: string]: unknown
+}
+
+/**
+ * Read and validate the `message.content` field of a raw SDK record.
+ * @param message - the `SessionMessage.message` value (`unknown` in the SDK).
+ * @returns the content as a string or a block array, or undefined when the
+ *   record does not carry the shape this module expects.
+ */
+function readMessageContent(message: unknown): string | RawBlock[] | undefined {
+  if (typeof message !== 'object' || message === null || !('content' in message)) return undefined
+  const content = (message as { content: unknown }).content
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return undefined
+  const blocks: RawBlock[] = []
+  for (const block of content) {
+    if (typeof block === 'object' && block !== null && typeof (block as { type?: unknown }).type === 'string') {
+      blocks.push(block as RawBlock)
+    }
+    // A block without a string `type` cannot be dispatched below; skipped.
+  }
+  return blocks
+}
+
+/**
+ * Map one assistant content block to its transcript event.
+ * @param block - a validated content block from an assistant message.
+ * @returns a single-element array for a recognized, non-empty block; empty
+ *   for an empty text/thinking block or a block type this module skips
+ *   (e.g. `redacted_thinking`, `server_tool_use`).
+ */
+function mapAssistantBlock(block: RawBlock): CcEventInput[] {
+  if (block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0) {
+    return [{ kind: 'assistant', text: block.text }]
+  }
+  if (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.trim().length > 0) {
+    return [{ kind: 'thinking', text: block.thinking }]
+  }
+  if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
+    return [{ kind: 'tool_use', toolUseId: block.id, name: block.name, input: block.input }]
+  }
+  return []
+}
+
+/**
+ * Map one user content block to its transcript event.
+ * @param block - a validated content block from a user message.
+ * @returns a single-element array for a recognized, non-empty block; empty
+ *   for an empty text block or a block type this module does not render.
+ *   Native `image` blocks are dropped: dsh-cc's `ImageRef` addresses bytes
+ *   in its own session-store `blobs/` directory, which a native transcript
+ *   was never written through, so there is no blob to reference.
+ */
+function mapUserBlock(block: RawBlock): CcEventInput[] {
+  if (block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0) {
+    return [{ kind: 'user', text: block.text }]
+  }
+  if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+    return [{
+      kind: 'tool_result',
+      toolUseId: block.tool_use_id,
+      text: flattenToolResultContent(block.content),
+      isError: block.is_error === true,
+    }]
+  }
+  return []
+}
+
+/**
+ * Flatten a tool_result block's `content` field to display text.
+ * @param content - string, content-block array, or absent.
+ * @returns the flattened text; empty string when `content` is absent.
+ */
+function flattenToolResultContent(content: unknown): string {
+  if (content === undefined || content === null) return ''
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return JSON.stringify(content)
+  const parts: string[] = []
+  for (const block of content) {
+    if (typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'text'
+      && typeof (block as { text?: unknown }).text === 'string') {
+      parts.push((block as { text: string }).text)
+    } else {
+      parts.push(JSON.stringify(block))
+    }
+  }
+  return parts.join('\n')
+}
+
+/**
+ * Resolve one record's display timestamp. `SessionMessage` does not declare
+ * a `timestamp` field, but the CLI's on-disk records carry one at runtime
+ * (mirroring the sibling `SDKAssistantMessage`/`SDKUserMessage` field); a
+ * record without a usable value reuses the previous event's timestamp so
+ * ordering stays monotonic.
+ * @param message - the source record.
+ * @param previous - the previous event's resolved timestamp.
+ * @returns an ISO 8601 timestamp.
+ */
+function resolveTimestamp(message: SessionMessage, previous: string): string {
+  const raw = (message as unknown as { timestamp?: unknown }).timestamp
+  if (typeof raw === 'string' && !Number.isNaN(Date.parse(raw))) return raw
+  return previous
+}

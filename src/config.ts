@@ -9,6 +9,46 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 
+/**
+ * Structured Anthropic-compatible provider settings, resolved into the same
+ * `env` map `ClaudeCodeConfig.env` layers onto the claude process — this is a
+ * named, schema-validated way to set the same well-known variables the raw
+ * `env` dict accepts, for a `cordis.patch.yml` that wants a gateway endpoint
+ * without hand-writing env var names. An explicit `env` key always wins over
+ * its structured counterpart, so `env` remains the escape hatch for anything
+ * these fields don't cover.
+ */
+export interface ClaudeCodeProviderConfig {
+  /** Anthropic-compatible endpoint; resolves to ANTHROPIC_BASE_URL. Empty = Claude's official API. */
+  baseUrl?: string
+  /** Bearer credential; resolves to ANTHROPIC_AUTH_TOKEN. */
+  authToken?: string
+  /** API-key credential; resolves to ANTHROPIC_API_KEY. Only takes effect when `authToken` is unset. */
+  apiKey?: string
+  /**
+   * Model id or alias the CLI resolves through the provider's own catalog; resolves to
+   * ANTHROPIC_MODEL. Distinct from `ClaudeCodeConfig.model`, which is the SDK's `model` query
+   * option — the two are separate resolution mechanisms and either or both may be set.
+   */
+  model?: string
+  /** Opus-tier alias; resolves to ANTHROPIC_DEFAULT_OPUS_MODEL. */
+  opusModel?: string
+  /** Sonnet-tier alias; resolves to ANTHROPIC_DEFAULT_SONNET_MODEL. */
+  sonnetModel?: string
+  /** Haiku-tier alias; resolves to ANTHROPIC_DEFAULT_HAIKU_MODEL. */
+  haikuModel?: string
+  /** Small/fast-tier alias; resolves to ANTHROPIC_SMALL_FAST_MODEL. */
+  smallFastModel?: string
+  /** HTTPS proxy; resolves to HTTPS_PROXY. */
+  httpsProxy?: string
+  /** HTTP proxy; resolves to HTTP_PROXY. */
+  httpProxy?: string
+  /** Proxy bypass list; resolves to NO_PROXY. */
+  noProxy?: string
+  /** Per-request timeout in milliseconds; resolves to API_TIMEOUT_MS. */
+  apiTimeoutMs?: number
+}
+
 /** Plugin config fields; every field is optional with a resolved default. */
 export interface ClaudeCodeConfig {
   /** Session store directory; defaults to $DSH_HOME (or ~/.dsh) + /claude-code. */
@@ -19,6 +59,8 @@ export interface ClaudeCodeConfig {
   model?: string
   /** Native permission posture for queries; the page can answer prompts in default mode. */
   permissionMode?: 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions' | 'auto'
+  /** Structured provider/proxy settings, resolved into `env` before `env` itself is layered on. */
+  provider?: ClaudeCodeProviderConfig
   /** Extra environment for the claude process, layered over the inherited environment. */
   env?: Record<string, string>
   /** Maximum simultaneously live CLI processes; idle overflow is closed and resumed later. */
@@ -30,6 +72,22 @@ export interface ClaudeCodeConfig {
   /** Default reasoning effort for new sessions; unset = the CLI default. */
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 }
+
+/** Runtime configuration schema for the structured provider settings. */
+const ProviderConfigSchema: z<ClaudeCodeProviderConfig> = z.object({
+  baseUrl: z.string(),
+  authToken: z.string(),
+  apiKey: z.string(),
+  model: z.string(),
+  opusModel: z.string(),
+  sonnetModel: z.string(),
+  haikuModel: z.string(),
+  smallFastModel: z.string(),
+  httpsProxy: z.string(),
+  httpProxy: z.string(),
+  noProxy: z.string(),
+  apiTimeoutMs: z.natural(),
+})
 
 /** Runtime configuration schema for the dsh-cc plugin. */
 export const Config: z<ClaudeCodeConfig> = z.object({
@@ -43,6 +101,7 @@ export const Config: z<ClaudeCodeConfig> = z.object({
     z.const('bypassPermissions'),
     z.const('auto'),
   ]),
+  provider: ProviderConfigSchema,
   env: z.dict(z.string()),
   maxLiveSessions: z.natural().max(64),
   maxTurns: z.natural(),
@@ -81,10 +140,38 @@ export function resolveConfig(config: ClaudeCodeConfig): ResolvedConfig {
     cwd: resolve(config.cwd || process.cwd()),
     model: config.model || '',
     permissionMode: config.permissionMode || 'auto',
-    env: { ...config.env },
+    // The structured fields resolve first so an explicit `env` key can always override its
+    // structured counterpart, matching `env`'s existing role as the escape hatch.
+    env: { ...resolveProviderEnv(config.provider ?? {}), ...config.env },
     maxLiveSessions: config.maxLiveSessions || 4,
     maxTurns: config.maxTurns || 0,
     executablePath: config.executablePath || '',
     ...(config.effort !== undefined ? { effort: config.effort } : {}),
   }
+}
+
+/**
+ * Project the structured provider settings onto their well-known env var names.
+ * @param provider - the structured provider config; absent fields are omitted.
+ * @returns the env entries the structured fields set; a field left unset contributes no key.
+ */
+function resolveProviderEnv(provider: ClaudeCodeProviderConfig): Record<string, string> {
+  const env: Record<string, string> = {}
+  const set = (key: string, value: string | number | undefined): void => {
+    if (value === undefined || value === '') return
+    env[key] = String(value)
+  }
+  set('ANTHROPIC_BASE_URL', provider.baseUrl)
+  set('ANTHROPIC_AUTH_TOKEN', provider.authToken)
+  set('ANTHROPIC_API_KEY', provider.apiKey)
+  set('ANTHROPIC_MODEL', provider.model)
+  set('ANTHROPIC_DEFAULT_OPUS_MODEL', provider.opusModel)
+  set('ANTHROPIC_DEFAULT_SONNET_MODEL', provider.sonnetModel)
+  set('ANTHROPIC_DEFAULT_HAIKU_MODEL', provider.haikuModel)
+  set('ANTHROPIC_SMALL_FAST_MODEL', provider.smallFastModel)
+  set('HTTPS_PROXY', provider.httpsProxy)
+  set('HTTP_PROXY', provider.httpProxy)
+  set('NO_PROXY', provider.noProxy)
+  set('API_TIMEOUT_MS', provider.apiTimeoutMs)
+  return env
 }

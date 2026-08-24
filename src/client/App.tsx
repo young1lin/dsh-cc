@@ -19,6 +19,8 @@ import { Composer } from './Composer.tsx'
 import { PermissionCard, QuestionCard } from './Interaction.tsx'
 import { SessionRail } from './SessionRail.tsx'
 import { StatusBar } from './StatusBar.tsx'
+import { LiveTurnView } from './LiveTurnView.tsx'
+import { reduceDelta, type LiveTurn } from './stream.ts'
 import { Transcript } from './Transcript.tsx'
 import { SettingsModal } from './settings/SettingsModal.tsx'
 import { SessionEnvModal } from './settings/SessionEnvModal.tsx'
@@ -58,6 +60,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   const [context, setContext] = useState<ContextUsage | undefined>()
   const [permissions, setPermissions] = useState<PendingPermission[]>([])
   const [dialogs, setDialogs] = useState<PendingDialog[]>([])
+  const [live, setLive] = useState<LiveTurn | undefined>()
   const [connected, setConnected] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [envSessionId, setEnvSessionId] = useState<string | undefined>()
@@ -120,7 +123,19 @@ export function CcApp(props: { onClose(): void }): ReactElement {
         case 'event':
           if (message.sessionId !== currentIdRef.current) break
           setEvents(previous => [...previous, message.event])
-          if (message.event.kind === 'result') refreshTelemetry(currentIdRef.current)
+          // Only the turn's own end clears the live tail. Blocks commit one at
+          // a time WITHIN a turn — the thinking event lands while the text
+          // block is still streaming — so clearing on every committed event
+          // would drop the rest of the turn. A block that has already been
+          // committed is hidden by its `closed` flag instead.
+          if (message.event.kind === 'result') {
+            setLive(undefined)
+            refreshTelemetry(currentIdRef.current)
+          }
+          break
+        case 'delta':
+          if (message.sessionId !== currentIdRef.current) break
+          setLive(previous => reduceDelta(previous, message.delta))
           break
         case 'permission':
           setPermissions(previous => [...previous, { sessionId: message.sessionId, request: message.request }])
@@ -139,8 +154,8 @@ export function CcApp(props: { onClose(): void }): ReactElement {
           setDialogs(previous => previous.filter(item => item.id !== message.requestId))
           break
         default:
-          // `delta` frames belong to the streaming layer; an unknown frame from
-          // a newer host half is ignored rather than breaking the stream.
+          // An unknown frame from a newer node half is ignored rather than
+          // breaking the stream.
           break
       }
     }, setConnected)
@@ -152,6 +167,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   }, [])
 
   useEffect(() => {
+    setLive(undefined)
     if (currentId === undefined) {
       setEvents([])
       return
@@ -175,7 +191,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   useEffect(() => {
     const element = scrollRef.current
     if (element !== null) element.scrollTop = element.scrollHeight
-  }, [events.length, currentId])
+  }, [events.length, live, currentId])
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent): void => {
@@ -252,7 +268,12 @@ export function CcApp(props: { onClose(): void }): ReactElement {
         </header>
 
         {current !== undefined && (
-          <StatusBar sessionId={current.id} context={context} usage={usage} />
+          <StatusBar
+            sessionId={current.id}
+            context={context}
+            usage={usage}
+            fallbackCostUsd={current.totalCostUsd}
+          />
         )}
 
         {error !== undefined && (
@@ -268,7 +289,9 @@ export function CcApp(props: { onClose(): void }): ReactElement {
               <>
                 <div className="cc-scroll" ref={scrollRef}>
                   <Transcript events={events} />
-                  {events.length === 0 && <div className="cc-empty">发送第一条消息，开始与 Claude Code 对话</div>}
+                  <LiveTurnView turn={live} />
+                  {events.length === 0 && live === undefined
+                    && <div className="cc-empty">发送第一条消息，开始与 Claude Code 对话</div>}
                   {permissions
                     .filter(item => item.sessionId === current.id)
                     .map(item => (

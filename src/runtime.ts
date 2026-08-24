@@ -14,9 +14,12 @@ import { dirname, join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ResolvedConfig } from './config.ts'
 import { SessionEngine, type EngineHooks } from './engine.ts'
+import { SessionCatalog } from './catalog.ts'
+import { deleteNativeSession, renameNativeSession } from './native-sessions.ts'
 import { SessionStore } from './store.ts'
 import type {
-  CcEvent, CcEventInput, CcSettings, ConfigLayer, ConfigSummary, DirListing, EffectiveEnvEntry, WireMessage,
+  AccountSummary, CcEvent, CcEventInput, CcSettings, ConfigLayer, ConfigSummary, DirListing,
+  EffectiveEnvEntry, PermissionDestination, WireMessage,
 } from './types.ts'
 
 const MAX_BODY_BYTES = 1024 * 1024
@@ -35,6 +38,8 @@ const STATIC_MODEL_FALLBACK = [
  */
 export class CcRuntime {
   readonly store: SessionStore
+  /** The merged view over the CLI's session store and the dsh-cc sidecar. */
+  readonly catalog: SessionCatalog
   private readonly engines = new Map<string, SessionEngine>()
   private readonly clients = new Set<ServerResponse>()
   private readonly sdkVersion: string
@@ -43,6 +48,12 @@ export class CcRuntime {
   private settings: CcSettings
   /** Live-chosen reasoning effort; undefined keeps each model's default. */
   private effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined
+  /**
+   * The account the CLI last reported. Only a live CLI can answer, so this is
+   * cached from the first engine that resolves one and survives that engine's
+   * close; a credential change is picked up by the next engine start.
+   */
+  private account: AccountSummary | undefined
 
   constructor(
     private readonly ctx: Context,
@@ -50,6 +61,10 @@ export class CcRuntime {
   ) {
     this.store = new SessionStore(baseConfig.dataDir)
     this.store.load()
+    this.catalog = new SessionCatalog(this.store)
+    // The CLI store is read from disk, so the first list is served from the
+    // sidecar alone and the broadcast that follows fills in the rest.
+    void this.catalog.refresh().then(() => this.broadcastSessions())
     this.settings = loadSettings(baseConfig.dataDir)
     this.sdkVersion = readSdkVersion()
     this.heartbeat = setInterval(() => {
@@ -124,7 +139,9 @@ export class CcRuntime {
     const method = req.method ?? 'GET'
     try {
       if (parts[0] === 'events' && parts.length === 1 && method === 'GET') return this.sse(req, res)
-      if (parts[0] === 'config' && parts.length === 1 && method === 'GET') return json(res, this.configSummary())
+      if (parts[0] === 'config' && parts.length === 1 && method === 'GET') {
+        return json(res, { config: this.configSummary() })
+      }
       if (parts[0] === 'settings' && parts.length === 1 && method === 'GET') return json(res, { settings: this.settings })
       if (parts[0] === 'settings' && parts.length === 1 && method === 'PUT') {
         return await this.saveSettings(req, res)
@@ -133,7 +150,10 @@ export class CcRuntime {
         return await this.listDir(url.searchParams.get('path') ?? undefined, res)
       }
       if (parts[0] === 'sessions') {
-        if (parts.length === 1 && method === 'GET') return json(res, { sessions: this.store.list() })
+        if (parts.length === 1 && method === 'GET') {
+          await this.catalog.refresh()
+          return json(res, { sessions: this.catalog.list() })
+        }
         if (parts.length === 1 && method === 'POST') {
           const body = await readJson(req)
           const session = await this.store.create(body ?? {}, { cwd: this.effectiveConfig().cwd })
@@ -142,19 +162,30 @@ export class CcRuntime {
         }
         const id = parts[1] ?? ''
         if (parts.length === 2 && method === 'GET') {
-          const session = this.store.get(id)
+          const session = this.store.get(id) ?? await this.catalog.adopt(id)
           if (!session) return json(res, { error: '会话不存在' }, 404)
-          return json(res, { session, events: await this.store.transcript(id) })
+          return json(res, { session, events: await this.catalog.transcript(session) })
         }
         if (parts.length === 2 && method === 'DELETE') {
+          const session = this.catalog.get(id)
+          if (!session) return json(res, { error: '会话不存在' }, 404)
           await this.closeEngine(id)
-          const removed = await this.store.remove(id)
-          if (!removed) return json(res, { error: '会话不存在' }, 404)
+          await this.store.remove(id)
+          // The CLI's own copy is the conversation; leaving it behind would
+          // make a deleted session reappear on the next refresh.
+          if (session.claudeSessionId !== undefined) {
+            try {
+              await deleteNativeSession(session.claudeSessionId, { cwd: session.cwd })
+            } catch (error) {
+              this.ctx.logger?.warn?.(`dsh-cc: could not delete native session ${session.claudeSessionId}: ${String(error)}`)
+            }
+          }
+          await this.catalog.refresh()
           this.broadcastSessions()
           return json(res, { ok: true })
         }
         if (parts.length === 3 && parts[2] === 'name' && method === 'PUT') {
-          const session = this.store.get(id)
+          const session = this.store.get(id) ?? await this.catalog.adopt(id)
           if (!session) return json(res, { error: '会话不存在' }, 404)
           const body = await readJson(req)
           const name = typeof body?.name === 'string' ? body.name.trim() : ''
@@ -162,6 +193,14 @@ export class CcRuntime {
             return json(res, { error: '名称需为 1-80 个字符' }, 400)
           }
           await this.patchMeta(id, { name })
+          // Title the CLI's record too, so `claude --resume` lists the same name.
+          if (session.claudeSessionId !== undefined) {
+            try {
+              await renameNativeSession(session.claudeSessionId, name, { cwd: session.cwd })
+            } catch (error) {
+              this.ctx.logger?.warn?.(`dsh-cc: could not retitle native session ${session.claudeSessionId}: ${String(error)}`)
+            }
+          }
           return json(res, { ok: true, name })
         }
         if (parts.length === 3 && parts[2] === 'env' && method === 'PUT') {
@@ -256,6 +295,15 @@ export class CcRuntime {
           if (usage === undefined) return json(res, { available: false, reason: '查询失败或该账户类型无额度数据' })
           return json(res, { available: true, usage })
         }
+        if (parts.length === 3 && parts[2] === 'commands' && method === 'GET') {
+          const engine = this.engines.get(id)
+          if (engine === undefined || engine.isClosed) {
+            return json(res, { available: false, commands: [] })
+          }
+          const commands = await engine.supportedCommands()
+          if (commands === undefined) return json(res, { available: false, commands: [] })
+          return json(res, { available: true, commands })
+        }
         if (parts.length === 3 && parts[2] === 'stop' && method === 'POST') {
           const engine = this.engines.get(id)
           if (!engine) return json(res, { error: '会话没有正在运行的进程' }, 404)
@@ -300,7 +348,7 @@ export class CcRuntime {
   }
 
   private async sendMessage(id: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const session = this.store.get(id)
+    const session = this.store.get(id) ?? await this.catalog.adopt(id)
     if (!session) return json(res, { error: '会话不存在' }, 404)
     const body = await readJson(req)
     const text = typeof body?.text === 'string' ? body.text : ''
@@ -321,6 +369,9 @@ export class CcRuntime {
     }
     await this.emitEvent(id, { kind: 'user', text })
     await engine.send(text)
+    // After send, never before: the engine creates its query lazily on the
+    // first message, and an account can only be read from a live query.
+    this.refreshAccount(engine)
     await this.patchMeta(id, { status: 'busy', lastError: undefined, messageCount: session.messageCount + 1 })
     return json(res, { ok: true }, 202)
   }
@@ -337,7 +388,12 @@ export class CcRuntime {
     const body = await readJson(req)
     const behavior = body?.behavior === 'allow' ? 'allow' as const : 'deny' as const
     const message = typeof body?.message === 'string' ? body.message : undefined
-    const decided = engine?.answerPermission(requestId, behavior, message)
+    const remember = readDestination(body?.remember)
+    const decided = engine?.answerPermission(requestId, {
+      behavior,
+      ...(message !== undefined ? { message } : {}),
+      ...(remember !== undefined ? { remember } : {}),
+    })
     if (!decided) return json(res, { error: '权限请求不存在或已处理' }, 404)
     this.broadcast({ t: 'permission-done', sessionId: id, requestId, behavior: decided })
     return json(res, { ok: true })
@@ -350,6 +406,9 @@ export class CcRuntime {
       },
       updateMeta: async patch => {
         await this.patchMeta(sessionId, patch)
+      },
+      delta: delta => {
+        this.broadcast({ t: 'delta', sessionId, delta })
       },
       permissionRequest: request => {
         this.broadcast({ t: 'permission', sessionId, request })
@@ -376,7 +435,7 @@ export class CcRuntime {
     const fallback = session.lastGoodModel
     if (fallback === undefined || fallback === '' || fallback === session.model) return
     // Find the last user message to replay.
-    const events = await this.store.transcript(sessionId, 40)
+    const events = await this.catalog.transcript(session, 40)
     const lastUser = [...events].reverse().find(event => event.kind === 'user')
     if (lastUser === undefined) return
     await this.patchMeta(sessionId, { model: fallback, lastError: undefined, status: 'idle' })
@@ -394,13 +453,16 @@ export class CcRuntime {
     )
     this.engines.set(sessionId, engine)
     await engine.send(lastUser.text)
+    this.refreshAccount(engine)
     await this.patchMeta(sessionId, { status: 'busy' })
     this.broadcastSessions()
   }
 
   private async emitEvent(sessionId: string, input: CcEventInput): Promise<void> {
     const event = { ...input, seq: this.store.nextSeq(sessionId), ts: new Date().toISOString() } as CcEvent
-    await this.store.append(sessionId, event)
+    if (SessionCatalog.persists(this.store.get(sessionId), event)) {
+      await this.store.append(sessionId, event)
+    }
     this.broadcast({ t: 'event', sessionId, event })
   }
 
@@ -410,7 +472,7 @@ export class CcRuntime {
   }
 
   private broadcastSessions(): void {
-    this.broadcast({ t: 'sessions', sessions: this.store.list() })
+    this.broadcast({ t: 'sessions', sessions: this.catalog.list() })
   }
 
   private broadcast(message: WireMessage): void {
@@ -456,7 +518,24 @@ export class CcRuntime {
       env: effectiveEnvEntries(this.baseConfig.env, this.settings.env),
       liveSessions: this.engines.size,
       sdkVersion: this.sdkVersion,
+      ...(this.account !== undefined ? { account: this.account } : {}),
     }
+  }
+
+  /**
+   * Ask a freshly started engine which account it authenticated as, and
+   * republish the config when the answer differs from the cached one. Runs
+   * detached: the account readout is informational, and a CLI that cannot
+   * answer must not delay the turn that started it.
+   * @param engine - the engine to interrogate.
+   */
+  private refreshAccount(engine: SessionEngine): void {
+    void engine.accountInfo().then(account => {
+      if (account === undefined) return
+      if (JSON.stringify(account) === JSON.stringify(this.account)) return
+      this.account = account
+      this.broadcast({ t: 'hello', config: this.configSummary() })
+    })
   }
 
   /** Close idle engines beyond the live cap, oldest use first. */
@@ -498,6 +577,39 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown> |
   const raw = Buffer.concat(chunks).toString('utf8')
   if (raw.trim().length === 0) return undefined
   return JSON.parse(raw) as Record<string, unknown>
+}
+
+/**
+ * Environment variables Claude Code itself reads, matched by the families its
+ * own documentation defines rather than by an enumerated list, so a variable
+ * the CLI gains later is still reported. Used only to decide what is worth
+ * showing on the settings page; it never filters what the CLI is given.
+ */
+const CLI_ENV_KEY = /^(ANTHROPIC_|CLAUDE_CODE_|API_TIMEOUT_MS$|(HTTPS?|NO)_PROXY$)/i
+
+/**
+ * Variables a parent Claude Code process injects into the processes it spawns.
+ * They match {@link CLI_ENV_KEY} but are handoff plumbing, not configuration
+ * anyone set — and two of them carry a live credential and IPC path of the
+ * parent session, which must not be rendered onto a settings page.
+ */
+const CLI_ENV_INJECTED = /^CLAUDE_CODE_(SESSION_ID|CHILD_SESSION|ENTRYPOINT|EXECPATH|MESSAGING_.*)$/
+
+/** Rule destinations the CLI accepts; anything else from the page is dropped. */
+const PERMISSION_DESTINATIONS: readonly PermissionDestination[] = [
+  'userSettings', 'projectSettings', 'localSettings', 'session', 'cliArg',
+]
+
+/**
+ * Narrow one page-supplied rule destination. The page is an untrusted wire
+ * peer, and an unrecognised destination would make the CLI reject the whole
+ * permission response, so an invalid value degrades to a one-shot decision
+ * rather than failing the tool call.
+ * @param value - the raw `remember` field from the request body.
+ * @returns the destination when valid, else undefined.
+ */
+function readDestination(value: unknown): PermissionDestination | undefined {
+  return PERMISSION_DESTINATIONS.find(destination => destination === value)
 }
 
 /** Default settings: every field empty, so the cordis config stays authoritative. */
@@ -613,10 +725,23 @@ function effectiveEnvEntries(
   settings: Record<string, string>,
 ): EffectiveEnvEntry[] {
   const winner = new Map<string, { value: string; layer: ConfigLayer }>()
-  for (const [key, value] of Object.entries(plugin)) winner.set(key, { value, layer: 'plugin' })
+  // The CLI is spawned with this process's environment, so a variable set in
+  // the shell that launched dsh reaches Claude Code even though no dsh-cc
+  // layer mentions it. Reporting it is what makes "which endpoint am I
+  // actually talking to" answerable from the page.
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value === undefined) continue
+    if (!CLI_ENV_KEY.test(key) || CLI_ENV_INJECTED.test(key)) continue
+    winner.set(key, { value, layer: 'process' })
+  }
+  // Settings replace the plugin's env map wholesale rather than merging into
+  // it (see effectiveConfig), so a non-empty settings layer retires every
+  // plugin entry. The process layer survives either way: the CLI inherits it
+  // from the spawn regardless of which dsh-cc layer wins.
   if (Object.keys(settings).length > 0) {
-    winner.clear()
     for (const [key, value] of Object.entries(settings)) winner.set(key, { value, layer: 'settings' })
+  } else {
+    for (const [key, value] of Object.entries(plugin)) winner.set(key, { value, layer: 'plugin' })
   }
   return [...winner.entries()]
     .map(([key, { value, layer }]) => SECRET_KEY.test(key)
