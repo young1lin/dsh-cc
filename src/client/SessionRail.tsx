@@ -6,7 +6,15 @@
  */
 
 import { useEffect, useState, type ReactElement } from 'react'
-import { Button, Input, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
+import {
+  Button,
+  IconFolderClose16,
+  IconFolderOpen16,
+  IconPlusOutline16,
+  IconTriangleRightFill14,
+  Input,
+  StateDot,
+} from '@deepseek-ai/dsh-client-ui-primitives'
 import { DirectoryPicker } from './DirectoryPicker.tsx'
 import { registerCss } from './css.ts'
 import type { ConfigSummary, SessionMeta } from '../types.ts'
@@ -183,8 +191,13 @@ function SessionRow(props: {
  * its structure instead of 200 rows. A selection that later moves into the
  * group — a newly created session, a resume — re-reveals it; a deliberate
  * manual collapse is still respected until that happens.
+ *
+ * The header row mirrors the host workspace browser's project row (figma cell
+ * set 14:3080): folder glyph that swaps to a rotating chevron on hover, the
+ * directory's title, and hover-revealed row actions — here the create button,
+ * which starts a session directly in this directory.
  * @param props - the group, the selected session id, whether the group is the
- *   default-open one, and the row callbacks.
+ *   default-open one, and the row plus create callbacks.
  * @returns the section node.
  */
 function ProjectGroup(props: {
@@ -194,6 +207,7 @@ function ProjectGroup(props: {
   onSelect(id: string): void
   onDelete(id: string): void
   onRename(id: string, name: string): void
+  onCreate(form: { name?: string; cwd?: string; model?: string }): void
 }): ReactElement {
   const containsCurrent =
     props.currentId !== undefined && props.group.sessions.some(session => session.id === props.currentId)
@@ -205,18 +219,39 @@ function ProjectGroup(props: {
 
   return (
     <div className="cc-group">
-      <button
-        type="button"
-        className="cc-group-head"
-        data-open={open}
-        title={props.group.cwd.length > 0 ? props.group.cwd : '尚未运行过回合的会话，没有记录工作目录'}
+      <div
+        className="cc-project-row"
+        role="treeitem"
         aria-expanded={open}
+        title={props.group.cwd.length > 0 ? props.group.cwd : '尚未运行过回合的会话，没有记录工作目录'}
         onClick={() => setOpen(value => !value)}
       >
-        <span className="cc-group-caret" aria-hidden>▾</span>
-        <span className="cc-group-name">{groupLabel(props.group.cwd)}</span>
-        <span className="cc-group-count">{props.group.sessions.length}</span>
-      </button>
+        <span className="cc-slot cc-folder" data-active={open && containsCurrent}>
+          {open ? <IconFolderOpen16 /> : <IconFolderClose16 />}
+        </span>
+        <span className="cc-slot cc-chevron">
+          <IconTriangleRightFill14 />
+        </span>
+        <span className="cc-project-text">
+          <span className="cc-title">{groupLabel(props.group.cwd)}</span>
+        </span>
+        {props.group.cwd.length > 0 && (
+          <span className="cc-row-actions">
+            <button
+              type="button"
+              className="cc-icon-button"
+              aria-label={`在 ${groupLabel(props.group.cwd)} 新建会话`}
+              title={`在此目录新建会话：${props.group.cwd}`}
+              onClick={event => {
+                event.stopPropagation()
+                props.onCreate({ cwd: props.group.cwd })
+              }}
+            >
+              <IconPlusOutline16 />
+            </button>
+          </span>
+        )}
+      </div>
       {open && props.group.sessions.map(session => (
         <SessionRow
           key={session.id}
@@ -340,6 +375,7 @@ export function SessionRail(props: {
             onSelect={props.onSelect}
             onDelete={props.onDelete}
             onRename={props.onRename}
+            onCreate={props.onCreate}
           />
         ))}
         {props.sessions.length === 0 && !creating && <div className="cc-empty">暂无会话</div>}

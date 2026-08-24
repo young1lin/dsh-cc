@@ -53,6 +53,8 @@ function sidecarOnly(kind: string, subtype: string | undefined): boolean {
 export class SessionCatalog {
   /** Native sessions from the last {@link refresh}, most recent first. */
   private native: SessionMeta[] = []
+  /** Last-refresh fingerprint; equal strings mean nothing native moved. */
+  private signature = ''
 
   /**
    * @param store - the dsh-cc sidecar.
@@ -69,14 +71,22 @@ export class SessionCatalog {
    * A failure here is not fatal: the CLI store may be absent on a machine that
    * has only ever run Claude Code through this page, and the sidecar alone
    * still serves a working list.
-   * @returns nothing; failures leave the previous cache in place.
+   * @returns whether anything native changed — a moved `updatedAt` or a
+   *   flipped status — so a poller can skip broadcasting a quiet store.
    */
-  async refresh(): Promise<void> {
+  async refresh(): Promise<boolean> {
+    let fresh: SessionMeta[]
     try {
-      this.native = await listNativeSessions()
+      fresh = await listNativeSessions()
     } catch {
       // No readable CLI store: the sidecar list stands on its own.
+      return false
     }
+    this.native = fresh
+    const signature = JSON.stringify(fresh.map(meta => `${meta.id}\n${meta.updatedAt}\n${meta.status}`))
+    if (signature === this.signature) return false
+    this.signature = signature
+    return true
   }
 
   /**

@@ -67,6 +67,10 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   const [error, setError] = useState<string | undefined>()
   const currentIdRef = useRef(currentId)
   const scrollRef = useRef<HTMLDivElement>(null)
+  /** Last native-session update mirrored into the page, per session. */
+  const foreignSync = useRef<{ id: string; updatedAt: string } | undefined>(undefined)
+  /** Debounce for that mirror, so a burst of frames collapses into one read. */
+  const foreignSyncTimer = useRef<ReturnType<typeof setTimeout>>(undefined)
 
   const current = sessions.find(session => session.id === currentId)
   const dialogOpen = showSettings || envSessionId !== undefined
@@ -117,9 +121,33 @@ export function CcApp(props: { onClose(): void }): ReactElement {
         case 'hello':
           setConfig(message.config)
           break
-        case 'sessions':
+        case 'sessions': {
           setSessions(message.sessions)
+          // A native session whose transcript advances with no engine of ours
+          // is being driven from a terminal CLI; mirror its new events into
+          // the open page. Web-owned sessions already stream through 'event'
+          // frames, so the refetch stays scoped to origin 'cli'.
+          const current = message.sessions.find(session => session.id === currentIdRef.current)
+          if (current !== undefined && current.origin === 'cli'
+            && (foreignSync.current === undefined
+              || foreignSync.current.id !== current.id
+              || foreignSync.current.updatedAt !== current.updatedAt)) {
+            foreignSync.current = { id: current.id, updatedAt: current.updatedAt }
+            clearTimeout(foreignSyncTimer.current)
+            foreignSyncTimer.current = setTimeout(() => {
+              const id = currentIdRef.current
+              if (id === undefined) return
+              fetchSession(id)
+                .then(result => {
+                  if (currentIdRef.current === id) setEvents(result.events)
+                })
+                .catch(() => {
+                  // The mirror is best-effort; the next change retries.
+                })
+            }, 800)
+          }
           break
+        }
         case 'event':
           if (message.sessionId !== currentIdRef.current) break
           setEvents(previous => [...previous, message.event])
@@ -162,6 +190,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
 
     return () => {
       disposed = true
+      clearTimeout(foreignSyncTimer.current)
       dispose()
     }
   }, [])
@@ -318,6 +347,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                 </div>
                 <Composer
                   busy={current.status === 'busy'}
+                  foreignBusy={current.status === 'busy' && current.origin === 'cli'}
                   onSend={(text, images) => {
                     sendMessage(current.id, text, images).catch(fail)
                   }}

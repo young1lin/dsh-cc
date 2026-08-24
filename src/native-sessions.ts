@@ -17,6 +17,9 @@ import {
 } from '@anthropic-ai/claude-agent-sdk'
 import type { SessionMeta } from './types.ts'
 
+/** A native transcript touched within this window reads as a running turn. */
+const RECENT_WRITE_MS = 15_000
+
 /** Options shared by every native-session lookup and mutation below. */
 export interface NativeSessionOptions {
   /**
@@ -94,10 +97,12 @@ export async function getNativeSession(
  *
  * `SDKSessionInfo` carries no model, status, message count, or cost — the
  * CLI's on-disk store does not track them at the session level — so those
- * fields take fixed defaults appropriate to a session with no attached
- * engine: `model: ''` (plugin default), `status: 'idle'` (no engine
- * survives the process, mirroring the shadow store's own reload logic),
- * `messageCount: 0`, `totalCostUsd: 0`.
+ * fields take defaults appropriate to a session with no attached engine:
+ * `model: ''` (plugin default), `messageCount: 0`, `totalCostUsd: 0`. Status
+ * comes from the transcript file's own recency: a file appended within the
+ * window is a session someone — usually a terminal CLI — is actively driving,
+ * so it reports `busy` and the page shows it as running. A quiet tool call
+ * inside a longer turn simply reads as idle until its next write lands.
  *
  * @param info - one record from `listSessions`/`getSessionInfo`.
  * @param cwdFallback - working directory to use when `info.cwd` is absent
@@ -115,7 +120,7 @@ export function toSessionMeta(info: SDKSessionInfo, cwdFallback = ''): SessionMe
     updatedAt: new Date(info.lastModified).toISOString(),
     claudeSessionId: info.sessionId,
     origin: 'cli',
-    status: 'idle',
+    status: Date.now() - info.lastModified < RECENT_WRITE_MS ? 'busy' : 'idle',
     messageCount: 0,
     totalCostUsd: 0,
     ...(info.gitBranch !== undefined ? { gitBranch: info.gitBranch } : {}),

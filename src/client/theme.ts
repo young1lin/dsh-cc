@@ -43,46 +43,98 @@ registerCss('shell', `
 .cc-rail-head { padding: 12px; }
 .cc-rail-list { flex: 1; overflow-y: auto; padding: 0 8px 8px; }
 
-/* A project group: sticky header so the directory stays visible while its
-   sessions scroll under it. Sits above the (positioned) rows. */
-.cc-group-head {
+/* A project group header, mirroring the host workspace browser's project row
+   (ui-workspace Rows.module.css): 34px cell, folder glyph by default, expand
+   chevron + row actions on hover, sticky so the directory stays visible while
+   its sessions scroll under it (and above the positioned session rows). */
+.cc-project-row {
   position: sticky;
   top: 0;
   z-index: 1;
   display: flex;
   align-items: center;
   gap: 6px;
-  width: 100%;
-  padding: 8px 6px 4px;
-  border: none;
-  background: var(--dsw-specific-sidebar-fill);
-  color: var(--dsw-alias-label-tertiary);
-  font: var(--dsw-font-xxs-12);
+  height: 34px;
+  box-sizing: border-box;
+  border-radius: 8px;
+  padding: 0 8px;
   cursor: pointer;
   user-select: none;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-specific-sidebar-fill);
 }
 
-.cc-group-head:hover { color: var(--dsw-alias-label-secondary); }
+.cc-project-row:hover { background: var(--dsw-alias-interactive-bg-hover); }
 
-.cc-group-caret {
+.cc-slot {
   flex: none;
-  width: 12px;
-  text-align: center;
-  transition: transform var(--ds-transition-duration-fast) var(--ds-ease-in-out);
+  width: 16px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--dsw-alias-label-tertiary);
 }
 
-.cc-group-head[data-open='false'] .cc-group-caret { transform: rotate(-90deg); }
+.cc-slot svg { display: block; }
 
-.cc-group-name {
+/* The folder sits one step darker (tertiary) at rest and takes the business
+   tint while it is the expanded group holding the current session. */
+.cc-folder[data-active='true'] { color: var(--dsw-alias-state-business-primary); }
+
+/* Leading slot swap: folder by default, chevron on row hover. */
+.cc-project-row .cc-chevron { display: none; color: var(--dsw-alias-label-caption); }
+.cc-project-row:hover .cc-chevron { display: inline-flex; }
+.cc-project-row:hover .cc-folder { display: none; }
+
+/* Expand triangle: points right closed, rotates to point down open. */
+.cc-project-row .cc-chevron svg { transition: transform 150ms var(--ds-ease-in-out); }
+.cc-project-row[aria-expanded='true'] .cc-chevron svg { transform: rotate(90deg); }
+
+.cc-project-text {
   flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.cc-title {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  text-align: left;
+  font-size: 14px;
+  line-height: 20px;
 }
 
-.cc-group-count { flex: none; font: var(--dsw-font-xxs-12); opacity: 0.7; }
+/* Trailing action buttons surface on hover only: bare 16px glyphs. */
+.cc-row-actions {
+  flex: none;
+  display: none;
+  align-items: center;
+  gap: 12px;
+  height: 20px;
+}
+
+.cc-project-row:hover .cc-row-actions { display: inline-flex; }
+
+.cc-icon-button {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border: none;
+  border-radius: 4px;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.cc-icon-button:hover { color: var(--dsw-alias-label-primary); }
 
 .cc-rail-foot {
   display: flex;
@@ -295,6 +347,6 @@ registerCss('shell', `
 
 @media (prefers-reduced-motion: reduce) {
   .cc-overlay { animation: none; }
-  .cc-dock, .cc-session, .cc-session-action, .cc-group-caret { transition: none; }
+  .cc-dock, .cc-session, .cc-session-action, .cc-project-row .cc-chevron svg { transition: none; }
 }
 `)

@@ -54,6 +54,8 @@ export class CcRuntime {
   private readonly clients = new Set<ServerResponse>()
   private readonly sdkVersion: string
   private heartbeat: ReturnType<typeof setInterval> | undefined
+  /** Periodic native-store rescan; picks up sessions running in a terminal. */
+  private rescan: ReturnType<typeof setInterval> | undefined
   /** Page-editable overrides layered over the cordis config. */
   private settings: CcSettings
   /** Live-chosen reasoning effort; undefined keeps each model's default. */
@@ -87,6 +89,16 @@ export class CcRuntime {
         }
       }
     }, 20_000)
+    // A session driven from a terminal CLI writes its transcript with no
+    // engine of ours involved; rescanning the native store keeps the page's
+    // list — statuses included — in step with it. The catalog only reports a
+    // change when something actually moved, so a quiet store costs one stat
+    // sweep and no broadcast.
+    this.rescan = setInterval(() => {
+      void this.catalog.refresh().then(changed => {
+        if (changed) this.broadcastSessions()
+      })
+    }, 2_000)
   }
 
   /**
@@ -416,6 +428,7 @@ export class CcRuntime {
   /** Close every engine and SSE client; the route disposer calls this. */
   async dispose(): Promise<void> {
     if (this.heartbeat !== undefined) clearInterval(this.heartbeat)
+    if (this.rescan !== undefined) clearInterval(this.rescan)
     for (const id of [...this.engines.keys()]) await this.closeEngine(id)
     for (const res of this.clients) {
       try {
