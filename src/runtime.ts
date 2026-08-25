@@ -17,7 +17,7 @@ import type { ResolvedConfig } from './config.ts'
 import { SessionEngine, resolveSessionModel, resolveSessionPermissionMode, type EngineHooks, type SendImage } from './engine.ts'
 import { BlobStore, isImageMediaType } from './blobs.ts'
 import { SessionCatalog } from './catalog.ts'
-import { effectiveEnvEntries, maskSecret, readDirListing, readSdkVersion } from './http-support.ts'
+import { effectiveEnvEntries, maskSecret, readDirListing, readSdkVersion, readTextFile } from './http-support.ts'
 import { reduceDelta, type LiveTurn } from './live-turn.ts'
 import { deleteNativeSession, renameNativeSession } from './native-sessions.ts'
 import { SessionStore } from './store.ts'
@@ -577,6 +577,16 @@ export class CcRuntime {
       }
       if (parts[0] === 'fs' && parts[1] === 'list' && parts.length === 2 && method === 'GET') {
         return await this.listDir(url.searchParams.get('path') ?? undefined, res)
+      }
+      if (parts[0] === 'fs' && parts[1] === 'file' && parts.length === 2 && method === 'GET') {
+        const path = url.searchParams.get('path')
+        if (path === null || path.trim() === '') return json(res, { error: '缺少 path 参数' }, 400)
+        try {
+          return json(res, { file: await readTextFile(path) })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          return json(res, { error: `无法读取文件：${message}` }, 404)
+        }
       }
       if (parts[0] === 'sessions') {
         if (parts.length === 1 && method === 'GET') {

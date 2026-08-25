@@ -1,14 +1,15 @@
 /**
  * Pure helpers behind the /cc/api HTTP surface: directory listings for the
- * path picker, the SDK version readout, and the env projection the settings
- * page renders. Nothing here touches the session store or an engine, which
- * is what lets the runtime file stay about routing and lifecycle.
+ * path picker, text file reads for the viewer, the SDK version readout, and
+ * the env projection the settings page renders. Nothing here touches the
+ * session store or an engine, which is what lets the runtime file stay about
+ * routing and lifecycle.
  *
  * @module dsh-cc/http-support
  */
 
 import { existsSync, readFileSync } from 'node:fs'
-import { readdir } from 'node:fs/promises'
+import { open, readdir, stat } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { dirname, join, resolve } from 'node:path'
 import type { DirListing, EffectiveEnvEntry } from './types.ts'
@@ -61,6 +62,45 @@ export async function readDirListing(pathname: string | undefined): Promise<DirL
         : left.directory ? -1 : 1)
   const parent = dirname(dir) !== dir ? dirname(dir) : null
   return { path: dir, parent, entries }
+}
+
+/** Largest file the viewer reads; bigger files deliver their head only. */
+const MAX_FILE_BYTES = 2 * 1024 * 1024
+
+/** One text file as the page viewer renders it. */
+export interface FileContent {
+  path: string
+  content: string
+  /** True when only the head of an oversized file was read. */
+  truncated: boolean
+}
+
+/**
+ * Read one text file for the viewer. A NUL byte in the head marks a binary
+ * file and is refused rather than rendered; an oversized file is cut to its
+ * head with the flag set so the viewer can say so.
+ * @param pathname - the file to read.
+ * @returns the content descriptor.
+ * @throws when the path is empty, missing, unreadable, or not a text file.
+ */
+export async function readTextFile(pathname: string): Promise<FileContent> {
+  const file = resolve(pathname.trim())
+  if (file === '') throw new Error('未指定文件')
+  const info = await stat(file).catch(() => {
+    throw new Error('文件不存在或不可访问')
+  })
+  if (!info.isFile()) throw new Error('不是文件')
+  const truncated = info.size > MAX_FILE_BYTES
+  const size = truncated ? MAX_FILE_BYTES : info.size
+  const handle = await open(file, 'r')
+  try {
+    const buffer = Buffer.alloc(size)
+    await handle.read(buffer, 0, size, 0)
+    if (buffer.includes(0)) throw new Error('不是文本文件')
+    return { path: file, content: buffer.toString('utf8'), truncated }
+  } finally {
+    await handle.close()
+  }
 }
 
 /** The pinned Agent SDK version, read from the installed package for diagnostics. */
