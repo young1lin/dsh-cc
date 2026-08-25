@@ -13,7 +13,7 @@ const q = query({
     parent_tool_use_id: null,
   }],
   options: {
-    cwd: 'D:/dev/dsh-cc',
+    cwd: 'C:/PythonProject/dev/dsh-cc',
     permissionMode: 'auto',
     canUseTool: async (toolName, input) => {
       if (toolName === 'AskUserQuestion') {

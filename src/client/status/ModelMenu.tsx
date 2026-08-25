@@ -67,6 +67,12 @@ registerCss('status-model-menu', `
 .cc-model-alias { font: var(--dsw-font-xs-13); }
 .cc-model-resolved,
 .cc-model-desc { font: var(--dsw-font-xxs-12); color: var(--dsw-alias-label-tertiary); }
+
+/* One-line switch failure beside the pickers; auto-clears after a moment. */
+.cc-status-failure {
+  font: var(--dsw-font-xxs-12);
+  color: var(--dsw-alias-state-error-primary);
+}
 `)
 
 /** The live catalog plus the session's current model and effort selections. */
@@ -110,7 +116,23 @@ export function ModelMenu(props: { sessionId: string; busy: boolean }): ReactEle
   const [openMenu, setOpenMenu] = useState<'model' | 'effort' | null>(null)
   /** Bumped to re-read the catalog; see the turn-start effect below. */
   const [reload, setReload] = useState(0)
+  const [failure, setFailure] = useState<string | undefined>()
   const wasBusy = useRef(false)
+  const failureTimer = useRef<ReturnType<typeof setTimeout>>(undefined)
+
+  useEffect(() => () => clearTimeout(failureTimer.current), [])
+
+  /**
+   * Show the one-line switch failure and clear it again after a moment, so
+   * the strip does not carry a stale error into the next turn.
+   * @param detail - the underlying rejection, kept off the visible line (it
+   *   is transport text, not product copy) but available on the tooltip.
+   */
+  const showFailure = (detail: string): void => {
+    setFailure(detail)
+    clearTimeout(failureTimer.current)
+    failureTimer.current = setTimeout(() => setFailure(undefined), 4000)
+  }
 
   // Switching sessions must not leave the previous session's selection on
   // screen while the new catalog loads. A reload of the SAME session keeps
@@ -191,8 +213,15 @@ export function ModelMenu(props: { sessionId: string; busy: boolean }): ReactEle
         selectedId={modelSelectedId}
         onSelect={id => {
           setOpenMenu(null)
+          const previousModel = catalog.current
           setCatalog(previous => ({ ...previous, current: id }))
-          void setModel(props.sessionId, id).catch(() => {})
+          setFailure(undefined)
+          // The row highlights optimistically; a rejected switch rolls the
+          // selection back so the picker never claims a model it lacks.
+          void setModel(props.sessionId, id).catch((cause: unknown) => {
+            setCatalog(previous => ({ ...previous, current: previousModel }))
+            showFailure(cause instanceof Error ? cause.message : String(cause))
+          })
         }}
         onClose={() => { setOpenMenu(null) }}
       />
@@ -215,11 +244,19 @@ export function ModelMenu(props: { sessionId: string; busy: boolean }): ReactEle
         selectedId={catalog.effort}
         onSelect={level => {
           setOpenMenu(null)
+          const previousEffort = catalog.effort
           setCatalog(previous => ({ ...previous, effort: level }))
-          void setEffort(props.sessionId, level).catch(() => {})
+          setFailure(undefined)
+          void setEffort(props.sessionId, level).catch((cause: unknown) => {
+            setCatalog(previous => ({ ...previous, effort: previousEffort }))
+            showFailure(cause instanceof Error ? cause.message : String(cause))
+          })
         }}
         onClose={() => { setOpenMenu(null) }}
       />
+      {failure !== undefined && (
+        <span className="cc-status-failure" role="status" title={failure}>切换失败</span>
+      )}
     </>
   )
 }

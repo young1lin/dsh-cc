@@ -132,16 +132,20 @@ const PERMISSION_CHOICES = [
 
 /**
  * Render the settings dialog.
- * @param props - the effective config summary and the close callback.
+ * @param props - the effective config summary, the close callback, and the
+ *   saved callback (invoked once a save lands, so the owner can re-read the
+ *   config it displays fields of).
  * @returns the dialog node.
  */
 export function SettingsModal(props: {
   config: ConfigSummary | undefined
   onClose(): void
+  onSaved(): void
 }): ReactElement {
   const [model, setModel] = useState('')
   const [permissionMode, setPermissionMode] = useState('')
   const [env, setEnv] = useState<Record<string, string>>({})
+  const [advancedRows, setAdvancedRows] = useState<EnvRow[]>([])
   const [ready, setReady] = useState(false)
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState<string | undefined>()
@@ -164,7 +168,11 @@ export function SettingsModal(props: {
       .then(result => {
         setModel(result.settings.model)
         setPermissionMode(result.settings.permissionMode)
-        setEnv(result.settings.env)
+        // Structured form and KV editor own disjoint key sets, held as
+        // separate state: re-deriving the rows from `env` on every keystroke
+        // would rebuild their identities and lose input focus mid-edit.
+        setEnv(pickStructuredKeys(result.settings.env))
+        setAdvancedRows(toRows(omitStructuredKeys(result.settings.env)))
         setReady(true)
       })
       .catch(cause => setMessage(cause instanceof Error ? cause.message : String(cause)))
@@ -172,20 +180,15 @@ export function SettingsModal(props: {
 
   const save = (): void => {
     setSaving(true)
-    saveSettings({ model, permissionMode, env })
-      .then(props.onClose)
+    saveSettings({ model, permissionMode, env: { ...env, ...fromRows(advancedRows) } })
+      .then(() => {
+        props.onSaved()
+        props.onClose()
+      })
       .catch(cause => {
         setSaving(false)
         setMessage(cause instanceof Error ? cause.message : String(cause))
       })
-  }
-
-  // The advanced KV editor only ever shows and writes the rows the structured
-  // form does not own; saving it back must not disturb the structured keys
-  // that are absent from its own row list.
-  const advancedRows = toRows(omitStructuredKeys(env))
-  const setAdvancedRows = (rows: EnvRow[]): void => {
-    setEnv({ ...pickStructuredKeys(env), ...fromRows(rows) })
   }
 
   return (

@@ -21,6 +21,45 @@ export type SessionStatus = 'idle' | 'busy' | 'error'
  */
 export const DEFAULT_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 
+/** One selectable reasoning-effort level. */
+export type EffortLevel = (typeof DEFAULT_EFFORT_LEVELS)[number]
+
+/**
+ * Structured provider field names mapped onto the env var each one resolves
+ * to. Shared by the node half's config resolution so the schema, the env
+ * projection, and any future UI read one table instead of three diverging
+ * copies. Field names match `ClaudeCodeProviderConfig` exactly.
+ */
+export const PROVIDER_ENV_KEYS = {
+  baseUrl: 'ANTHROPIC_BASE_URL',
+  authToken: 'ANTHROPIC_AUTH_TOKEN',
+  apiKey: 'ANTHROPIC_API_KEY',
+  model: 'ANTHROPIC_MODEL',
+  opusModel: 'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  sonnetModel: 'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  haikuModel: 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  smallFastModel: 'ANTHROPIC_SMALL_FAST_MODEL',
+  httpsProxy: 'HTTPS_PROXY',
+  httpProxy: 'HTTP_PROXY',
+  noProxy: 'NO_PROXY',
+  apiTimeoutMs: 'API_TIMEOUT_MS',
+} as const
+
+/** The structured provider fields {@link PROVIDER_ENV_KEYS} knows about. */
+export type ProviderEnvField = keyof typeof PROVIDER_ENV_KEYS
+
+/**
+ * Image media types mapped onto the file extension each one is stored under.
+ * Shared by the blob store (forward direction) and the blob-serving URL
+ * table (inverse), so the two can never drift apart.
+ */
+export const MEDIA_TYPE_EXTENSIONS = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+} as const
+
 /**
  * Which layer supplied a resolved configuration value. Later layers win:
  * a session override beats page settings, which beat the cordis plugin
@@ -49,6 +88,12 @@ export interface SessionMeta {
   cwd: string
   /** Model override for this session; empty string = Claude Code default. */
   model: string
+  /**
+   * Reasoning-effort override for this session; unset or empty = the resolved
+   * config default. Effort is per session, not a runtime global: the page
+   * renders the picker per session and a spawn reads its own session's level.
+   */
+  effort?: EffortLevel | ''
   /** Model id of the most recent successful turn; the fallback when a chosen model fails. */
   lastGoodModel?: string
   createdAt: string

@@ -1,5 +1,7 @@
 # Terminal Session Ownership Implementation Plan
 
+> **状态（2026-08-25 标注）**：本计划已于 2026-08-24/25 实施完毕。后续 21265be 与 6456375 修正了实现：所有权改由 `drivesNative` 回调在每次 refresh 现场判定（注册表里的 peer 若非我们自己的引擎才算 terminalOwned）、`adopt()` 剥离 `terminalOwned`、`list()` 返回拷贝。文中 Task 代码块已与实现分叉，**勿按本文代码重做**；「全局约束」一节仍然有效。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the mtime-recency guess for "a CLI terminal is driving this session" with the CLI's own live-process registry, so the web page knows exactly which sessions another live `claude` process holds open — and stays read-only for them.

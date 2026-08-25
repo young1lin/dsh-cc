@@ -57,6 +57,13 @@ export class SessionCatalog {
   private native: SessionMeta[] = []
   /** Last-refresh fingerprint; equal strings mean nothing native moved. */
   private signature = ''
+  /**
+   * The refresh currently running, if any. The rescan timer and concurrent
+   * requests all funnel through {@link refresh}; sharing one sweep keeps the
+   * cache mutation (native array + signature) single-threaded and spares the
+   * disk a second identical sweep per tick.
+   */
+  private refreshInFlight: Promise<boolean> | undefined
 
   /**
    * @param store - the dsh-cc sidecar.
@@ -77,6 +84,10 @@ export class SessionCatalog {
    * Re-read the CLI's session store across every project directory and the
    * live-process registry alongside it.
    *
+   * Single-flight: while one sweep runs, every further caller (the rescan
+   * timer, a concurrent request) joins it instead of starting an overlapping
+   * sweep over the same mutable cache.
+   *
    * A failure here is not fatal: the CLI store may be absent on a machine
    * that has only ever run Claude Code through this page, and the sidecar
    * alone still serves a working list.
@@ -85,6 +96,27 @@ export class SessionCatalog {
    *   broadcasting a quiet store.
    */
   async refresh(): Promise<boolean> {
+    const running = this.refreshInFlight
+    if (running !== undefined) return await running
+    const run = this.refreshOnce()
+      .catch((error: unknown) => {
+        // The sweep must never reject: callers hang `void ...then(...)` off it.
+        console.warn('dsh-cc: 会话目录刷新失败', error)
+        return false
+      })
+      .finally(() => {
+        this.refreshInFlight = undefined
+      })
+    this.refreshInFlight = run
+    return await run
+  }
+
+  /**
+   * One disk sweep; only ever reached through the single-flight guard in
+   * {@link refresh}, so its await points never interleave with another
+   * refresh writing the same cache.
+   */
+  private async refreshOnce(): Promise<boolean> {
     let fresh: SessionMeta[]
     let peers: Map<string, PeerSession>
     try {
@@ -145,6 +177,22 @@ export class SessionCatalog {
    */
   get(id: string): SessionMeta | undefined {
     return this.store.get(id) ?? this.native.find(meta => meta.id === id)
+  }
+
+  /**
+   * Whether a terminal process currently holds the session open, answered
+   * from the merged live view.
+   *
+   * Ownership is resolved per refresh and written only onto merged copies, so
+   * a stored sidecar row never carries it — asking the store directly would
+   * answer undefined even while a terminal drives the session. This is the
+   * check the send path gates on.
+   * @param id - the page id: a sidecar id, or a native session id.
+   * @returns true when a live terminal peer owns the session right now.
+   */
+  terminalOwned(id: string): boolean {
+    return this.list().some(row =>
+      (row.id === id || row.claudeSessionId === id) && row.terminalOwned === true)
   }
 
   /**

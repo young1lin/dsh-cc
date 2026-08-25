@@ -145,6 +145,7 @@ export class SessionEngine {
   private stderrTail = ''
   private started = false
   private closed = false
+  private queryEnded = false
   private query: Query | undefined
 
   /** Native Claude Code session id; learned from init, then the resume anchor. */
@@ -155,6 +156,14 @@ export class SessionEngine {
   busy = false
   /** Last activity timestamp; the live-cap eviction order. */
   lastUsed = Date.now()
+  /**
+   * Host callback fired once this engine's query has terminated. A terminated
+   * engine can never serve another message — its input stream has no consumer
+   * — so the host uses this to drop it from its live table immediately. Set
+   * by the host after construction; never called on an engine the host
+   * already removed.
+   */
+  onEnd: (() => void) | undefined
   /**
    * The most recent submission, kept verbatim so the host can replay it when
    * the process dies mid-turn.
@@ -170,6 +179,17 @@ export class SessionEngine {
   /** Whether close() already ran; a closed engine restarts through a new instance. */
   get isClosed(): boolean {
     return this.closed
+  }
+
+  /**
+   * Whether the SDK query has terminated — the CLI exited or failed, however
+   * cleanly. Such an engine is spent: pushing into it feeds a stream nobody
+   * consumes, so the host must spawn a replacement instead of reusing it.
+   * Set synchronously the moment the termination is noticed, so a send racing
+   * the end-of-query bookkeeping still sees it.
+   */
+  get isDead(): boolean {
+    return this.queryEnded
   }
 
   /**
@@ -459,7 +479,11 @@ export class SessionEngine {
       ...(updatedPermissions !== undefined ? { updatedPermissions } : {}),
     })
     const note = answer.message?.trim()
-    if (note !== undefined && note !== '') void this.noteToModel(note)
+    if (note !== undefined && note !== '') {
+      void this.noteToModel(note).catch(error => {
+        console.warn('dsh-cc: 备注转发失败', error)
+      })
+    }
     return 'allow'
   }
 
@@ -517,9 +541,31 @@ export class SessionEngine {
     }
   }
 
+  /**
+   * Fire-and-forget transcript publish that can never surface an unhandled
+   * rejection: these run off the message loop, where nobody is left to catch.
+   * @param input - the event to publish.
+   */
+  private publish(input: CcEventInput): void {
+    void this.hooks.emit(input).catch(error => {
+      console.warn('dsh-cc: 事件发布失败', error)
+    })
+  }
+
+  /**
+   * Fire-and-forget metadata patch with the same never-rejects guarantee.
+   * @param patch - the fields to patch.
+   */
+  private patch(patch: Partial<SessionMeta>): void {
+    void this.hooks.updateMeta(patch).catch(error => {
+      console.warn('dsh-cc: 会话状态更新失败', error)
+    })
+  }
+
   private ensureStarted(): void {
     if (this.started) return
     this.started = true
+    const model = resolveSessionModel(this.startSpec.model, this.config.model)
     const options: Options = {
       cwd: this.startSpec.cwd,
       abortController: this.abort,
@@ -533,7 +579,7 @@ export class SessionEngine {
       supportedDialogKinds: ['ask_user_question'],
       includePartialMessages: true,
       stderr: chunk => this.appendStderr(chunk),
-      ...(this.startSpec.model ? { model: this.startSpec.model } : this.config.model ? { model: this.config.model } : {}),
+      ...(model !== undefined ? { model } : {}),
       ...(this.config.maxTurns > 0 ? { maxTurns: this.config.maxTurns } : {}),
       ...(this.config.effort !== undefined ? { effort: this.config.effort } : {}),
       ...(this.config.executablePath ? { pathToClaudeCodeExecutable: this.config.executablePath } : {}),
@@ -557,7 +603,11 @@ export class SessionEngine {
       for await (const message of q) this.onMessage(message)
       await this.finish(undefined)
     } catch (error) {
+      // finish's own finally still retires the engine if the host hooks fail
+      // again inside it; this catch only stops the rejection from escaping a
+      // promise nobody awaits.
       await this.finish(error instanceof Error ? error : new Error(String(error)))
+        .catch(() => {})
     }
   }
 
@@ -571,8 +621,8 @@ export class SessionEngine {
         if (message.subtype === 'init') {
           this.claudeSessionId = message.session_id
           this.liveModel = message.model
-          void this.hooks.updateMeta({ claudeSessionId: message.session_id })
-          void this.hooks.emit({
+          this.patch({ claudeSessionId: message.session_id })
+          this.publish({
             kind: 'system',
             subtype: 'init',
             data: {
@@ -593,17 +643,17 @@ export class SessionEngine {
         for (const block of message.message.content) {
           if (block.type === 'text' && block.text.trim().length > 0) {
             emittedText = true
-            void this.hooks.emit({ kind: 'assistant', text: block.text, ...outcome })
+            this.publish({ kind: 'assistant', text: block.text, ...outcome })
           } else if (block.type === 'thinking' && block.thinking.trim().length > 0) {
-            void this.hooks.emit({ kind: 'thinking', text: block.thinking })
+            this.publish({ kind: 'thinking', text: block.thinking })
           } else if (block.type === 'tool_use') {
-            void this.hooks.emit({ kind: 'tool_use', toolUseId: block.id, name: block.name, input: block.input })
+            this.publish({ kind: 'tool_use', toolUseId: block.id, name: block.name, input: block.input })
           }
         }
         // A turn that failed before producing text carries the reason only on
         // the envelope; without this the failure never reaches the transcript.
         if (!emittedText && message.error !== undefined) {
-          void this.hooks.emit({ kind: 'assistant', text: '', ...outcome })
+          this.publish({ kind: 'assistant', text: '', ...outcome })
         }
         return
       }
@@ -620,7 +670,7 @@ export class SessionEngine {
             // The AskUserQuestion answer rides the permission-deny channel,
             // so the CLI marks it as an error; it is a normal answer.
             const isAnswer = text.startsWith('用户回答：') || text.startsWith('用户没有回答')
-            void this.hooks.emit({
+            this.publish({
               kind: 'tool_result',
               toolUseId: block.tool_use_id,
               text,
@@ -633,7 +683,7 @@ export class SessionEngine {
       case 'result': {
         this.busy = false
         const isError = message.subtype !== 'success' || message.is_error === true
-        void this.hooks.emit({
+        this.publish({
           kind: 'result',
           subtype: message.subtype,
           text: message.subtype === 'success' ? message.result : '',
@@ -646,7 +696,7 @@ export class SessionEngine {
           ...(message.subtype === 'success' ? {} : { errors: message.errors }),
           ...(message.terminal_reason !== undefined ? { terminalReason: message.terminal_reason } : {}),
         })
-        void this.hooks.updateMeta({
+        this.patch({
           status: 'idle',
           ...(this.liveModel !== undefined ? { lastGoodModel: this.liveModel } : {}),
           ...(message.total_cost_usd !== undefined ? { totalCostUsd: message.total_cost_usd } : {}),
@@ -737,16 +787,29 @@ export class SessionEngine {
     this.hooks.delta({ d: 'turn-stop', ...(stopReason !== undefined ? { stopReason } : {}) })
   }
 
+  /**
+   * Query-termination bookkeeping. `queryEnded` flips first and synchronously,
+   * so a send racing this function already sees a dead engine; the `finally`
+   * then guarantees the host's end-of-life callback runs on every path, even
+   * one where a host hook itself throws.
+   * @param error - the failure that ended the query, or undefined on a clean
+   *   end of stream (which can still be a CLI that exited mid-turn).
+   */
   private async finish(error: Error | undefined): Promise<void> {
     this.busy = false
+    this.queryEnded = true
     if (this.closed) return
-    if (error !== undefined) {
-      await this.hooks.emit({ kind: 'error', message: this.describeFailure(error) })
-      await this.hooks.updateMeta({ status: 'error', lastError: error.message })
-      await this.hooks.onEngineFailure?.(error)
-      return
+    try {
+      if (error !== undefined) {
+        await this.hooks.emit({ kind: 'error', message: this.describeFailure(error) })
+        await this.hooks.updateMeta({ status: 'error', lastError: error.message })
+        await this.hooks.onEngineFailure?.(error)
+        return
+      }
+      await this.hooks.updateMeta({ status: 'idle' })
+    } finally {
+      this.onEnd?.()
     }
-    await this.hooks.updateMeta({ status: 'idle' })
   }
 
   /**
@@ -760,6 +823,24 @@ export class SessionEngine {
     if (tail === '' || error.message.includes('stderr:')) return error.message
     return `${error.message}\nstderr: ${tail}`
   }
+}
+
+/**
+ * The model a session's engine runs with: the session's own override when it
+ * names one, else the resolved config default, else none (the CLI picks).
+ *
+ * One rule, shared by the spawn path here and the catalog readout in the
+ * runtime — two copies of "session.model falls back to the config model"
+ * would drift, and the page's current-model marker must agree with what the
+ * process actually runs.
+ * @param sessionModel - the session's model override; empty = no opinion.
+ * @param configModel - the resolved config's default model; empty = none.
+ * @returns the model id to spawn with, or undefined to let the CLI choose.
+ */
+export function resolveSessionModel(sessionModel: string, configModel: string): string | undefined {
+  if (sessionModel !== '') return sessionModel
+  if (configModel !== '') return configModel
+  return undefined
 }
 
 /** One streamed content block as the Messages API opens it. */

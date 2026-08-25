@@ -12,7 +12,7 @@
  * @module dsh-cc/client/tool/ToolRow
  */
 
-import { useState, type ReactElement, type ReactNode } from 'react'
+import { memo, useState, type ReactElement, type ReactNode } from 'react'
 import {
   DiffBlock,
   DisclosureRow,
@@ -206,10 +206,15 @@ function Leading(props: { state: RowState; name: string }): ReactElement {
 
 /**
  * Render one tool call.
+ *
+ * Memo'd: a streaming turn re-renders the whole transcript column per delta,
+ * and a settled row has nothing to recompute — the card parse below is the
+ * expensive part, so stable props (`input`/`result` keep their event-object
+ * identity, `summary`/`cwd` are strings) keep every finished row out of it.
  * @param props - see {@link ToolRowProps}.
  * @returns the row element.
  */
-export function ToolRow(props: ToolRowProps): ReactElement {
+export const ToolRow = memo(function ToolRow(props: ToolRowProps): ReactElement {
   const { name, input, result, cwd } = props
   const [expanded, setExpanded] = useState(false)
   const state: RowState = result === undefined ? 'running' : result.isError ? 'error' : 'ok'
@@ -250,4 +255,4 @@ export function ToolRow(props: ToolRowProps): ReactElement {
       </DisclosureRow>
     </div>
   )
-}
+})

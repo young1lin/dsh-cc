@@ -5,10 +5,17 @@
  * @module dsh-cc/client/DirectoryPicker
  */
 
-import { useEffect, useState, type ReactElement } from 'react'
-import { Button, Input, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
+import { useEffect, useRef, useState, type ReactElement } from 'react'
+import {
+  Button,
+  IconFolderClose16,
+  IconListPenOutline16,
+  Input,
+  Modal,
+} from '@deepseek-ai/dsh-client-ui-primitives'
 import { listDir } from './api/settings.ts'
 import { registerCss } from './css.ts'
+import { useOverlay } from './overlay.ts'
 import type { DirListing } from '../types.ts'
 
 registerCss('directory-picker', `
@@ -43,6 +50,14 @@ registerCss('directory-picker', `
 .cc-picker-row[data-file='true'] { color: var(--dsw-alias-label-caption); cursor: default; }
 .cc-picker-row[data-file='true']:hover { background: transparent; color: var(--dsw-alias-label-caption); }
 .cc-picker-note { padding: 18px; text-align: center; font: var(--dsw-font-xs-13); color: var(--dsw-alias-label-tertiary); }
+
+.cc-picker-glyph {
+  flex: none;
+  display: inline-flex;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.cc-picker-glyph svg { display: block; }
 `)
 
 /**
@@ -59,16 +74,30 @@ export function DirectoryPicker(props: {
   const [draft, setDraft] = useState(props.initial)
   const [listing, setListing] = useState<DirListing | undefined>()
   const [error, setError] = useState<string | undefined>()
+  /**
+   * Request generation: quick clicks fire overlapping reads, and only the
+   * newest response may land — a straggler would flip the list back to a
+   * directory the user already left.
+   */
+  const loadSeq = useRef(0)
+  // The picker is a floating layer: while it is open, Escape closes it (via
+  // the modal's own handler), never the surface or the form beneath.
+  useOverlay(true)
 
   const load = (target: string | undefined): void => {
+    const seq = (loadSeq.current += 1)
     listDir(target)
       .then(result => {
+        if (seq !== loadSeq.current) return
         setListing(result)
         setPath(result.path)
         setDraft(result.path)
         setError(undefined)
       })
-      .catch(cause => setError(cause instanceof Error ? cause.message : String(cause)))
+      .catch(cause => {
+        if (seq !== loadSeq.current) return
+        setError(cause instanceof Error ? cause.message : String(cause))
+      })
   }
 
   useEffect(() => {
@@ -127,7 +156,9 @@ export function DirectoryPicker(props: {
               data-file={!entry.directory}
               onClick={() => enter(entry)}
             >
-              <span aria-hidden>{entry.directory ? '📁' : '📄'}</span>
+              <span className="cc-picker-glyph" aria-hidden>
+                {entry.directory ? <IconFolderClose16 /> : <IconListPenOutline16 />}
+              </span>
               <span>{entry.name}</span>
             </button>
           ))}

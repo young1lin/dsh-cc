@@ -8,6 +8,7 @@
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import z from '@deepseek-ai/schemastery'
+import { PROVIDER_ENV_KEYS, type EffortLevel, type ProviderEnvField } from './types.ts'
 
 /**
  * Structured Anthropic-compatible provider settings, resolved into the same
@@ -70,7 +71,7 @@ export interface ClaudeCodeConfig {
   /** Optional pathToClaudeCodeExecutable override; empty = the SDK's pinned payload. */
   executablePath?: string
   /** Default reasoning effort for new sessions; unset = the CLI default. */
-  effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  effort?: EffortLevel
 }
 
 /** Runtime configuration schema for the structured provider settings. */
@@ -126,7 +127,7 @@ export interface ResolvedConfig {
   maxLiveSessions: number
   maxTurns: number
   executablePath: string
-  effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  effort?: EffortLevel
 }
 
 /**
@@ -152,27 +153,17 @@ export function resolveConfig(config: ClaudeCodeConfig): ResolvedConfig {
 }
 
 /**
- * Project the structured provider settings onto their well-known env var names.
+ * Project the structured provider settings onto their well-known env var
+ * names, driven by the shared field-to-key table in types.ts.
  * @param provider - the structured provider config; absent fields are omitted.
  * @returns the env entries the structured fields set; a field left unset contributes no key.
  */
 function resolveProviderEnv(provider: ClaudeCodeProviderConfig): Record<string, string> {
   const env: Record<string, string> = {}
-  const set = (key: string, value: string | number | undefined): void => {
-    if (value === undefined || value === '') return
-    env[key] = String(value)
+  for (const [field, envKey] of Object.entries(PROVIDER_ENV_KEYS) as [ProviderEnvField, string][]) {
+    const value = provider[field]
+    if (value === undefined || value === '') continue
+    env[envKey] = String(value)
   }
-  set('ANTHROPIC_BASE_URL', provider.baseUrl)
-  set('ANTHROPIC_AUTH_TOKEN', provider.authToken)
-  set('ANTHROPIC_API_KEY', provider.apiKey)
-  set('ANTHROPIC_MODEL', provider.model)
-  set('ANTHROPIC_DEFAULT_OPUS_MODEL', provider.opusModel)
-  set('ANTHROPIC_DEFAULT_SONNET_MODEL', provider.sonnetModel)
-  set('ANTHROPIC_DEFAULT_HAIKU_MODEL', provider.haikuModel)
-  set('ANTHROPIC_SMALL_FAST_MODEL', provider.smallFastModel)
-  set('HTTPS_PROXY', provider.httpsProxy)
-  set('HTTP_PROXY', provider.httpProxy)
-  set('NO_PROXY', provider.noProxy)
-  set('API_TIMEOUT_MS', provider.apiTimeoutMs)
   return env
 }

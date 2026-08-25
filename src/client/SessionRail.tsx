@@ -17,6 +17,7 @@ import {
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { DirectoryPicker } from './DirectoryPicker.tsx'
 import { registerCss } from './css.ts'
+import { useOverlay } from './overlay.ts'
 import type { ConfigSummary, SessionMeta } from '../types.ts'
 
 registerCss('session-rail', `
@@ -96,18 +97,24 @@ function dotState(status: SessionMeta['status']): 'done' | 'ongoing' | 'error' {
 
 /**
  * Render one session row with inline rename.
- * @param props - the session, its selected state, and row callbacks.
+ * @param props - the session, its selected state, pending-interaction count,
+ *   and row callbacks.
  * @returns the row node.
  */
 function SessionRow(props: {
   session: SessionMeta
   active: boolean
+  /** Permissions or questions waiting on this session, shown as a badge. */
+  pending: number
   onSelect(): void
   onDelete(): void
   onRename(name: string): void
 }): ReactElement {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(props.session.name)
+  // The rename edit is a floating layer: its Escape cancels the edit only,
+  // never the surface underneath.
+  useOverlay(editing)
 
   const commit = (): void => {
     const name = draft.trim()
@@ -127,7 +134,6 @@ function SessionRow(props: {
           onKeyDown={event => {
             if (event.key === 'Enter') commit()
             if (event.key === 'Escape') {
-              event.stopPropagation()
               setDraft(props.session.name)
               setEditing(false)
             }
@@ -155,6 +161,12 @@ function SessionRow(props: {
     >
       <StateDot state={dotState(props.session.status)} />
       <span className="cc-session-name" title={props.session.name}>{props.session.name}</span>
+      {props.pending > 0 && (
+        <span className="cc-session-alert" title="有等待处理的权限请求或问题">
+          <span className="cc-session-alert-dot" aria-hidden />
+          {props.pending > 1 ? props.pending : null}
+        </span>
+      )}
       <span className="cc-session-time">{props.session.updatedAt.slice(5, 16).replace('T', ' ')}</span>
       <button
         type="button"
@@ -198,13 +210,16 @@ function SessionRow(props: {
  * directory's title, and hover-revealed row actions — here the create button,
  * which starts a session directly in this directory.
  * @param props - the group, the selected session id, whether the group is the
- *   default-open one, and the row plus create callbacks.
+ *   default-open one, pending-interaction counts per session, and the row plus
+ *   create callbacks.
  * @returns the section node.
  */
 function ProjectGroup(props: {
   group: SessionGroup
   currentId: string | undefined
   defaultOpen: boolean
+  /** Pending permissions/questions per session id, for the row badges. */
+  pending: Record<string, number>
   onSelect(id: string): void
   onDelete(id: string): void
   onRename(id: string, name: string): void
@@ -258,6 +273,7 @@ function ProjectGroup(props: {
           key={session.id}
           session={session}
           active={session.id === props.currentId}
+          pending={props.pending[session.id] ?? 0}
           onSelect={() => props.onSelect(session.id)}
           onDelete={() => props.onDelete(session.id)}
           onRename={name => props.onRename(session.id, name)}
@@ -281,6 +297,9 @@ function NewSessionForm(props: {
   const [cwd, setCwd] = useState(props.config?.defaultCwd ?? '')
   const [model, setModel] = useState('')
   const [picking, setPicking] = useState(false)
+  // The form is a transient editing layer over the rail: while it holds a
+  // half-filled draft, Escape must not close the whole surface under it.
+  useOverlay(true)
 
   return (
     <div className="cc-new-form">
@@ -333,7 +352,8 @@ function NewSessionForm(props: {
 
 /**
  * The complete rail.
- * @param props - session list state, connection state, and rail callbacks.
+ * @param props - session list state, connection state, pending-interaction
+ *   counts per session, and rail callbacks.
  * @returns the rail node.
  */
 export function SessionRail(props: {
@@ -341,6 +361,8 @@ export function SessionRail(props: {
   currentId: string | undefined
   config: ConfigSummary | undefined
   connected: boolean
+  /** Pending permissions/questions per session id, for the row badges. */
+  pending: Record<string, number>
   onSelect(id: string): void
   onCreate(form: { name?: string; cwd?: string; model?: string }): void
   onDelete(id: string): void
@@ -373,6 +395,7 @@ export function SessionRail(props: {
             group={group}
             currentId={props.currentId}
             defaultOpen={index === 0}
+            pending={props.pending}
             onSelect={props.onSelect}
             onDelete={props.onDelete}
             onRename={props.onRename}

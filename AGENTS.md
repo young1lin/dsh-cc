@@ -4,7 +4,7 @@
 
 ## 项目是什么
 
-dsh-cc 是一个 DSH 双面外挂插件：在 DeepSeek Harness Web GUI 侧边栏加入 Claude Code 入口，每个会话由官方 `@anthropic-ai/claude-agent-sdk` 驱动一个真实 claude 进程。功能细节、配置项与 HTTP API 表见 `README.md`（中文，与本文件互补）。
+dsh-cc 是一个 DSH 双面外挂插件：在 DeepSeek Harness Web GUI 右缘加入 Claude Code dock 入口（`shell.overlay` 槽），每个会话由官方 `@anthropic-ai/claude-agent-sdk` 驱动一个真实 claude 进程。功能细节、配置项与 HTTP API 表见 `README.md`（中文，与本文件互补）。
 
 ## 常用命令
 
@@ -51,7 +51,7 @@ node 半区各模块（读懂 catalog 这一层是理解全局的关键）：
 
 **核心不变量**：CLI 的存储是会话身份 / 标题 / 转录的唯一权威；sidecar 只存 CLI 表达不了的字段（模型覆盖、env 层、live 状态、计量成本、草稿转录）。两边按原生 id（sidecar 的 `claudeSessionId`）对齐；native 记录上的字段不得泄漏进合并后的 sidecar 行。
 
-浏览器半区：`index.tsx` 的 `apply()` 往 `sidebar.footer.action` 槽注册入口；`App.tsx` 组合 `SessionRail` / `Transcript` / `Composer` / `LiveTurnView`；`tool/*-card.ts` 渲染各类工具卡片；`settings/` 是 provider / 环境配置 UI；`status/` 是用量读数。
+浏览器半区：`index.tsx` 的 `apply()` 往 `shell.overlay` 槽注入右缘 dock 入口（`cc-dock` 按钮，点开全屏 overlay）；`App.tsx` 组合 `SessionRail` / `Transcript` / `Composer` / `LiveTurnView` / `StatusBar` / `Interaction`（权限审批卡片与 AskUserQuestion 桥）；`tool/*-card.ts` 渲染各类工具卡片；`settings/` 是 provider / 环境配置 UI（`SettingsModal` / `SessionEnvModal` 等）；`status/` 是用量与上下文读数。
 
 ## 硬性约束
 
@@ -59,7 +59,7 @@ node 半区各模块（读懂 catalog 这一层是理解全局的关键）：
 - 不跨进程打断：终端持有的会话在页面上只读，这就是全部控制模型（Windows 无法向别的控制台进程发 Ctrl+C）。
 - SDK 固定 `@anthropic-ai/claude-agent-sdk@0.3.220`（自带 CLI 载荷，与本机 claude 版本无关）。
 - profile 补丁层（cordis.patch.yml）里 id 定位的补丁**整行替换 config** —— 改哪项就把整块写全。
-- 本机 `~/.claude/settings.json` 若设 `permissions.defaultMode: "auto"`，原生分类器会自行允许/拒绝，页面收不到审批卡片。
+- 插件默认 `permissionMode` 就是 `auto`（`config.ts`），零配置时页面收不到审批卡片；想页面审批需显式设为 `default`。本机 `~/.claude/settings.json` 的 `permissions.defaultMode` 是另一条同效果的来源。
 
 ## 代码风格
 

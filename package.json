@@ -2,7 +2,7 @@
   "name": "dsh-cc",
   "version": "0.1.0",
   "private": true,
-  "description": "Claude Code inside the DeepSeek Harness web GUI: sidebar entry, session overlay, and an env-configurable Claude Agent SDK bridge",
+  "description": "Claude Code inside the DeepSeek Harness web GUI: right-edge dock entry, session overlay, and an env-configurable Claude Agent SDK bridge",
   "type": "module",
   "license": "MIT",
   "main": "lib/index.js",

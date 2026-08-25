@@ -3,17 +3,19 @@
  * interactions, and the composer.
  *
  * This module owns cross-cutting state only — the live SSE subscription, the
- * selected session, and which dialog is open. Each region is its own module so
- * they can evolve independently.
+ * selected session, and the per-session transcript cache. Each region is its
+ * own module so they can evolve independently.
  *
- * Escape is handled here rather than at the layer entry so an open dialog
- * consumes the key first: closing the whole surface out from under a dialog was
- * the previous behavior, and it made the settings dialog impossible to dismiss.
+ * Escape is handled here rather than at the layer entry, and only when no
+ * floating layer is open: modals, the inline directory picker, a rename edit
+ * all report themselves through the overlay signal (see ./overlay.ts), and the
+ * surface reads that count from a ref at key-press time, so an Escape that
+ * closes one layer can never fall through and close the surface under it.
  *
  * @module dsh-cc/client/App
  */
 
-import { useEffect, useRef, useState, type ReactElement } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react'
 import { Button } from '@deepseek-ai/dsh-client-ui-primitives'
 import { Composer } from './Composer.tsx'
 import { PermissionCard, QuestionCard } from './Interaction.tsx'
@@ -24,6 +26,7 @@ import { reduceDelta, type LiveTurn } from '../live-turn.ts'
 import { Transcript } from './Transcript.tsx'
 import { SettingsModal } from './settings/SettingsModal.tsx'
 import { SessionEnvModal } from './settings/SessionEnvModal.tsx'
+import { OverlayContext, useOverlay, type OverlaySignal } from './overlay.ts'
 import { connectEvents } from './api/http.ts'
 import { answerDialog, answerPermission } from './api/interaction.ts'
 import {
@@ -54,6 +57,36 @@ interface LiveEntry {
   turn: LiveTurn | undefined
 }
 
+/** Shared empty transcript, so a session with no events keeps one stable identity. */
+const NO_EVENTS: CcEvent[] = []
+
+/**
+ * Union two views of one session's transcript by `seq`. The SSE stream and a
+ * re-read snapshot can overlap arbitrarily — the same event seen over the wire
+ * and again in a fetch — and a plain append would duplicate it. The first-seen
+ * copy wins on a collision (events are immutable once committed); when the
+ * incoming list adds nothing, the current array's identity is kept so
+ * memoized rows below do not re-render for nothing.
+ *
+ * @param current - the events already held for the session, `seq`-ascending.
+ * @param incoming - a server snapshot or another stream view of the same session.
+ * @returns the merged list, `seq`-ascending; `current` itself when it already
+ *   covers everything `incoming` carries.
+ */
+function mergeBySeq(current: CcEvent[], incoming: CcEvent[]): CcEvent[] {
+  if (current.length === 0) return incoming
+  const bySeq = new Map<number, CcEvent>()
+  for (const event of current) bySeq.set(event.seq, event)
+  let added = false
+  for (const event of incoming) {
+    if (bySeq.has(event.seq)) continue
+    bySeq.set(event.seq, event)
+    added = true
+  }
+  if (!added) return current
+  return [...bySeq.values()].sort((left, right) => left.seq - right.seq)
+}
+
 /**
  * The Claude Code surface.
  * @param props - the close callback, invoked by Escape or the close control.
@@ -63,7 +96,14 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   const [config, setConfig] = useState<ConfigSummary | undefined>()
   const [sessions, setSessions] = useState<SessionMeta[]>([])
   const [currentId, setCurrentId] = useState<string | undefined>()
-  const [events, setEvents] = useState<CcEvent[]>([])
+  /**
+   * The transcript tail of EVERY session that has streamed while the page was
+   * open, keyed by session id. Switching sessions must never show one
+   * session's events under another's title, and an event that lands while a
+   * switch is in flight must land in its own session's list — both fall out
+   * of keying, where the flat list needed race guards to approximate it.
+   */
+  const [eventsBySession, setEventsBySession] = useState<Record<string, CcEvent[]>>({})
   const [usage, setUsage] = useState<UsageInfo | undefined>()
   const [context, setContext] = useState<ContextUsage | undefined>()
   const [permissions, setPermissions] = useState<PendingPermission[]>([])
@@ -80,6 +120,10 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   const [error, setError] = useState<string | undefined>()
   const currentIdRef = useRef(currentId)
   const scrollRef = useRef<HTMLDivElement>(null)
+  /** Whether the transcript is pinned to the bottom (following the stream). */
+  const pinnedRef = useRef(true)
+  /** End-of-content marker; a pending card is nudged into view through it. */
+  const attentionRef = useRef<HTMLDivElement>(null)
   /** Last delta counter folded per session; the ref mirror survives renders. */
   const liveSeqsRef = useRef<Record<string, number>>({})
   /** Sessions whose server fold needs re-fetching after a frame gap. */
@@ -90,9 +134,25 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   const foreignSync = useRef<{ id: string; updatedAt: string } | undefined>(undefined)
   /** Debounce for that mirror, so a burst of frames collapses into one read. */
   const foreignSyncTimer = useRef<ReturnType<typeof setTimeout>>(undefined)
+  /**
+   * Every floating layer currently open, as opaque tokens. Escape reads this
+   * set at key-press time; a layer's own handler then closes just that layer.
+   */
+  const overlaysRef = useRef<Set<object>>(new Set())
+  const overlaySignal = useMemo<OverlaySignal>(() => ({
+    register: () => {
+      const token = {}
+      overlaysRef.current.add(token)
+      return () => {
+        overlaysRef.current.delete(token)
+      }
+    },
+  }), [])
+  useOverlay(showSettings)
+  useOverlay(envSessionId !== undefined)
 
   const current = sessions.find(session => session.id === currentId)
-  const dialogOpen = showSettings || envSessionId !== undefined
+  const events = currentId !== undefined ? eventsBySession[currentId] ?? NO_EVENTS : NO_EVENTS
   const live = currentId !== undefined ? liveBySession[currentId]?.turn : undefined
 
   const fail = (cause: unknown): void => {
@@ -110,6 +170,20 @@ export function CcApp(props: { onClose(): void }): ReactElement {
       const next = { ...previous }
       delete next[sessionId]
       return next
+    })
+  }
+
+  /**
+   * Fold one session's transcript tail with a server snapshot, deduplicated
+   * by `seq` — see {@link mergeBySeq}.
+   * @param sessionId - the session the events belong to.
+   * @param incoming - the server's view of the same tail.
+   */
+  const mergeSessionEvents = (sessionId: string, incoming: CcEvent[]): void => {
+    setEventsBySession(previous => {
+      const merged = mergeBySeq(previous[sessionId] ?? [], incoming)
+      if (merged === previous[sessionId]) return previous
+      return { ...previous, [sessionId]: merged }
     })
   }
 
@@ -132,8 +206,9 @@ export function CcApp(props: { onClose(): void }): ReactElement {
 
   /**
    * Re-fetch the server fold for sessions whose frame stream jumped — the
-   * local fold has holes the reducer will not fill on its own. Debounced so
-   * one reconnect costs one request, not one per missed frame.
+   * local fold has holes the reducer will not fill on its own. The same read
+   * recovers events that committed during the gap: nothing re-sends them.
+   * Debounced so one reconnect costs one request, not one per missed frame.
    * @param sessionId - the session whose stream showed a counter gap.
    */
   const scheduleLiveCatchUp = (sessionId: string): void => {
@@ -145,12 +220,26 @@ export function CcApp(props: { onClose(): void }): ReactElement {
       liveGapPending.current.clear()
       for (const id of ids) {
         fetchSession(id)
-          .then(result => applyLiveSnapshot(id, result.live))
+          .then(result => {
+            applyLiveSnapshot(id, result.live)
+            mergeSessionEvents(id, result.events)
+          })
           .catch(() => {
             // Best effort; the next gap (or the next selection) retries.
           })
       }
     }, 250)
+  }
+
+  /**
+   * Re-read whichever session is being watched. Used on SSE (re)connection
+   * and on `hello`: a turn that ENDED while the stream was down leaves no
+   * delta hole to detect, so a full re-read is the only carrier of the
+   * events that committed during the gap.
+   */
+  const catchUpCurrent = (): void => {
+    const id = currentIdRef.current
+    if (id !== undefined) scheduleLiveCatchUp(id)
   }
 
   /**
@@ -190,6 +279,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
       switch (message.t) {
         case 'hello':
           setConfig(message.config)
+          catchUpCurrent()
           break
         case 'sessions': {
           setSessions(message.sessions)
@@ -204,6 +294,20 @@ export function CcApp(props: { onClose(): void }): ReactElement {
             const next = { ...previous }
             for (const id of Object.keys(next)) {
               if (!busy.has(id)) {
+                delete next[id]
+                changed = true
+              }
+            }
+            return changed ? next : previous
+          })
+          // Cached transcripts of sessions that left the catalog (deleted
+          // here or in a terminal) go with them.
+          setEventsBySession(previous => {
+            const alive = new Set(message.sessions.map(session => session.id))
+            let changed = false
+            const next = { ...previous }
+            for (const id of Object.keys(next)) {
+              if (!alive.has(id)) {
                 delete next[id]
                 changed = true
               }
@@ -230,7 +334,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
               if (id === undefined) return
               fetchSession(id)
                 .then(result => {
-                  if (currentIdRef.current === id) setEvents(result.events)
+                  if (currentIdRef.current === id) mergeSessionEvents(id, result.events)
                 })
                 .catch(() => {
                   // The mirror is best-effort; the next change retries.
@@ -249,9 +353,14 @@ export function CcApp(props: { onClose(): void }): ReactElement {
           if (message.event.kind === 'result' || message.event.kind === 'error') {
             dropLive(message.sessionId)
           }
-          if (message.sessionId !== currentIdRef.current) break
-          setEvents(previous => [...previous, message.event])
-          if (message.event.kind === 'result') {
+          // Events are filed under the session they belong to, watched or
+          // not: a background session's tail is complete when the user
+          // switches to it, without a re-read racing the switch.
+          setEventsBySession(previous => {
+            const existing = previous[message.sessionId] ?? []
+            return { ...previous, [message.sessionId]: [...existing, message.event] }
+          })
+          if (message.sessionId === currentIdRef.current && message.event.kind === 'result') {
             refreshTelemetry(currentIdRef.current)
           }
           break
@@ -295,7 +404,12 @@ export function CcApp(props: { onClose(): void }): ReactElement {
           // breaking the stream.
           break
       }
-    }, setConnected)
+    }, up => {
+      setConnected(up)
+      // The stream coming back up is the one moment a re-read is needed
+      // without a counter gap to announce it.
+      if (up) catchUpCurrent()
+    })
 
     return () => {
       disposed = true
@@ -306,15 +420,16 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   }, [])
 
   useEffect(() => {
-    if (currentId === undefined) {
-      setEvents([])
-      return
-    }
+    if (currentId === undefined) return
     let stale = false
+    // Entering a session starts pinned at the bottom of its transcript.
+    pinnedRef.current = true
     fetchSession(currentId)
       .then(result => {
         if (stale) return
-        setEvents(result.events)
+        // Merged, not replaced: events that streamed in over SSE while this
+        // request was in flight must survive the snapshot landing.
+        mergeSessionEvents(currentId, result.events)
         // The selection may land mid-turn (page opened on a running session,
         // or reloaded): adopt the server's fold unless local frames already
         // ran ahead of it.
@@ -331,27 +446,53 @@ export function CcApp(props: { onClose(): void }): ReactElement {
     }
   }, [currentId])
 
+  // Follow the stream only while the user is at the bottom: scrolling up to
+  // read must not be fought by the stream appending below. Coming back within
+  // the threshold resumes following.
   useEffect(() => {
     const element = scrollRef.current
-    if (element !== null) element.scrollTop = element.scrollHeight
+    if (element === null) return
+    if (pinnedRef.current) element.scrollTop = element.scrollHeight
   }, [events.length, live, currentId])
+
+  const currentPermissions = permissions.filter(item => item.sessionId === currentId)
+  const currentDialogs = dialogs.filter(item => item.sessionId === currentId)
+  const pendingKey = `${currentPermissions.map(item => item.request.id).join('|')}#${currentDialogs.map(item => item.id).join('|')}`
+
+  // A permission or question card for the watched session arrives below the
+  // fold exactly when it is most urgent; nudge it into view. `block: 'nearest'`
+  // so an already-visible card does not move anything.
+  useEffect(() => {
+    if (currentPermissions.length === 0 && currentDialogs.length === 0) return
+    attentionRef.current?.scrollIntoView({ block: 'nearest' })
+  }, [pendingKey, currentPermissions.length, currentDialogs.length])
+
+  /** Pending permission/question counts per session, for the rail's badges. */
+  const pendingBySession = useMemo(() => {
+    const counts: Record<string, number> = {}
+    for (const item of permissions) counts[item.sessionId] = (counts[item.sessionId] ?? 0) + 1
+    for (const item of dialogs) counts[item.sessionId] = (counts[item.sessionId] ?? 0) + 1
+    return counts
+  }, [permissions, dialogs])
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent): void => {
       if (event.key !== 'Escape') return
-      // An open dialog owns the key; the surface closes only from the bare
-      // surface, so Escape never dismisses two layers at once.
-      if (dialogOpen) return
+      // The Escape that cancels an IME composition belongs to the input, not
+      // the page; closing the surface here would eat a half-typed draft.
+      if (event.isComposing || event.keyCode === 229) return
+      // Any open layer — modal, directory picker, rename edit, new-session
+      // form — owns the key and closes just itself through its own handler.
+      if (overlaysRef.current.size > 0) return
       props.onClose()
     }
     // Capture phase, deliberately: a dialog closes itself from a `document`
     // bubble listener, and React flushes that state update at the microtask
-    // checkpoint BETWEEN the two listeners — re-registering this one with
-    // `dialogOpen` already false, which then closed the surface too. Capture
-    // runs before any of that, while the dialog is still open.
+    // checkpoint BETWEEN the two listeners. The overlay count lives in a ref
+    // read here, at key-press time, so that flush cannot flip the answer.
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [dialogOpen, props.onClose])
+  }, [props.onClose])
 
   const decide = (requestId: string, answer: PermissionAnswer): void => {
     if (current === undefined) return
@@ -359,106 +500,112 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   }
 
   return (
-    <div className="cc-overlay">
-      <SessionRail
-        sessions={sessions}
-        currentId={currentId}
-        config={config}
-        connected={connected}
-        onSelect={setCurrentId}
-        onCreate={form => {
-          createSession(form)
-            .then(result => {
-              setSessions(previous => [
-                result.session,
-                ...previous.filter(session => session.id !== result.session.id),
-              ])
-              setCurrentId(result.session.id)
-            })
-            .catch(fail)
-        }}
-        onDelete={id => {
-          if (!window.confirm('删除该会话及全部聊天记录？')) return
-          deleteSession(id)
-            .then(() => {
-              setSessions(previous => previous.filter(session => session.id !== id))
-              setCurrentId(previous => (previous === id ? undefined : previous))
-            })
-            .catch(fail)
-        }}
-        onRename={(id, name) => {
-          renameSession(id, name).catch(fail)
-        }}
-        onOpenSettings={() => setShowSettings(true)}
-      />
+    <OverlayContext.Provider value={overlaySignal}>
+      <div className="cc-overlay">
+        <SessionRail
+          sessions={sessions}
+          currentId={currentId}
+          config={config}
+          connected={connected}
+          pending={pendingBySession}
+          onSelect={setCurrentId}
+          onCreate={form => {
+            createSession(form)
+              .then(result => {
+                setSessions(previous => [
+                  result.session,
+                  ...previous.filter(session => session.id !== result.session.id),
+                ])
+                setCurrentId(result.session.id)
+              })
+              .catch(fail)
+          }}
+          onDelete={id => {
+            if (!window.confirm('删除该会话及全部聊天记录？')) return
+            deleteSession(id)
+              .then(() => {
+                setSessions(previous => previous.filter(session => session.id !== id))
+                setCurrentId(previous => (previous === id ? undefined : previous))
+              })
+              .catch(fail)
+          }}
+          onRename={(id, name) => {
+            renameSession(id, name).catch(fail)
+          }}
+          onOpenSettings={() => setShowSettings(true)}
+        />
 
-      <main className="cc-main">
-        <header className="cc-head">
-          <div className="cc-head-title">
-            <strong>{current?.name ?? 'Claude Code'}</strong>
+        <main className="cc-main">
+          <header className="cc-head">
+            <div className="cc-head-title">
+              <strong>{current?.name ?? 'Claude Code'}</strong>
+              {current !== undefined && (
+                <span className="cc-head-meta">
+                  <span>{current.cwd}</span>
+                  {current.lastGoodModel !== undefined && <span>· {current.lastGoodModel}</span>}
+                  {config !== undefined && <span>· {config.permissionMode}</span>}
+                </span>
+              )}
+            </div>
             {current !== undefined && (
-              <span className="cc-head-meta">
-                <span>{current.cwd}</span>
-                {current.lastGoodModel !== undefined && <span>· {current.lastGoodModel}</span>}
-                {config !== undefined && <span>· {config.permissionMode}</span>}
-              </span>
+              <Button size="sm" onClick={() => setEnvSessionId(current.id)}>会话环境</Button>
             )}
-          </div>
+            <Button size="sm" onClick={props.onClose}>关闭 Esc</Button>
+          </header>
+
           {current !== undefined && (
-            <Button size="sm" onClick={() => setEnvSessionId(current.id)}>会话环境</Button>
+            <StatusBar
+              sessionId={current.id}
+              busy={current.status === 'busy'}
+              context={context}
+              usage={usage}
+              fallbackCostUsd={current.totalCostUsd}
+            />
           )}
-          <Button size="sm" onClick={props.onClose}>关闭 Esc</Button>
-        </header>
 
-        {current !== undefined && (
-          <StatusBar
-            sessionId={current.id}
-            busy={current.status === 'busy'}
-            context={context}
-            usage={usage}
-            fallbackCostUsd={current.totalCostUsd}
-          />
-        )}
+          {error !== undefined && (
+            <div className="cc-error-bar">
+              <span className="cc-spacer">{error}</span>
+              <Button size="sm" onClick={() => setError(undefined)}>关闭</Button>
+            </div>
+          )}
 
-        {error !== undefined && (
-          <div className="cc-error-bar">
-            <span className="cc-spacer">{error}</span>
-            <Button size="sm" onClick={() => setError(undefined)}>关闭</Button>
-          </div>
-        )}
-
-        {current === undefined
-          ? <div className="cc-empty cc-center">从左侧选择或新建一个 Claude Code 会话</div>
-          : (
+          {current === undefined
+            ? <div className="cc-empty cc-center">从左侧选择或新建一个 Claude Code 会话</div>
+            : (
               <>
-                <div className="cc-scroll" ref={scrollRef}>
+                <div
+                  className="cc-scroll"
+                  ref={scrollRef}
+                  onScroll={event => {
+                    const element = event.currentTarget
+                    pinnedRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80
+                  }}
+                >
                   <Transcript events={events} />
                   <LiveTurnView turn={live} />
                   {events.length === 0 && live === undefined
                     && <div className="cc-empty">发送第一条消息，开始与 Claude Code 对话</div>}
-                  {permissions
-                    .filter(item => item.sessionId === current.id)
-                    .map(item => (
-                      <PermissionCard
-                        key={item.request.id}
-                        request={item.request}
-                        onAnswer={answer => decide(item.request.id, answer)}
-                      />
-                    ))}
-                  {dialogs
-                    .filter(item => item.sessionId === current.id)
-                    .map(item => (
-                      <QuestionCard
-                        key={item.id}
-                        payload={item.payload}
-                        onAnswer={answers => {
-                          answerDialog(current.id, item.id, answers).catch(fail)
-                        }}
-                        onCancel={() => {
-                          answerDialog(current.id, item.id, undefined).catch(fail)
-                        }}
-                      />
-                    ))}
+                  {currentPermissions.map(item => (
+                    <PermissionCard
+                      key={item.request.id}
+                      request={item.request}
+                      onAnswer={answer => decide(item.request.id, answer)}
+                    />
+                  ))}
+                  {currentDialogs.map(item => (
+                    <QuestionCard
+                      key={item.id}
+                      payload={item.payload}
+                      onAnswer={answers => {
+                        answerDialog(current.id, item.id, answers).catch(fail)
+                      }}
+                      onCancel={() => {
+                        answerDialog(current.id, item.id, undefined).catch(fail)
+                      }}
+                    />
+                  ))}
+                  <div ref={attentionRef} aria-hidden />
                 </div>
                 <Composer
                   busy={current.status === 'busy'}
@@ -472,18 +619,33 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                 />
               </>
             )}
-      </main>
+        </main>
 
-      {showSettings && <SettingsModal config={config} onClose={() => setShowSettings(false)} />}
-      {envSessionId !== undefined && current !== undefined && current.id === envSessionId && (
-        <SessionEnvModal
-          session={current}
-          onClose={() => setEnvSessionId(undefined)}
-          onSaved={() => {
-            fetchSessions().then(result => setSessions(result.sessions)).catch(fail)
-          }}
-        />
-      )}
-    </div>
+        {showSettings && (
+          <SettingsModal
+            config={config}
+            onClose={() => setShowSettings(false)}
+            onSaved={() => {
+              // The header shows fields of the effective config; without this
+              // re-read it would keep the pre-save posture until reconnect.
+              fetchConfig()
+                .then(result => setConfig(result.config))
+                .catch(() => {
+                  // The save itself succeeded; the next hello frame retries.
+                })
+            }}
+          />
+        )}
+        {envSessionId !== undefined && current !== undefined && current.id === envSessionId && (
+          <SessionEnvModal
+            session={current}
+            onClose={() => setEnvSessionId(undefined)}
+            onSaved={() => {
+              fetchSessions().then(result => setSessions(result.sessions)).catch(fail)
+            }}
+          />
+        )}
+      </div>
+    </OverlayContext.Provider>
   )
 }

@@ -11,31 +11,20 @@
  * @module dsh-cc/client/settings/providerFields
  */
 
-import type { ConfigLayer, ConfigSummary, EffectiveEnvEntry } from '../../types.ts'
+import { PROVIDER_ENV_KEYS, type ConfigLayer, type ConfigSummary, type EffectiveEnvEntry } from '../../types.ts'
 
 /** The env var the 密钥 field writes to when neither credential key is already present. */
-export const PRIMARY_KEY_ENV = 'ANTHROPIC_AUTH_TOKEN'
+export const PRIMARY_KEY_ENV = PROVIDER_ENV_KEYS.authToken
 /** The credential env var the 密钥 field falls back to reading when the primary key is absent. */
-export const FALLBACK_KEY_ENV = 'ANTHROPIC_API_KEY'
+export const FALLBACK_KEY_ENV = PROVIDER_ENV_KEYS.apiKey
 
 /**
- * Every env key the structured form owns. A key edited here must never also
- * appear as a row in the advanced KV editor.
+ * Every env key the structured form owns, derived from the shared
+ * field↔env-key table — the same table the node half's config resolution
+ * reads, so the form can never drift from what actually reaches the process.
+ * A key owned here must never also appear as a row in the advanced KV editor.
  */
-export const STRUCTURED_ENV_KEYS: readonly string[] = [
-  'ANTHROPIC_BASE_URL',
-  PRIMARY_KEY_ENV,
-  FALLBACK_KEY_ENV,
-  'ANTHROPIC_MODEL',
-  'ANTHROPIC_DEFAULT_OPUS_MODEL',
-  'ANTHROPIC_DEFAULT_SONNET_MODEL',
-  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-  'ANTHROPIC_SMALL_FAST_MODEL',
-  'HTTPS_PROXY',
-  'HTTP_PROXY',
-  'NO_PROXY',
-  'API_TIMEOUT_MS',
-]
+export const STRUCTURED_ENV_KEYS: readonly string[] = Object.values(PROVIDER_ENV_KEYS)
 
 /** The structured form's in-memory field values, projected from an env map. */
 export interface ProviderFormFields {
@@ -61,19 +50,22 @@ export interface ProviderFormFields {
  * @returns the form field values; a key absent from `env` becomes an empty string.
  */
 export function extractProviderFields(env: Record<string, string>): ProviderFormFields {
+  const keys = PROVIDER_ENV_KEYS
   return {
-    baseUrl: env.ANTHROPIC_BASE_URL ?? '',
-    apiKeyValue: env[PRIMARY_KEY_ENV] ?? env[FALLBACK_KEY_ENV] ?? '',
-    apiKeySourceKey: PRIMARY_KEY_ENV in env ? PRIMARY_KEY_ENV : FALLBACK_KEY_ENV in env ? FALLBACK_KEY_ENV : PRIMARY_KEY_ENV,
-    model: env.ANTHROPIC_MODEL ?? '',
-    opusModel: env.ANTHROPIC_DEFAULT_OPUS_MODEL ?? '',
-    sonnetModel: env.ANTHROPIC_DEFAULT_SONNET_MODEL ?? '',
-    haikuModel: env.ANTHROPIC_DEFAULT_HAIKU_MODEL ?? '',
-    smallFastModel: env.ANTHROPIC_SMALL_FAST_MODEL ?? '',
-    httpsProxy: env.HTTPS_PROXY ?? '',
-    httpProxy: env.HTTP_PROXY ?? '',
-    noProxy: env.NO_PROXY ?? '',
-    apiTimeoutMs: env.API_TIMEOUT_MS ?? '',
+    baseUrl: env[keys.baseUrl] ?? '',
+    apiKeyValue: env[keys.authToken] ?? env[keys.apiKey] ?? '',
+    apiKeySourceKey: keys.authToken in env
+      ? keys.authToken
+      : keys.apiKey in env ? keys.apiKey : keys.authToken,
+    model: env[keys.model] ?? '',
+    opusModel: env[keys.opusModel] ?? '',
+    sonnetModel: env[keys.sonnetModel] ?? '',
+    haikuModel: env[keys.haikuModel] ?? '',
+    smallFastModel: env[keys.smallFastModel] ?? '',
+    httpsProxy: env[keys.httpsProxy] ?? '',
+    httpProxy: env[keys.httpProxy] ?? '',
+    noProxy: env[keys.noProxy] ?? '',
+    apiTimeoutMs: env[keys.apiTimeoutMs] ?? '',
   }
 }
 
@@ -90,17 +82,18 @@ export function applyProviderFields(env: Record<string, string>, fields: Provide
   const set = (key: string, value: string): void => {
     if (value.trim() !== '') next[key] = value
   }
-  set('ANTHROPIC_BASE_URL', fields.baseUrl)
+  const keys = PROVIDER_ENV_KEYS
+  set(keys.baseUrl, fields.baseUrl)
   set(fields.apiKeySourceKey, fields.apiKeyValue)
-  set('ANTHROPIC_MODEL', fields.model)
-  set('ANTHROPIC_DEFAULT_OPUS_MODEL', fields.opusModel)
-  set('ANTHROPIC_DEFAULT_SONNET_MODEL', fields.sonnetModel)
-  set('ANTHROPIC_DEFAULT_HAIKU_MODEL', fields.haikuModel)
-  set('ANTHROPIC_SMALL_FAST_MODEL', fields.smallFastModel)
-  set('HTTPS_PROXY', fields.httpsProxy)
-  set('HTTP_PROXY', fields.httpProxy)
-  set('NO_PROXY', fields.noProxy)
-  set('API_TIMEOUT_MS', fields.apiTimeoutMs)
+  set(keys.model, fields.model)
+  set(keys.opusModel, fields.opusModel)
+  set(keys.sonnetModel, fields.sonnetModel)
+  set(keys.haikuModel, fields.haikuModel)
+  set(keys.smallFastModel, fields.smallFastModel)
+  set(keys.httpsProxy, fields.httpsProxy)
+  set(keys.httpProxy, fields.httpProxy)
+  set(keys.noProxy, fields.noProxy)
+  set(keys.apiTimeoutMs, fields.apiTimeoutMs)
   return next
 }
 

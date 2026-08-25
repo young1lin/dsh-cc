@@ -13,7 +13,7 @@ const q = query({
     parent_tool_use_id: null,
   }],
   options: {
-    cwd: 'D:/dev/dsh-cc',
+    cwd: 'C:/PythonProject/dev/dsh-cc',
     permissionMode: 'auto',
     supportedDialogKinds: ['ask_user_question', 'question', 'ask_user_question_dialog'],
     onUserDialog: async (request) => {

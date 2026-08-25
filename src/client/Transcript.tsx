@@ -13,12 +13,12 @@
  * @module dsh-cc/client/Transcript
  */
 
-import { useState, type ReactElement } from 'react'
+import { memo, useMemo, useState, type ReactElement } from 'react'
 import { DisclosureRow, IconThinkOutline14, MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
 import { registerCss } from './css.ts'
 import { ToolRow } from './tool/ToolRow.tsx'
 import { stringField } from './tool/wire.ts'
-import type { CcEvent, ImageRef } from '../types.ts'
+import { MEDIA_TYPE_EXTENSIONS, type CcEvent } from '../types.ts'
 
 registerCss('transcript', `
 /* The user's own turn, drawn from the host's own bubble token and geometry
@@ -103,13 +103,12 @@ registerCss('transcript', `
 }
 `)
 
-/** URL extension per image type, mirroring the host's blob route. */
-const IMAGE_EXTENSIONS: Record<ImageRef['mediaType'], string> = {
-  'image/png': 'png',
-  'image/jpeg': 'jpg',
-  'image/gif': 'gif',
-  'image/webp': 'webp',
-}
+/**
+ * URL extension per image type for the blob route, from the shared table the
+ * blob store itself stores under — a local copy could drift from what the
+ * route actually serves.
+ */
+const IMAGE_EXTENSIONS = MEDIA_TYPE_EXTENSIONS
 
 /** One tool call with its result, or any other transcript entry. */
 type Item =
@@ -341,7 +340,10 @@ function ToolItem(props: { item: Extract<Item, { k: 'tool' }>; cwd: string | und
     <ToolRow
       name={name}
       input={call?.input}
-      result={result === undefined ? undefined : { text: result.text, isError: result.isError }}
+      // The result event itself, not a reshaped copy: ToolRow is memo'd, and
+      // the event's identity is stable in the events array while a fresh
+      // `{ text, isError }` object per render would defeat that memo.
+      result={result}
       summary={call === undefined ? '' : toolSummary(name, call.input)}
       cwd={props.cwd}
     />
@@ -350,12 +352,17 @@ function ToolItem(props: { item: Extract<Item, { k: 'tool' }>; cwd: string | und
 
 /**
  * Render a whole transcript.
+ *
+ * Memo'd on its one prop: the parent re-renders on every stream delta, but
+ * the current session's events array keeps its identity until an event
+ * actually commits, so the O(n) projection and every ToolRow's card parse
+ * run only when the transcript really changed.
  * @param props - the ordered events.
  * @returns the transcript nodes.
  */
-export function Transcript(props: { events: CcEvent[] }): ReactElement {
-  const items = projectTranscript(props.events)
-  const cwd = sessionCwd(props.events)
+export const Transcript = memo(function Transcript(props: { events: CcEvent[] }): ReactElement {
+  const items = useMemo(() => projectTranscript(props.events), [props.events])
+  const cwd = useMemo(() => sessionCwd(props.events), [props.events])
   return (
     <>
       {items.map((item, index) => item.k === 'tool'
@@ -363,4 +370,4 @@ export function Transcript(props: { events: CcEvent[] }): ReactElement {
         : <EventItem key={`event:${item.event.seq}:${index}`} event={item.event} />)}
     </>
   )
-}
+})

@@ -17,9 +17,10 @@ globalThis.window = { __ModuleLoader__: { load(options) { loaded = options } } }
 const requireStub = (name) => {
   if (name === 'react-dom') return { createPortal: () => { throw new Error('createPortal must not run in the smoke test') } }
   if (name === '@deepseek-ai/dsh-client-ui-primitives') {
-    // The published artifact is a browser closure bundle; stub the one value
-    // this plugin imports.
-    return { MarkdownText: () => null }
+    // The published artifact is a browser closure bundle; stub every export
+    // the plugin might import (MarkdownText, Button, icons…) with inert
+    // components, so module-scope JSX maps never see an undefined type.
+    return new Proxy({}, { get: () => () => null })
   }
   return nodeRequire(name)
 }

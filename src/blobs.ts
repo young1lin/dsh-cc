@@ -14,15 +14,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync } from 'node:fs'
 import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { ImageRef } from './types.ts'
-
-/** Image media types the page and the CLI exchange. */
-const EXTENSIONS: Record<ImageRef['mediaType'], string> = {
-  'image/png': 'png',
-  'image/jpeg': 'jpg',
-  'image/gif': 'gif',
-  'image/webp': 'webp',
-}
+import { MEDIA_TYPE_EXTENSIONS, type ImageRef } from './types.ts'
 
 /**
  * Whether a string names an image type this store accepts.
@@ -30,7 +22,7 @@ const EXTENSIONS: Record<ImageRef['mediaType'], string> = {
  * @returns true when the type is supported.
  */
 export function isImageMediaType(value: string): value is ImageRef['mediaType'] {
-  return value in EXTENSIONS
+  return value in MEDIA_TYPE_EXTENSIONS
 }
 
 /** Image bytes on disk, addressed by content hash. */
@@ -85,6 +77,6 @@ export class BlobStore {
    * @returns the absolute file path.
    */
   private path(id: string, mediaType: ImageRef['mediaType']): string {
-    return join(this.dir, `${id}.${EXTENSIONS[mediaType]}`)
+    return join(this.dir, `${id}.${MEDIA_TYPE_EXTENSIONS[mediaType]}`)
   }
 }

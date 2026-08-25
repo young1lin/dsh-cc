@@ -58,18 +58,29 @@ export class SessionStore {
   }
 
   /**
-   * The highest persisted seq of a session, read from its transcript tail.
+   * The highest persisted seq of a session, read from its transcript file.
+   *
+   * The maximum over every parseable line, not the last line's value:
+   * concurrent writers can land events out of order, so the final line may
+   * carry a smaller seq than one before it.
    * @param id - session id.
-   * @returns the last seq, or 0 without a transcript.
+   * @returns the highest seq, or 0 without a transcript.
    */
   private lastSeq(id: string): number {
     try {
       const file = join(this.dataDir, 'sessions', `${id}.jsonl`)
       if (!existsSync(file)) return 0
-      const lines = readFileSync(file, 'utf8').split('\n').filter(line => line.trim().length > 0)
-      const last = lines[lines.length - 1]
-      if (last === undefined) return 0
-      return (JSON.parse(last) as CcEvent).seq ?? 0
+      let max = 0
+      for (const line of readFileSync(file, 'utf8').split('\n')) {
+        if (line.trim().length === 0) continue
+        try {
+          const seq = (JSON.parse(line) as CcEvent).seq
+          if (typeof seq === 'number' && seq > max) max = seq
+        } catch {
+          // A torn line contributes nothing; the rest of the file still counts.
+        }
+      }
+      return max
     } catch {
       return 0
     }
@@ -133,17 +144,36 @@ export class SessionStore {
   }
 
   /**
+   * One session's metadata by the native id it wraps.
+   * @param claudeSessionId - the native Claude Code session id.
+   * @returns the sidecar row carrying it, or undefined when none does.
+   */
+  findByClaudeId(claudeSessionId: string): SessionMeta | undefined {
+    for (const meta of this.sessions.values()) {
+      if (meta.claudeSessionId === claudeSessionId) return meta
+    }
+    return undefined
+  }
+
+  /**
    * Insert a sidecar record for a session that already exists in the CLI's own
    * store, preserving its native id so the two stores agree on one identity.
    *
    * Unlike {@link create} this mints no id: adopting a CLI session under a new
    * id would make the page resume a conversation it lists under a different
    * key, and the transcript would be read from the wrong file.
+   *
+   * The claudeSessionId is uniqueness-checked too: reaching a page-created
+   * session through its native id must return that session's existing row,
+   * not mint a second one for the same conversation — two rows for one native
+   * session would both appear in the catalog list and diverge from there.
    * @param meta - the record to insert.
-   * @returns the inserted record, or the existing one when the id is taken.
+   * @returns the inserted record, or the existing one when the id or the
+   *   claudeSessionId is already taken.
    */
   async adopt(meta: SessionMeta): Promise<SessionMeta> {
     const existing = this.sessions.get(meta.id)
+      ?? (meta.claudeSessionId !== undefined ? this.findByClaudeId(meta.claudeSessionId) : undefined)
     if (existing !== undefined) return existing
     this.sessions.set(meta.id, meta)
     this.seq.set(meta.id, this.lastSeq(meta.id))
@@ -153,6 +183,11 @@ export class SessionStore {
 
   /**
    * Patch one session's metadata and refresh its updatedAt.
+   *
+   * A patch that would re-link this session onto a claudeSessionId another row
+   * already holds is refused for that field alone (everything else in the
+   * patch applies): one native session must map to at most one sidecar row,
+   * and silently keeping two would resurrect the duplicate-row catalog bug.
    * @param id - session id.
    * @param patch - fields to overwrite.
    * @returns the updated metadata, or undefined for an unknown id.
@@ -160,9 +195,32 @@ export class SessionStore {
   async update(id: string, patch: Partial<SessionMeta>): Promise<SessionMeta | undefined> {
     const meta = this.sessions.get(id)
     if (!meta) return undefined
-    Object.assign(meta, patch, { updatedAt: new Date().toISOString() })
+    const applied = { ...patch }
+    if (typeof applied.claudeSessionId === 'string' && applied.claudeSessionId !== meta.claudeSessionId) {
+      const holder = this.findByClaudeId(applied.claudeSessionId)
+      if (holder !== undefined && holder.id !== id) {
+        console.warn(`dsh-cc: 原生会话 ${applied.claudeSessionId} 已由会话 ${holder.id} 记录，不再重复关联到 ${id}`)
+        delete applied.claudeSessionId
+      }
+    }
+    Object.assign(meta, applied, { updatedAt: new Date().toISOString() })
     await this.persistIndex()
     return meta
+  }
+
+  /**
+   * Count one more user message.
+   *
+   * The increment happens against the store's own record rather than a value
+   * the caller read earlier, so two sends that overlap cannot both compute
+   * the same next count and lose one.
+   * @param id - session id.
+   */
+  async incrementMessageCount(id: string): Promise<void> {
+    const meta = this.sessions.get(id)
+    if (meta === undefined) return
+    meta.messageCount += 1
+    await this.persistIndex()
   }
 
   /**
@@ -206,6 +264,11 @@ export class SessionStore {
 
   /**
    * Read a session transcript (tail-limited for page rendering).
+   *
+   * A line that fails to parse is skipped, not thrown: a crash mid-append
+   * leaves a torn final line, and one bad byte must not turn every later read
+   * of the session into a 500 — the parseable history is still the history.
+   * This mirrors how the SDK's own transcript reader treats torn lines.
    * @param id - session id.
    * @param limit - maximum number of trailing events.
    * @returns the events in order; empty for a session without a transcript.
@@ -213,8 +276,16 @@ export class SessionStore {
   async transcript(id: string, limit = 800): Promise<CcEvent[]> {
     const file = join(this.dataDir, 'sessions', `${id}.jsonl`)
     if (!existsSync(file)) return []
-    const lines = (await readFile(file, 'utf8')).split('\n').filter(line => line.trim().length > 0)
-    return lines.slice(-limit).map(line => JSON.parse(line) as CcEvent)
+    const events: CcEvent[] = []
+    for (const line of (await readFile(file, 'utf8')).split('\n')) {
+      if (line.trim().length === 0) continue
+      try {
+        events.push(JSON.parse(line) as CcEvent)
+      } catch {
+        // Torn line from a crash mid-append; skip it, keep the rest.
+      }
+    }
+    return events.slice(-limit)
   }
 
   /**

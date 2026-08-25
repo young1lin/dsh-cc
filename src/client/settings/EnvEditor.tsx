@@ -42,8 +42,26 @@ registerCss('env-editor', `
 
 /** One editable environment entry. */
 export interface EnvRow {
+  /**
+   * Stable identity for the React key. Content cannot key a row — the key
+   * field is the thing being edited — and an index key reassigns identity
+   * when a row above is deleted. Assigned once at row creation.
+   */
+  id: string
   key: string
   value: string
+}
+
+/** Monotonic source of row ids; see {@link EnvRow.id}. */
+let rowSeq = 0
+
+/**
+ * Mint one row id.
+ * @returns a fresh, unique row id.
+ */
+function nextRowId(): string {
+  rowSeq += 1
+  return `env-row-${rowSeq}`
 }
 
 /**
@@ -54,7 +72,7 @@ export interface EnvRow {
 export function toRows(env: Record<string, string>): EnvRow[] {
   return Object.entries(env)
     .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, value]) => ({ key, value }))
+    .map(([key, value]) => ({ id: nextRowId(), key, value }))
 }
 
 /**
@@ -88,7 +106,7 @@ export function EnvEditor(props: {
   return (
     <>
       {props.rows.map((row, index) => (
-        <div key={index} className="cc-env-row">
+        <div key={row.id} className="cc-env-row">
           <input
             className="cc-env-key"
             value={row.key}
@@ -111,7 +129,7 @@ export function EnvEditor(props: {
           </button>
         </div>
       ))}
-      <Button size="sm" onClick={() => props.onChange([...props.rows, { key: '', value: '' }])}>
+      <Button size="sm" onClick={() => props.onChange([...props.rows, { id: nextRowId(), key: '', value: '' }])}>
         ＋ 添加变量
       </Button>
     </>

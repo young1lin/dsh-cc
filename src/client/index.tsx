@@ -12,8 +12,9 @@
  * @module dsh-cc/client
  */
 
-import { useEffect, useState, type ReactElement } from 'react'
+import { useLayoutEffect, useState, type ReactElement } from 'react'
 import { CcApp } from './App.tsx'
+import { ErrorBoundary } from './ErrorBoundary.tsx'
 import { mountCss } from './css.ts'
 import './theme.ts'
 
@@ -49,11 +50,19 @@ function TerminalIcon(): ReactElement {
 function ClaudeCodeLayer(): ReactElement {
   const [open, setOpen] = useState(false)
 
-  useEffect(() => {
+  // Layout effect: the dock must carry its styles in the FIRST paint — an
+  // effect would flash an unstyled sliver before the browser paints.
+  useLayoutEffect(() => {
     mountCss()
   }, [])
 
-  if (open) return <CcApp onClose={() => setOpen(false)} />
+  if (open) {
+    return (
+      <ErrorBoundary onDismiss={() => setOpen(false)}>
+        <CcApp onClose={() => setOpen(false)} />
+      </ErrorBoundary>
+    )
+  }
   return (
     <button type="button" className="cc-dock" title="打开 Claude Code" onClick={() => setOpen(true)}>
       <TerminalIcon />

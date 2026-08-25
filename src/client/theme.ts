@@ -185,6 +185,25 @@ registerCss('shell', `
   color: var(--dsw-alias-label-caption);
 }
 
+/* Pending-interaction badge: a warn-token dot (plus a count past one) when a
+   session — usually a background one — is blocked on a permission or an
+   unanswered question. */
+.cc-session-alert {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font: var(--dsw-font-xxs-12);
+  color: var(--dsw-alias-state-warn-primary);
+}
+
+.cc-session-alert-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--dsw-alias-state-warn-primary);
+}
+
 /* Row actions stay hidden until the row is hovered or focused within, so a
    quiet list is not a wall of icons. */
 .cc-session-action {

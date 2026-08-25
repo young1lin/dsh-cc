@@ -184,7 +184,7 @@ export function QuestionCard(props: {
     <div className="cc-ask">
       <div className="cc-ask-head">Claude 想确认几个问题</div>
       {questions.map((question, index) => (
-        <div key={question.question ?? index} style={{ marginTop: 10 }}>
+        <div key={`${index}:${question.question ?? ''}`} style={{ marginTop: 10 }}>
           {question.header !== undefined && question.header !== '' && (
             <div className="cc-q-header">{question.header}</div>
           )}
@@ -193,7 +193,7 @@ export function QuestionCard(props: {
             const label = option.label ?? ''
             return (
               <button
-                key={label}
+                key={`${index}:${label}`}
                 type="button"
                 className="cc-q-option"
                 data-active={(picks[index] ?? []).includes(label)}

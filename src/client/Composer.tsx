@@ -6,11 +6,12 @@
  * @module dsh-cc/client/Composer
  */
 
-import { useState, type ClipboardEvent, type DragEvent, type ReactElement } from 'react'
+import { useEffect, useRef, useState, type ClipboardEvent, type DragEvent, type ReactElement } from 'react'
 import { Button, IconSendOutline16, IconStopFill16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { uploadImage } from './api/sessions.ts'
 import { registerCss } from './css.ts'
-import type { ImageRef } from '../types.ts'
+import { useOverlay } from './overlay.ts'
+import { MEDIA_TYPE_EXTENSIONS, type ImageRef } from '../types.ts'
 
 registerCss('composer', `
 .cc-input-shell {
@@ -34,6 +35,7 @@ registerCss('composer', `
   border: none;
   outline: none;
   resize: none;
+  overflow-y: auto;
   background: transparent;
   color: var(--dsw-alias-label-primary);
   font: var(--dsw-font-s-14);
@@ -85,13 +87,8 @@ registerCss('composer', `
 .cc-attachment-drop:hover { color: var(--dsw-alias-state-error-primary); }
 `)
 
-/** URL extension per image type, mirroring the host's blob route. */
-const EXTENSIONS: Record<ImageRef['mediaType'], string> = {
-  'image/png': 'png',
-  'image/jpeg': 'jpg',
-  'image/gif': 'gif',
-  'image/webp': 'webp',
-}
+/** URL extension per image type, from the shared blob-store table. */
+const EXTENSIONS = MEDIA_TYPE_EXTENSIONS
 
 /**
  * Render the composer.
@@ -116,6 +113,21 @@ export function Composer(props: {
   const [uploading, setUploading] = useState(0)
   const [dropping, setDropping] = useState(false)
   const [failure, setFailure] = useState<string | undefined>()
+  const [focused, setFocused] = useState(false)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  // The composer holds drafts: while it is focused, Escape is not the
+  // surface's — it only leaves the input, and a stray press cannot cost the
+  // draft. Closing stays one Esc away once focus is elsewhere.
+  useOverlay(focused)
+
+  // Grow with the draft and hand the rest to internal scrolling: `auto` first
+  // so `scrollHeight` reports the content's own height, not the last one set.
+  useEffect(() => {
+    const element = inputRef.current
+    if (element === null) return
+    element.style.height = 'auto'
+    element.style.height = `${element.scrollHeight}px`
+  }, [value])
 
   const empty = value.trim().length === 0 && images.length === 0
 
@@ -208,6 +220,7 @@ export function Composer(props: {
         <textarea
           className="cc-input"
           rows={1}
+          ref={inputRef}
           value={value}
           readOnly={props.readOnly === true}
           placeholder={props.readOnly === true
@@ -217,8 +230,20 @@ export function Composer(props: {
               : '向 Claude Code 发送消息，Enter 发送，Shift+Enter 换行，可粘贴或拖入图片'}
           onChange={event => setValue(event.target.value)}
           onPaste={onPaste}
+          onFocus={() => setFocused(true)}
+          onBlur={() => setFocused(false)}
           onKeyDown={event => {
-            if (event.key === 'Escape') event.stopPropagation()
+            // The Enter that confirms an IME candidate is not a submit; some
+            // browsers report it only through keyCode 229. A whole-Chinese
+            // product hits this on every message, so guard before anything
+            // else consumes the key.
+            if (event.nativeEvent.isComposing || event.keyCode === 229) return
+            // Escape only leaves the input; the surface closes on the next
+            // Escape, once focus is no longer holding a draft.
+            if (event.key === 'Escape') {
+              event.currentTarget.blur()
+              return
+            }
             if (event.key === 'Enter' && !event.shiftKey) {
               event.preventDefault()
               submit()
