@@ -25,6 +25,16 @@ export const DEFAULT_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] a
 export type EffortLevel = (typeof DEFAULT_EFFORT_LEVELS)[number]
 
 /**
+ * The six permission postures the CLI accepts, in wire spelling — the same
+ * union the SDK's `PermissionMode` uses, mirrored so the browser half can
+ * validate and label it without importing the Node-only SDK.
+ */
+export type PermissionModeValue = 'default' | 'acceptEdits' | 'plan' | 'dontAsk' | 'bypassPermissions' | 'auto'
+
+/** Every {@link PermissionModeValue}, for validating page-supplied input. */
+export const PERMISSION_MODE_VALUES = ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions', 'auto'] as const
+
+/**
  * Structured provider field names mapped onto the env var each one resolves
  * to. Shared by the node half's config resolution so the schema, the env
  * projection, and any future UI read one table instead of three diverging
@@ -109,6 +119,12 @@ export interface SessionMeta {
    * renders the picker per session and a spawn reads its own session's level.
    */
   effort?: EffortLevel | ''
+  /**
+   * Permission-posture override for this session; unset or empty = the
+   * resolved config default. Same lifecycle as `model`: persisted here,
+   * spawn-time for a cold engine, hot-switched on a busy one.
+   */
+  permissionMode?: PermissionModeValue | ''
   /** Model id of the most recent successful turn; the fallback when a chosen model fails. */
   lastGoodModel?: string
   createdAt: string
@@ -407,6 +423,33 @@ export interface LiveTurnSnapshot {
   turn: LiveTurn | null
 }
 
+/** One row of a session's live task table, folded from the CLI's task frames. */
+export interface TaskRow {
+  /** The CLI's task id; joins control calls back to the process. */
+  id: string
+  /** Task discriminant: `subagent`, `shell`, `monitor`, `workflow`, … */
+  type: string
+  status: 'running' | 'paused' | 'completed' | 'failed' | 'killed' | 'stopped'
+  /** The model's own statement of what the task is for. */
+  description: string
+  /** The tool_use block that started the task, when the CLI reported one. */
+  toolUseId?: string
+  /** Subagent preset name, for `subagent` tasks. */
+  subagentType?: string
+  /** Joins the transcript Task/Bash card. */
+  prompt?: string
+  tokens: number
+  toolUses: number
+  durationMs: number
+  lastToolName?: string
+  summary?: string
+  isBackgrounded?: boolean
+  error?: string
+}
+
+/** The task statuses that end a task's life. */
+export const TERMINAL_TASK_STATUSES = ['completed', 'failed', 'killed', 'stopped'] as const
+
 /** Server-to-browser push message (the SSE data payload). */
 export type WireMessage =
   | { t: 'hello'; config: ConfigSummary }
@@ -417,3 +460,4 @@ export type WireMessage =
   | { t: 'permission-done'; sessionId: string; requestId: string; behavior: 'allow' | 'deny' }
   | { t: 'dialog'; sessionId: string; request: { id: string; kind: string; payload: Record<string, unknown> } }
   | { t: 'dialog-done'; sessionId: string; requestId: string }
+  | { t: 'tasks'; sessionId: string; tasks: TaskRow[] }
