@@ -71,6 +71,7 @@ const SILENT_HOOKS: EngineHooks = {
   delta: () => {},
   permissionRequest: () => {},
   dialogRequest: () => {},
+  tasks: () => {},
 }
 
 /**
@@ -1011,6 +1012,9 @@ export class CcRuntime {
       },
       dialogRequest: request => {
         this.broadcast({ t: 'dialog', sessionId, request })
+      },
+      tasks: rows => {
+        this.broadcast({ t: 'tasks', sessionId, tasks: rows })
       },
       onEngineFailure: async error => {
         await this.recoverWithLastGoodModel(sessionId, error)

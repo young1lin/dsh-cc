@@ -33,8 +33,10 @@ import type {
   SessionMeta,
   SlashCommand,
   StreamDelta,
+  TaskRow,
   TurnUsage,
 } from './types.ts'
+import { TERMINAL_TASK_STATUSES } from './types.ts'
 
 /**
  * Characters of CLI stderr retained for failure diagnostics. The tail is
@@ -55,6 +57,8 @@ export interface EngineHooks {
   permissionRequest(request: PermissionRequest): void
   /** Publish a pending blocking dialog (e.g. AskUserQuestion) to the page. */
   dialogRequest(request: DialogRequest): void
+  /** Publish the session's whole task table; display state, never persisted. */
+  tasks(rows: TaskRow[]): void
   /** Optional failure hook: the runtime may auto-recover with a fallback model. */
   onEngineFailure?(error: Error): Promise<void> | void
 }
@@ -144,6 +148,8 @@ export class SessionEngine {
   private readonly openBlocks = new Set<number>()
   /** Whether the running turn already published its turn-stop. */
   private turnStopped = false
+  /** The session's live task table in start order; display state only. */
+  private readonly taskTable = new Map<string, TaskRow>()
   /** Trailing CLI stderr, capped at STDERR_TAIL_LIMIT characters. */
   private stderrTail = ''
   private started = false
@@ -371,6 +377,34 @@ export class SessionEngine {
     return true
   }
 
+  /** The task table in start order; empty once the engine has ended. */
+  taskRows(): TaskRow[] {
+    return [...this.taskTable.values()]
+  }
+
+  /**
+   * Stop one running task; the CLI settles it with a `task_notification`
+   * whose status is `stopped`.
+   * @param taskId - the task id from the table.
+   */
+  async stopTask(taskId: string): Promise<void> {
+    this.lastUsed = Date.now()
+    await this.query?.stopTask(taskId)
+  }
+
+  /**
+   * Background the foreground task one tool call started — the control-call
+   * equivalent of the CLI's Ctrl+B.
+   * @param toolUseId - the tool_use id that started the task.
+   * @returns whether anything was backgrounded.
+   */
+  async backgroundTask(toolUseId: string): Promise<boolean> {
+    this.lastUsed = Date.now()
+    const q = this.query
+    if (q === undefined) return false
+    return await q.backgroundTasks(toolUseId)
+  }
+
   /**
    * Switch the permission posture of the running process; a recycled engine
    * reads the session's persisted override at spawn instead.
@@ -579,6 +613,23 @@ export class SessionEngine {
     })
   }
 
+  /** Broadcast the task-table snapshot through the host hook. */
+  private publishTasks(): void {
+    this.hooks.tasks([...this.taskTable.values()])
+  }
+
+  /** Drop terminal task rows; called when the next main turn starts. */
+  private pruneSettledTasks(): void {
+    let changed = false
+    for (const [id, row] of [...this.taskTable]) {
+      if ((TERMINAL_TASK_STATUSES as readonly string[]).includes(row.status)) {
+        this.taskTable.delete(id)
+        changed = true
+      }
+    }
+    if (changed) this.publishTasks()
+  }
+
   private ensureStarted(): void {
     if (this.started) return
     this.started = true
@@ -650,7 +701,9 @@ export class SessionEngine {
               permissionMode: message.permissionMode,
             },
           })
+          return
         }
+        this.onTaskMessage(message)
         return
       }
       case 'assistant': {
@@ -730,6 +783,103 @@ export class SessionEngine {
   }
 
   /**
+   * Fold one task-lifecycle system message into the task table and publish
+   * the whole table. Level semantics throughout: the table IS the state, and
+   * the page replaces its copy with each snapshot — so a missed frame heals
+   * on the next one and a mid-join page is repaired by the session detail.
+   * @param message - the system message carrying a task subtype.
+   */
+  private onTaskMessage(message: Extract<SDKMessage, { type: 'system' }>): void {
+    switch (message.subtype) {
+      case 'task_started': {
+        const previous = this.taskTable.get(message.task_id)
+        this.taskTable.set(message.task_id, {
+          id: message.task_id,
+          type: message.task_type ?? (message.subagent_type !== undefined ? 'subagent' : 'task'),
+          status: 'running',
+          description: message.description,
+          ...(message.tool_use_id !== undefined ? { toolUseId: message.tool_use_id } : {}),
+          ...(message.subagent_type !== undefined ? { subagentType: message.subagent_type } : {}),
+          ...(message.prompt !== undefined ? { prompt: message.prompt } : {}),
+          tokens: previous?.tokens ?? 0,
+          toolUses: previous?.toolUses ?? 0,
+          durationMs: previous?.durationMs ?? 0,
+          ...(previous?.summary !== undefined ? { summary: previous.summary } : {}),
+          ...(previous?.isBackgrounded !== undefined ? { isBackgrounded: previous.isBackgrounded } : {}),
+        })
+        break
+      }
+      case 'task_progress': {
+        const row = this.taskTable.get(message.task_id)
+        if (row === undefined) break
+        this.taskTable.set(message.task_id, {
+          ...row,
+          description: message.description,
+          tokens: message.usage.total_tokens,
+          toolUses: message.usage.tool_uses,
+          durationMs: message.usage.duration_ms,
+          ...(message.last_tool_name !== undefined ? { lastToolName: message.last_tool_name } : {}),
+          ...(message.subagent_type !== undefined ? { subagentType: message.subagent_type } : {}),
+          ...(message.summary !== undefined ? { summary: message.summary } : {}),
+        })
+        break
+      }
+      case 'task_updated': {
+        const row = this.taskTable.get(message.task_id)
+        if (row === undefined) break
+        const patch = message.patch
+        this.taskTable.set(message.task_id, {
+          ...row,
+          ...(patch.status !== undefined ? { status: patch.status === 'pending' ? 'running' : patch.status } : {}),
+          ...(patch.description !== undefined ? { description: patch.description } : {}),
+          ...(patch.error !== undefined ? { error: patch.error } : {}),
+          ...(patch.is_backgrounded !== undefined ? { isBackgrounded: patch.is_backgrounded } : {}),
+        })
+        break
+      }
+      case 'task_notification': {
+        const row = this.taskTable.get(message.task_id)
+        this.taskTable.set(message.task_id, {
+          id: message.task_id,
+          type: row?.type ?? 'task',
+          status: message.status,
+          description: row?.description ?? message.summary,
+          ...(row?.toolUseId !== undefined || message.tool_use_id !== undefined
+            ? { toolUseId: row?.toolUseId ?? message.tool_use_id }
+            : {}),
+          ...(row?.subagentType !== undefined ? { subagentType: row.subagentType } : {}),
+          ...(row?.prompt !== undefined ? { prompt: row.prompt } : {}),
+          tokens: message.usage?.total_tokens ?? row?.tokens ?? 0,
+          toolUses: message.usage?.tool_uses ?? row?.toolUses ?? 0,
+          durationMs: message.usage?.duration_ms ?? row?.durationMs ?? 0,
+          ...(row?.lastToolName !== undefined ? { lastToolName: row.lastToolName } : {}),
+          summary: message.summary,
+          ...(row?.isBackgrounded !== undefined ? { isBackgrounded: row.isBackgrounded } : {}),
+        })
+        break
+      }
+      case 'background_tasks_changed': {
+        // Level signal: reconcile membership only. Rows are never created
+        // here — a level for a task whose start frame was missed would
+        // otherwise render a nameless ghost.
+        for (const task of message.tasks) {
+          const row = this.taskTable.get(task.task_id)
+          if (row === undefined) continue
+          this.taskTable.set(task.task_id, {
+            ...row,
+            isBackgrounded: true,
+            ...(row.description === '' && task.description !== undefined ? { description: task.description } : {}),
+          })
+        }
+        break
+      }
+      default:
+        return
+    }
+    this.publishTasks()
+  }
+
+  /**
    * Publish one partial-message event as a StreamDelta. A subagent's turn
    * (parent_tool_use_id is set) is dropped: the page renders one stream, and
    * the subagent's output arrives with its Task tool result.
@@ -742,6 +892,9 @@ export class SessionEngine {
       case 'message_start': {
         this.openBlocks.clear()
         this.turnStopped = false
+        // The next main turn clears the settled rows the previous turn left
+        // for review; running rows (a backgrounded task) survive.
+        this.pruneSettledTasks()
         this.hooks.delta({
           d: 'turn-start',
           messageId: event.message.id,
@@ -817,6 +970,9 @@ export class SessionEngine {
   private async finish(error: Error | undefined): Promise<void> {
     this.busy = false
     this.queryEnded = true
+    // Tasks are bound to the CLI process; the transcript cards survive it.
+    this.taskTable.clear()
+    this.publishTasks()
     if (this.closed) return
     try {
       if (error !== undefined) {
