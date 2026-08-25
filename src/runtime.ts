@@ -14,7 +14,7 @@ import {
   applyConfigDir, CONFIG_DIR_ENV, normalizeAccounts, resolveAccountDir, restoreConfigDir, sameDir,
 } from './accounts.ts'
 import type { ResolvedConfig } from './config.ts'
-import { SessionEngine, resolveSessionModel, type EngineHooks, type SendImage } from './engine.ts'
+import { SessionEngine, resolveSessionModel, resolveSessionPermissionMode, type EngineHooks, type SendImage } from './engine.ts'
 import { BlobStore, isImageMediaType } from './blobs.ts'
 import { SessionCatalog } from './catalog.ts'
 import { effectiveEnvEntries, maskSecret, readDirListing, readSdkVersion } from './http-support.ts'
@@ -23,9 +23,9 @@ import { deleteNativeSession, renameNativeSession } from './native-sessions.ts'
 import { SessionStore } from './store.ts'
 import type {
   AccountSummary, CcAccount, CcEvent, CcEventInput, CcSettings, ConfigSummary,
-  EffortLevel, ImageRef, LiveTurnSnapshot, PermissionDestination, SessionMeta, WireMessage,
+  EffortLevel, ImageRef, LiveTurnSnapshot, PermissionDestination, PermissionModeValue, SessionMeta, WireMessage,
 } from './types.ts'
-import { DEFAULT_EFFORT_LEVELS, MEDIA_TYPE_EXTENSIONS } from './types.ts'
+import { DEFAULT_EFFORT_LEVELS, MEDIA_TYPE_EXTENSIONS, PERMISSION_MODE_VALUES } from './types.ts'
 
 const MAX_BODY_BYTES = 1024 * 1024
 
@@ -277,7 +277,7 @@ export class CcRuntime {
       // it would spawn against a home the catalog is not reading.
       ? { ...base.env, ...session.env, [CONFIG_DIR_ENV]: base.configDir }
       : base.env
-    return { ...base, env, ...(effort !== undefined ? { effort } : {}) }
+    return { ...base, env, permissionMode: this.permissionModeFor(session), ...(effort !== undefined ? { effort } : {}) }
   }
 
   /**
@@ -289,6 +289,16 @@ export class CcRuntime {
   private effortFor(session: SessionMeta): EffortLevel | undefined {
     if (session.effort !== undefined && session.effort !== '') return session.effort
     return this.effectiveConfig().effort
+  }
+
+  /**
+   * The posture a session's next engine spawns with: the session's own
+   * override when it names one, else the resolved config default.
+   * @param session - the session being resolved.
+   * @returns the posture.
+   */
+  private permissionModeFor(session: SessionMeta): PermissionModeValue {
+    return resolveSessionPermissionMode(session.permissionMode ?? '', this.effectiveConfig().permissionMode)
   }
 
   /**
@@ -751,6 +761,31 @@ export class CcRuntime {
             await this.closeEngine(session.id)
           }
           return json(res, { ok: true, effort: level })
+        }
+        if (parts.length === 3 && parts[2] === 'permission-mode' && method === 'POST') {
+          const session = this.store.get(id) ?? await this.catalog.adopt(id)
+          if (!session) return json(res, { error: '会话不存在' }, 404)
+          const body = await readJson(req)
+          const mode = typeof body?.mode === 'string' ? body.mode.trim() : ''
+          if (mode !== '' && !(PERMISSION_MODE_VALUES as readonly string[]).includes(mode)) {
+            return json(res, { error: '无效的权限模式' }, 400)
+          }
+          // Same lifecycle as the model override: persisted as this session's
+          // default, hot-switched on a busy process, and spawn-time for a cold
+          // one — an idle engine is recycled so the next message respawns.
+          const permissionMode = mode === '' ? undefined : mode as PermissionModeValue
+          await this.patchMeta(session.id, { permissionMode })
+          const engine = this.liveEngine(session.id)
+          if (engine !== undefined && engine.busy) {
+            // Detached but caught, exactly like the live model switch: a
+            // refusing CLI must not fault the host process.
+            engine.setPermissionMode(permissionMode).catch((error: unknown) => {
+              this.ctx.logger?.warn?.(`dsh-cc: live permission-mode switch failed for ${session.id}: ${String(error)}`)
+            })
+          } else if (engine !== undefined) {
+            await this.closeEngine(session.id)
+          }
+          return json(res, { ok: true, mode })
         }
         if (parts.length === 3 && parts[2] === 'usage' && method === 'GET') {
           const session = this.store.get(id)
