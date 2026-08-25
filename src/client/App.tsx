@@ -558,6 +558,8 @@ export function CcApp(props: { onClose(): void }): ReactElement {
             <StatusBar
               sessionId={current.id}
               busy={current.status === 'busy'}
+              sessionMode={current.permissionMode ?? ''}
+              configMode={config?.permissionMode ?? 'auto'}
               context={context}
               usage={usage}
               fallbackCostUsd={current.totalCostUsd}

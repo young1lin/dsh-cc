@@ -11,6 +11,7 @@ import type { ContextUsage, UsageInfo } from './api/telemetry.ts'
 import { registerCss } from './css.ts'
 import { ContextMeter } from './status/ContextMeter.tsx'
 import { ModelMenu } from './status/ModelMenu.tsx'
+import { PermissionModeMenu } from './status/PermissionModeMenu.tsx'
 import { UsageReadout } from './status/UsageReadout.tsx'
 
 registerCss('status-bar', `
@@ -32,6 +33,10 @@ registerCss('status-bar', `
  * @param props.sessionId - the session id, for the model/effort catalog.
  * @param props.busy - whether a turn is running, which is when a live CLI
  * process (and therefore the real model catalog) exists to be read.
+ * @param props.sessionMode - the session's own permission-posture override;
+ * '' means it follows the global default.
+ * @param props.configMode - the global default posture, shown when the
+ * session has no override of its own.
  * @param props.context - the session's latest context-window snapshot; absent for a cold session.
  * @param props.usage - the session's latest usage snapshot; absent for a cold session.
  * @param props.fallbackCostUsd - the session's cumulative cost from the session
@@ -42,12 +47,15 @@ registerCss('status-bar', `
 export function StatusBar(props: {
   sessionId: string
   busy: boolean
+  sessionMode: string
+  configMode: string
   context: ContextUsage | undefined
   usage: UsageInfo | undefined
   fallbackCostUsd?: number
 }): ReactElement {
   return (
     <div className="cc-status">
+      <PermissionModeMenu sessionId={props.sessionId} sessionMode={props.sessionMode} configMode={props.configMode} />
       <ModelMenu sessionId={props.sessionId} busy={props.busy} />
       {props.context !== undefined && <ContextMeter context={props.context} />}
       <UsageReadout info={props.usage} fallbackCostUsd={props.fallbackCostUsd} />

@@ -150,3 +150,13 @@ export function setModel(id: string, model: string): Promise<{ ok: boolean }> {
 export function setEffort(id: string, effort: string): Promise<{ ok: boolean }> {
   return api<{ ok: boolean }>(`/sessions/${id}/effort`, { method: 'POST', body: JSON.stringify({ effort }) })
 }
+
+/**
+ * POST /sessions/:id/permission-mode — set this session's permission posture.
+ * @param id - session id.
+ * @param mode - posture value; empty resets to the global default.
+ * @returns the acknowledgement.
+ */
+export function setPermissionMode(id: string, mode: string): Promise<{ ok: boolean }> {
+  return api<{ ok: boolean }>(`/sessions/${id}/permission-mode`, { method: 'POST', body: JSON.stringify({ mode }) })
+}
