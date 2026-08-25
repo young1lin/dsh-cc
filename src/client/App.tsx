@@ -23,6 +23,7 @@ import { SessionRail } from './SessionRail.tsx'
 import { StatusBar } from './StatusBar.tsx'
 import { LiveTurnView } from './LiveTurnView.tsx'
 import { reduceDelta, type LiveTurn } from '../live-turn.ts'
+import { TodoPin } from './TodoPin.tsx'
 import { Transcript } from './Transcript.tsx'
 import { SettingsModal } from './settings/SettingsModal.tsx'
 import { SessionEnvModal } from './settings/SessionEnvModal.tsx'
@@ -607,6 +608,8 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                   ))}
                   <div ref={attentionRef} aria-hidden />
                 </div>
+                {/* TaskPanel (后续批次) 会插在此面板之前 */}
+                <TodoPin key={current.id} events={events} />
                 <Composer
                   busy={current.status === 'busy'}
                   readOnly={current.terminalOwned === true}
