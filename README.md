@@ -10,6 +10,10 @@ dsh-cc 是一个 DSH 外挂双面插件：在 DSH Web GUI 右缘加入一个 **C
 - **工具权限审批**：把 `permissionMode` 设为 `default` 后，Claude Code 的每次工具授权请求会弹到页面上，点「允许 / 拒绝」（可选记住为规则）即可
 - **AskUserQuestion 对话桥**：模型向用户提问（选项 / 输入框）时直接在页面上作答
 - **模型与思考档位热切换**：会话进行中切换模型 / effort，忙碌回合就地切换，选择持久化为该会话的默认
+- **权限模式会话级热切换**：状态栏菜单切换六种权限姿态（默认 / 接受编辑 / 计划 / 免打扰 / 跳过全部确认 / 自动），忙碌回合就地切换，持久化为会话默认
+- **底部任务面板**：会话进程正在跑的子代理 / 命令 / 监视 / 工作流的实时进度（token · 时长 · 最近工具），每行「结束」「转后台」控制；随下一回合开始清理已结束行
+- **输入框上方固定当前任务清单**：从转录里最后一次 TodoWrite 推导的 TODO 面板，计划常驻眼前不用翻历史
+- **文件路径点击查看**：对话文本里反引号包裹的文本文件路径（带分隔符或绝对路径 + 已知文本扩展名）可点击打开查看器，显示磁盘最新内容（行号 + 语法高亮，> 2MB 截断）
 - **图片输入**：粘贴或拖入图片（每张 ≤ 5MB）随消息发送，转录回读同一份内容寻址存储
 - **用量与上下文读数**：状态栏显示模型 / 档位选择、上下文窗口占用与账户用量
 - 会话持久化：JSONL 转录存放在数据目录，重启 DSH 后会话列表与记录仍在；继续对话自动通过 Claude 原生 session resume
@@ -134,7 +138,7 @@ C:/PythonProject/dev/dsh-cc
 
 ### HTTP API（本机调试用）
 
-全部 24 个方法-路径对，与 `src/runtime.ts` 的路由注册一一对应：
+全部 28 个方法-路径对，与 `src/runtime.ts` 的路由注册一一对应：
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -146,9 +150,10 @@ C:/PythonProject/dev/dsh-cc
 | POST | /cc/api/images | 上传一张图片（原始字节 + content-type，≤ 5MB），返回内容寻址引用 |
 | GET | /cc/api/blobs/:id.:ext | 回读已存图片（immutable 长缓存） |
 | GET | /cc/api/fs/list?path= | 工作目录选择器的目录列表（无 path 列盘符根） |
+| GET | /cc/api/fs/file?path= | 读取文本文件最新内容（≤2MB，超出截断；二进制拒绝） |
 | GET | /cc/api/sessions | 会话列表（含 CLI 原生会话；`terminalOwned` 标注终端持有） |
 | POST | /cc/api/sessions | 新建会话（可带名称 / cwd / 模型） |
-| GET | /cc/api/sessions/:id | 会话详情 + 转录（尾部 800 条）+ 进行中回合快照 |
+| GET | /cc/api/sessions/:id | 会话详情 + 转录（尾部 800 条）+ 进行中回合快照 + 任务表快照 |
 | DELETE | /cc/api/sessions/:id | 删除会话（连同 CLI 原生转录）；原生存储删除失败（如 Windows 下文件被终端进程占用）时返回 409 + error，会话保留 |
 | PUT | /cc/api/sessions/:id/name | 重命名（同步改 CLI 记录，`claude --resume` 列表同名） |
 | PUT | /cc/api/sessions/:id/env | 会话级环境层；空闲引擎即时回收，下一条消息用新环境起进程 |
@@ -157,12 +162,15 @@ C:/PythonProject/dev/dsh-cc
 | GET | /cc/api/sessions/:id/models | 会话视角的模型目录、当前选择与 effort 档位 |
 | POST | /cc/api/sessions/:id/model | 切换模型；持久化为该会话默认，忙碌引擎就地热切换 |
 | POST | /cc/api/sessions/:id/effort | 切换思考档位；per-session：持久化到该会话，只影响该会话 |
+| POST | /cc/api/sessions/:id/permission-mode | 切换权限模式；持久化为该会话默认，忙碌引擎就地热切换 |
 | GET | /cc/api/sessions/:id/usage | 账户用量（需活跃引擎） |
 | GET | /cc/api/sessions/:id/commands | CLI 支持的斜杠命令（需活跃引擎） |
 | POST | /cc/api/sessions/:id/stop | 中断当前回合 |
+| POST | /cc/api/sessions/:id/tasks/:taskId/stop | 结束一个运行中的任务（子代理/命令等） |
+| POST | /cc/api/sessions/:id/tasks/:taskId/background | 把前台任务转后台继续跑（CLI 的 Ctrl+B 等价物） |
 | POST | /cc/api/sessions/:id/dialogs/:requestId | 应答 AskUserQuestion（`cancel: true` 取消） |
 | POST | /cc/api/sessions/:id/permissions/:requestId | 权限审批（allow / deny，可选 message 与 remember 目标） |
-| GET | /cc/api/events | SSE 实时推送（hello / sessions / event / delta / permission / dialog …） |
+| GET | /cc/api/events | SSE 实时推送（hello / sessions / event / delta / permission / dialog / tasks …） |
 
 ## 已知限制
 
@@ -172,4 +180,5 @@ C:/PythonProject/dev/dsh-cc
 - 终端正在使用的会话（terminalOwned）在页面上只读：发消息返回 409，也无法中断它的回合 —— Windows 无法向其他控制台进程发信号。
 - 每个活跃会话是一个真实 claude 进程，受 `maxLiveSessions`（默认 4）约束；被挤出的进程下次发消息时自动 resume。
 - 转录读取对页面按尾部 800 条截断；完整记录在数据目录的 JSONL 里。
+- 对话文本里的文件路径链接只作用于已完成回合的文本：流式中的文本保持普通代码样式，回合结束落定后才变成可点击链接。
 - SDK 固定为 `@anthropic-ai/claude-agent-sdk@0.3.220`（自带对应版本 CLI 载荷，与本机安装的 claude 版本无关）。
