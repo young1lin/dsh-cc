@@ -23,9 +23,9 @@ import { deleteNativeSession, renameNativeSession } from './native-sessions.ts'
 import { SessionStore } from './store.ts'
 import type {
   AccountSummary, CcAccount, CcEvent, CcEventInput, CcSettings, ConfigSummary,
-  EffortLevel, ImageRef, LiveTurnSnapshot, PermissionDestination, PermissionModeValue, SessionMeta, WireMessage,
+  EffortLevel, ImageRef, LiveTurnSnapshot, PermissionDestination, PermissionModeValue, SessionMeta, TaskRow, WireMessage,
 } from './types.ts'
-import { DEFAULT_EFFORT_LEVELS, MEDIA_TYPE_EXTENSIONS, PERMISSION_MODE_VALUES } from './types.ts'
+import { DEFAULT_EFFORT_LEVELS, MEDIA_TYPE_EXTENSIONS, PERMISSION_MODE_VALUES, TERMINAL_TASK_STATUSES } from './types.ts'
 
 const MAX_BODY_BYTES = 1024 * 1024
 
@@ -601,6 +601,7 @@ export class CcRuntime {
             session,
             events: await this.catalog.transcript(session),
             live: this.liveSnapshot(session.id),
+            tasks: this.taskSnapshot(session.id),
           })
         }
         if (parts.length === 2 && method === 'DELETE') {
@@ -814,6 +815,9 @@ export class CcRuntime {
           await engine.interrupt()
           return json(res, { ok: true })
         }
+        if (parts.length === 5 && parts[2] === 'tasks' && method === 'POST') {
+          return await this.controlTask(id, parts[3] ?? '', parts[4] ?? '', res)
+        }
         if (parts.length === 4 && parts[2] === 'dialogs' && method === 'POST') {
           const session = this.store.get(id)
           if (!session) return json(res, { error: '会话不存在' }, 404)
@@ -988,6 +992,34 @@ export class CcRuntime {
     return json(res, { ok: true })
   }
 
+  /**
+   * Stop or background one task of one session's live engine.
+   * @param id - the session id.
+   * @param taskId - the task id from the table.
+   * @param action - `stop` or `background`.
+   * @param res - the response to write.
+   */
+  private async controlTask(id: string, taskId: string, action: string, res: ServerResponse): Promise<void> {
+    const engine = this.liveEngine(id)
+    if (engine === undefined) return json(res, { error: '会话没有正在运行的进程' }, 409)
+    const row = engine.taskRows().find(task => task.id === taskId)
+    if (row === undefined) return json(res, { error: '任务不存在' }, 404)
+    if (action === 'stop') {
+      if ((TERMINAL_TASK_STATUSES as readonly string[]).includes(row.status)) {
+        return json(res, { error: '任务已结束' }, 409)
+      }
+      await engine.stopTask(taskId)
+      return json(res, { ok: true })
+    }
+    if (action === 'background') {
+      if (row.toolUseId === undefined) return json(res, { error: '该任务没有对应的工具调用' }, 409)
+      const backgrounded = await engine.backgroundTask(row.toolUseId)
+      if (!backgrounded) return json(res, { error: '该任务不在前台运行' }, 409)
+      return json(res, { ok: true })
+    }
+    return json(res, { error: '未知操作' }, 400)
+  }
+
   private hooks(sessionId: string): EngineHooks {
     return {
       emit: async input => {
@@ -1120,6 +1152,17 @@ export class CcRuntime {
    */
   private liveSnapshot(sessionId: string): LiveTurnSnapshot {
     return { seq: this.liveSeqs.get(sessionId) ?? 0, turn: this.liveTurns.get(sessionId) ?? null }
+  }
+
+  /**
+   * One session's live task table, read off its engine. No engine — cold,
+   * evicted, or terminal-owned — means an empty table, which is also the
+   * truth: those tasks died with their process.
+   * @param sessionId - the session to read.
+   * @returns the rows in start order.
+   */
+  private taskSnapshot(sessionId: string): TaskRow[] {
+    return this.liveEngine(sessionId)?.taskRows() ?? []
   }
 
   /**
