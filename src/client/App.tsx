@@ -24,6 +24,7 @@ import { StatusBar } from './StatusBar.tsx'
 import { LiveTurnView } from './LiveTurnView.tsx'
 import { reduceDelta, type LiveTurn } from '../live-turn.ts'
 import { TodoPin } from './TodoPin.tsx'
+import { TaskPanel } from './TaskPanel.tsx'
 import { Transcript } from './Transcript.tsx'
 import { SettingsModal } from './settings/SettingsModal.tsx'
 import { SessionEnvModal } from './settings/SessionEnvModal.tsx'
@@ -31,12 +32,13 @@ import { OverlayContext, useOverlay, type OverlaySignal } from './overlay.ts'
 import { connectEvents } from './api/http.ts'
 import { answerDialog, answerPermission } from './api/interaction.ts'
 import {
-  createSession, deleteSession, fetchSession, fetchSessions, renameSession, sendMessage, stopSession,
+  backgroundTask, createSession, deleteSession, fetchSession, fetchSessions, renameSession, sendMessage,
+  stopSession, stopTask,
 } from './api/sessions.ts'
 import { fetchConfig } from './api/settings.ts'
 import { fetchContext, fetchUsage, type ContextUsage, type UsageInfo } from './api/telemetry.ts'
 import type {
-  CcEvent, ConfigSummary, LiveTurnSnapshot, PermissionAnswer, PermissionRequest, SessionMeta,
+  CcEvent, ConfigSummary, LiveTurnSnapshot, PermissionAnswer, PermissionRequest, SessionMeta, TaskRow,
 } from '../types.ts'
 
 /** One pending permission request, tagged with the session it belongs to. */
@@ -115,6 +117,12 @@ export function CcApp(props: { onClose(): void }): ReactElement {
    * back must restore it rather than restart the view from scratch.
    */
   const [liveBySession, setLiveBySession] = useState<Record<string, LiveEntry>>({})
+  /**
+   * The task snapshot of EVERY session, keyed by session id: tasks keep
+   * running while their session is in the background, and the panel must
+   * restore from the last snapshot when the user switches back.
+   */
+  const [tasksBySession, setTasksBySession] = useState<Record<string, TaskRow[]>>({})
   const [connected, setConnected] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [envSessionId, setEnvSessionId] = useState<string | undefined>()
@@ -224,6 +232,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
           .then(result => {
             applyLiveSnapshot(id, result.live)
             mergeSessionEvents(id, result.events)
+            setTasksBySession(previous => ({ ...previous, [id]: result.tasks }))
           })
           .catch(() => {
             // Best effort; the next gap (or the next selection) retries.
@@ -304,6 +313,19 @@ export function CcApp(props: { onClose(): void }): ReactElement {
           // Cached transcripts of sessions that left the catalog (deleted
           // here or in a terminal) go with them.
           setEventsBySession(previous => {
+            const alive = new Set(message.sessions.map(session => session.id))
+            let changed = false
+            const next = { ...previous }
+            for (const id of Object.keys(next)) {
+              if (!alive.has(id)) {
+                delete next[id]
+                changed = true
+              }
+            }
+            return changed ? next : previous
+          })
+          // Their task snapshots go with them too.
+          setTasksBySession(previous => {
             const alive = new Set(message.sessions.map(session => session.id))
             let changed = false
             const next = { ...previous }
@@ -400,6 +422,11 @@ export function CcApp(props: { onClose(): void }): ReactElement {
         case 'dialog-done':
           setDialogs(previous => previous.filter(item => item.id !== message.requestId))
           break
+        case 'tasks':
+          // Snapshot rows replace the whole table: the frame is the server's
+          // authoritative fold, so partial merges would only add staleness.
+          setTasksBySession(previous => ({ ...previous, [message.sessionId]: message.tasks }))
+          break
         default:
           // An unknown frame from a newer node half is ignored rather than
           // breaking the stream.
@@ -435,6 +462,9 @@ export function CcApp(props: { onClose(): void }): ReactElement {
         // or reloaded): adopt the server's fold unless local frames already
         // ran ahead of it.
         applyLiveSnapshot(currentId, result.live)
+        // Seed the task snapshot the same way: tasks may have been running
+        // since before the page opened, with no frame yet witnessed.
+        setTasksBySession(previous => ({ ...previous, [currentId]: result.tasks }))
       })
       .catch(cause => {
         if (!stale) fail(cause)
@@ -610,7 +640,15 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                   ))}
                   <div ref={attentionRef} aria-hidden />
                 </div>
-                {/* TaskPanel (后续批次) 会插在此面板之前 */}
+                <TaskPanel
+                  tasks={tasksBySession[current.id] ?? []}
+                  onStop={taskId => {
+                    stopTask(current.id, taskId).catch(fail)
+                  }}
+                  onBackground={taskId => {
+                    backgroundTask(current.id, taskId).catch(fail)
+                  }}
+                />
                 <TodoPin key={current.id} events={events} />
                 <Composer
                   busy={current.status === 'busy'}

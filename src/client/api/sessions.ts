@@ -5,7 +5,7 @@
  * @module dsh-cc/client/api/sessions
  */
 
-import type { CcEvent, ImageRef, LiveTurnSnapshot, SessionMeta } from '../../types.ts'
+import type { CcEvent, ImageRef, LiveTurnSnapshot, SessionMeta, TaskRow } from '../../types.ts'
 import { api } from './http.ts'
 
 /** GET /sessions — every session the store knows, newest first. */
@@ -14,17 +14,18 @@ export function fetchSessions(): Promise<{ sessions: SessionMeta[] }> {
 }
 
 /**
- * GET /sessions/:id — metadata, the transcript tail, and the server's fold of
- * the in-flight turn (null turn when none is running).
+ * GET /sessions/:id — metadata, the transcript tail, the server's fold of the
+ * in-flight turn (null turn when none is running), and the task snapshot.
  * @param id - session id.
- * @returns the session, its events, and its live-turn snapshot.
+ * @returns the session, its events, its live-turn snapshot, and its tasks.
  */
 export function fetchSession(id: string): Promise<{
   session: SessionMeta
   events: CcEvent[]
   live: LiveTurnSnapshot
+  tasks: TaskRow[]
 }> {
-  return api<{ session: SessionMeta; events: CcEvent[]; live: LiveTurnSnapshot }>(`/sessions/${id}`)
+  return api<{ session: SessionMeta; events: CcEvent[]; live: LiveTurnSnapshot; tasks: TaskRow[] }>(`/sessions/${id}`)
 }
 
 /**
@@ -77,6 +78,26 @@ export function sendMessage(id: string, text: string, images: ImageRef[] = []): 
  */
 export function stopSession(id: string): Promise<{ ok: boolean }> {
   return api<{ ok: boolean }>(`/sessions/${id}/stop`, { method: 'POST' })
+}
+
+/**
+ * POST /sessions/:id/tasks/:taskId/stop — stop one running task.
+ * @param id - session id.
+ * @param taskId - the task id from the panel's row.
+ * @returns the acknowledgement.
+ */
+export function stopTask(id: string, taskId: string): Promise<{ ok: boolean }> {
+  return api<{ ok: boolean }>(`/sessions/${id}/tasks/${taskId}/stop`, { method: 'POST' })
+}
+
+/**
+ * POST /sessions/:id/tasks/:taskId/background — background one foreground task.
+ * @param id - session id.
+ * @param taskId - the task id from the panel's row.
+ * @returns the acknowledgement.
+ */
+export function backgroundTask(id: string, taskId: string): Promise<{ ok: boolean }> {
+  return api<{ ok: boolean }>(`/sessions/${id}/tasks/${taskId}/background`, { method: 'POST' })
 }
 
 /**
