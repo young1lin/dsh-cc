@@ -14,8 +14,10 @@
  */
 
 import { memo, useMemo, useState, type ReactElement } from 'react'
-import { DisclosureRow, IconThinkOutline14, MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
+import { DisclosureRow, IconThinkOutline14, MarkdownText, type MarkdownFileMentions } from '@deepseek-ai/dsh-client-ui-primitives'
 import { registerCss } from './css.ts'
+import { FileViewer } from './FileViewer.tsx'
+import { fileMentionsFor } from './file-mentions.ts'
 import { ToolRow } from './tool/ToolRow.tsx'
 import { stringField } from './tool/wire.ts'
 import { MEDIA_TYPE_EXTENSIONS, type CcEvent } from '../types.ts'
@@ -260,10 +262,11 @@ function compact(tokens: number): string {
 
 /**
  * Render one non-tool transcript event.
- * @param props - the event.
+ * @param props - the event, plus the file-mentions resolver its markdown
+ * renders with.
  * @returns the node, or null for an entry with nothing to show.
  */
-function EventItem(props: { event: CcEvent }): ReactElement | null {
+function EventItem(props: { event: CcEvent; mentions: MarkdownFileMentions }): ReactElement | null {
   const { event } = props
   switch (event.kind) {
     case 'user':
@@ -292,7 +295,7 @@ function EventItem(props: { event: CcEvent }): ReactElement | null {
     case 'assistant':
       return (
         <div className="cc-assistant">
-          <MarkdownText text={event.text} />
+          <MarkdownText text={event.text} fileMentions={props.mentions} />
           {event.aborted === true && <div className="cc-note">已中断</div>}
         </div>
       )
@@ -363,11 +366,16 @@ function ToolItem(props: { item: Extract<Item, { k: 'tool' }>; cwd: string | und
 export const Transcript = memo(function Transcript(props: { events: CcEvent[] }): ReactElement {
   const items = useMemo(() => projectTranscript(props.events), [props.events])
   const cwd = useMemo(() => sessionCwd(props.events), [props.events])
+  // The state setter is identity-stable, so the resolver changes only when
+  // the cwd does; a settled render's mentions cannot go stale mid-turn.
+  const [viewPath, setViewPath] = useState<string | undefined>()
+  const mentions = useMemo(() => fileMentionsFor(cwd, setViewPath), [cwd])
   return (
     <>
       {items.map((item, index) => item.k === 'tool'
         ? <ToolItem key={`tool:${item.id}`} item={item} cwd={cwd} />
-        : <EventItem key={`event:${item.event.seq}:${index}`} event={item.event} />)}
+        : <EventItem key={`event:${item.event.seq}:${index}`} event={item.event} mentions={mentions} />)}
+      {viewPath !== undefined && <FileViewer path={viewPath} onClose={() => setViewPath(undefined)} />}
     </>
   )
 })
