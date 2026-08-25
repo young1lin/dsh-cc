@@ -332,7 +332,7 @@ export class CcRuntime {
       }
     }
     const probe = new SessionEngine(
-      { sessionId: CATALOG_PROBE_ID, cwd: this.baseConfig.cwd, model: '' },
+      { sessionId: CATALOG_PROBE_ID, cwd: this.baseConfig.cwd, model: '', permissionMode: '' },
       this.effectiveConfig(),
       SILENT_HOOKS,
     )
@@ -844,7 +844,7 @@ export class CcRuntime {
    */
   private startEngine(session: SessionMeta, model: string): SessionEngine {
     const engine = new SessionEngine(
-      { sessionId: session.id, cwd: session.cwd, model, claudeSessionId: session.claudeSessionId },
+      { sessionId: session.id, cwd: session.cwd, model, permissionMode: session.permissionMode ?? '', claudeSessionId: session.claudeSessionId },
       this.configFor(session),
       this.hooks(session.id),
     )

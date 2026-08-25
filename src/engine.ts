@@ -28,6 +28,7 @@ import type {
   CcEventInput,
   ImageRef,
   PermissionAnswer,
+  PermissionModeValue,
   PermissionRequest,
   SessionMeta,
   SlashCommand,
@@ -78,6 +79,8 @@ export interface EngineStart {
   cwd: string
   /** Session-level model override; empty string = plugin default. */
   model: string
+  /** Session-level permission-posture override; empty string = plugin default. */
+  permissionMode: string
   claudeSessionId?: string
 }
 
@@ -369,6 +372,20 @@ export class SessionEngine {
   }
 
   /**
+   * Switch the permission posture of the running process; a recycled engine
+   * reads the session's persisted override at spawn instead.
+   * @param mode - the posture, or undefined to reset to the spawn default.
+   * @returns true when a live query accepted the switch.
+   */
+  async setPermissionMode(mode: PermissionModeValue | undefined): Promise<boolean> {
+    this.lastUsed = Date.now()
+    const q = this.query
+    if (q === undefined) return false
+    await q.setPermissionMode(mode ?? resolveSessionPermissionMode(this.startSpec.permissionMode, this.config.permissionMode))
+    return true
+  }
+
+  /**
    * Switch the reasoning effort level for subsequent turns (live processes
    * only; a cold session spawns with the runtime's current effort).
    * @param level - effort level, or undefined to reset to the default.
@@ -566,14 +583,15 @@ export class SessionEngine {
     if (this.started) return
     this.started = true
     const model = resolveSessionModel(this.startSpec.model, this.config.model)
+    const permissionMode = resolveSessionPermissionMode(this.startSpec.permissionMode, this.config.permissionMode)
     const options: Options = {
       cwd: this.startSpec.cwd,
       abortController: this.abort,
       env: { ...process.env, ...this.config.env },
-      permissionMode: this.config.permissionMode,
+      permissionMode,
       // The SDK refuses to skip permission checks unless the caller restates
       // the intent through this companion flag.
-      ...(this.config.permissionMode === 'bypassPermissions' ? { allowDangerouslySkipPermissions: true } : {}),
+      ...(permissionMode === 'bypassPermissions' ? { allowDangerouslySkipPermissions: true } : {}),
       canUseTool: this.canUseTool,
       onUserDialog: this.onUserDialog,
       supportedDialogKinds: ['ask_user_question'],
@@ -629,6 +647,7 @@ export class SessionEngine {
               model: message.model,
               cwd: message.cwd,
               tools: message.tools,
+              permissionMode: message.permissionMode,
             },
           })
         }
@@ -841,6 +860,22 @@ export function resolveSessionModel(sessionModel: string, configModel: string): 
   if (sessionModel !== '') return sessionModel
   if (configModel !== '') return configModel
   return undefined
+}
+
+/**
+ * The permission posture a session's engine runs with: the session's own
+ * override when it names one, else the resolved config default. Shared by the
+ * spawn path here and the page readout in the runtime so the two cannot drift.
+ * @param sessionMode - the session's override; empty = no opinion.
+ * @param configMode - the resolved config default.
+ * @returns the posture to spawn with.
+ */
+export function resolveSessionPermissionMode(
+  sessionMode: string,
+  configMode: ResolvedConfig['permissionMode'],
+): PermissionModeValue {
+  if (sessionMode !== '') return sessionMode as PermissionModeValue
+  return configMode
 }
 
 /** One streamed content block as the Messages API opens it. */
