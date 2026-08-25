@@ -65,7 +65,22 @@ export const MEDIA_TYPE_EXTENSIONS = {
  * a session override beats page settings, which beat the cordis plugin
  * config, which beats the environment dsh itself was launched with.
  */
-export type ConfigLayer = 'process' | 'plugin' | 'settings' | 'session'
+export type ConfigLayer = 'process' | 'plugin' | 'settings' | 'session' | 'account'
+
+/**
+ * One named Claude Code home. Switching to it repoints `CLAUDE_CONFIG_DIR` for
+ * the whole plugin, which moves the credential, the settings file, the memory
+ * and skills, the live-process registry, and the project transcripts together —
+ * everything the CLI keeps under one root.
+ */
+export interface CcAccount {
+  /** Stable id; minted by the host when a newly added row arrives without one. */
+  id: string
+  /** Display name; defaults to the directory's own basename. */
+  name: string
+  /** Absolute account root, i.e. what `CLAUDE_CONFIG_DIR` is set to. */
+  dir: string
+}
 
 /** Where a session's transcript came from. */
 export type SessionOrigin =
@@ -120,6 +135,18 @@ export interface SessionMeta {
   summary?: string
   /** Per-session environment layered over the plugin settings; e.g. relay endpoints. */
   env?: Record<string, string>
+  /**
+   * The Claude Code home this row's conversation lives under, stamped at
+   * creation. A row belongs to exactly one account root, because its
+   * `claudeSessionId` only resolves inside that root's `projects/` tree, so
+   * the catalog shows only the rows matching the active root — without this
+   * an account switch would leave the previous account's rows on the rail as
+   * orphans whose transcripts cannot be read and whose sends cannot resume.
+   *
+   * Absent on rows written before accounts existed; those belong to the
+   * baseline root.
+   */
+  configDir?: string
 }
 
 /**
@@ -288,6 +315,18 @@ export interface ConfigSummary {
   liveSessions: number
   sdkVersion: string
   account?: AccountSummary
+  /** The Claude Code home in force; where sessions, credentials, and memory are read. */
+  configDir: string
+  /**
+   * The home that applies when no account is selected: the cordis config's, else
+   * what dsh was launched with. Distinct from {@link ConfigSummary.configDir},
+   * which is whatever is active right now.
+   */
+  defaultConfigDir: string
+  /** The configured account roots the page can switch between. */
+  accounts: CcAccount[]
+  /** The selected account's id; empty means the cordis/host default root. */
+  activeAccountId: string
 }
 
 /** Page-editable runtime settings, layered over the cordis config. */
@@ -296,8 +335,17 @@ export interface CcSettings {
   model: string
   /** Permission posture; empty = keep the cordis config default. */
   permissionMode: string
-  /** Environment for the claude process, layered over the cordis config env per key. */
+  /**
+   * Environment for the claude process, layered over the cordis config env per
+   * key. `CLAUDE_CONFIG_DIR` is refused here — the account list owns it, and an
+   * env entry would move the spawned process without moving the plugin's own
+   * reads.
+   */
   env: Record<string, string>
+  /** Account roots the page can switch between. */
+  accounts: CcAccount[]
+  /** The selected account's id; empty = the cordis/host default root. */
+  activeAccountId: string
 }
 
 /** One entry of a directory listing. */

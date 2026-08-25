@@ -16,10 +16,13 @@ import { useState, type ReactElement } from 'react'
 import { Button, Input, Pill, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import { registerCss } from '../css.ts'
 import {
-  applyProviderFields, extractProviderFields, findEnvEntry, layerLabel, PROVIDER_PRESETS,
-  type ProviderFormFields,
+  activePresetId, applyProviderFields, CUSTOM_PRESET_ID, extractProviderFields, findEnvEntry,
+  layerLabel, PROVIDER_PRESETS, type ProviderFormFields,
 } from './providerFields.ts'
 import type { ConfigSummary } from '../../types.ts'
+
+/** DOM id of the API-address input; the 自定义中转 preset focuses it by id. */
+const BASE_URL_INPUT_ID = 'cc-provider-base-url'
 
 registerCss('provider-form', `
 .cc-provider-presets { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -67,6 +70,8 @@ function ProviderField(props: {
   provenanceKey: string
   config: ConfigSummary | undefined
   reveal?: { revealed: boolean; onToggle(): void }
+  /** DOM id for the native input, so a preset can hand the caret over. */
+  inputId?: string
 }): ReactElement {
   const entry = findEnvEntry(props.config, props.provenanceKey)
   return (
@@ -78,6 +83,7 @@ function ProviderField(props: {
       <span className="cc-row">
         <Input
           className="cc-spacer"
+          {...(props.inputId !== undefined ? { id: props.inputId } : {})}
           type={props.reveal !== undefined && !props.reveal.revealed ? 'password' : 'text'}
           placeholder={props.placeholder}
           value={props.value}
@@ -113,6 +119,9 @@ export function ProviderForm(props: {
 }): ReactElement {
   const [keyRevealed, setKeyRevealed] = useState(false)
   const fields = extractProviderFields(props.env)
+  // Exactly one pill is active, derived from the field rather than matched per
+  // pill: two presets share an empty baseUrl and both used to light up.
+  const active = activePresetId(fields.baseUrl)
 
   const patch = (partial: Partial<ProviderFormFields>): void => {
     props.onChange(applyProviderFields(props.env, { ...fields, ...partial }))
@@ -124,7 +133,22 @@ export function ProviderForm(props: {
       <div className="cc-provider-presets">
         {PROVIDER_PRESETS.map(preset => (
           <Tooltip key={preset.id} label={preset.hint} side="bottom">
-            <Pill active={fields.baseUrl === preset.baseUrl} onClick={() => patch({ baseUrl: preset.baseUrl })}>
+            <Pill
+              active={active === preset.id}
+              onClick={() => {
+                patch({ baseUrl: preset.baseUrl })
+                // 自定义中转 clears the field so the user can type their own
+                // endpoint — but an empty field IS the official endpoint, so
+                // the readout would swing to 官方 API and look like the click
+                // picked the wrong pill. Handing over the caret makes the next
+                // keystroke resolve it, which is what the preset actually means.
+                // The Input primitive is not a forwardRef component, so the
+                // caret is reached through the id it passes to the native input.
+                if (preset.id === CUSTOM_PRESET_ID) {
+                  document.getElementById(BASE_URL_INPUT_ID)?.focus()
+                }
+              }}
+            >
               {preset.label}
             </Pill>
           </Tooltip>
@@ -138,6 +162,7 @@ export function ProviderForm(props: {
         onChange={baseUrl => patch({ baseUrl })}
         provenanceKey="ANTHROPIC_BASE_URL"
         config={props.config}
+        inputId={BASE_URL_INPUT_ID}
       />
 
       <div className="cc-provider-group">

@@ -16,6 +16,7 @@
  * @module dsh-cc/catalog
  */
 
+import { baselineConfigDir, sameDir } from './accounts.ts'
 import type { BlobStore } from './blobs.ts'
 import { listNativeSessions } from './native-sessions.ts'
 import { readNativeTranscript } from './native-transcript.ts'
@@ -73,12 +74,45 @@ export class SessionCatalog {
    *   live-process registry under the same session id a terminal would, so
    *   without this the two are indistinguishable and ownership can only be
    *   answered by refusing to answer it.
+   * @param activeConfigDir - the Claude Code home currently in force. Read
+   *   through a callback rather than captured, because switching accounts
+   *   moves it under a catalog that outlives the switch.
    */
   constructor(
     private readonly store: SessionStore,
     private readonly blobs: BlobStore,
     private readonly drivesNative: (claudeSessionId: string) => boolean = () => false,
+    private readonly activeConfigDir: () => string = baselineConfigDir,
   ) {}
+
+  /**
+   * Drop the cached native view so the next {@link refresh} is a cold read
+   * that always reports a change.
+   *
+   * The signature exists to suppress broadcasts for a quiet store, but after
+   * an account switch the store is not quiet — it is a different store, and a
+   * coincidentally equal signature would leave the page on the old account's
+   * list.
+   */
+  invalidate(): void {
+    this.native = []
+    this.signature = ''
+  }
+
+  /**
+   * Whether one sidecar row belongs to the Claude Code home in force.
+   *
+   * A row's `claudeSessionId` only resolves inside the root it was created
+   * under, so rows from another account are not merely uninteresting here —
+   * their transcripts cannot be read and a send against them would resume
+   * nothing. Rows written before accounts existed carry no stamp and belong
+   * to the baseline root.
+   * @param meta - the sidecar row.
+   * @returns true when the row is in scope for the active root.
+   */
+  private inScope(meta: SessionMeta): boolean {
+    return sameDir(meta.configDir ?? baselineConfigDir(), this.activeConfigDir())
+  }
 
   /**
    * Re-read the CLI's session store across every project directory and the
@@ -158,6 +192,7 @@ export class SessionCatalog {
     const adopted = new Map<string, SessionMeta>()
     const merged: SessionMeta[] = []
     for (const meta of this.store.list()) {
+      if (!this.inScope(meta)) continue
       const row = { ...meta }
       merged.push(row)
       if (row.claudeSessionId !== undefined) adopted.set(row.claudeSessionId, row)
@@ -217,7 +252,15 @@ export class SessionCatalog {
     // after that writer exited. Nothing on this page is driving the session
     // yet, so the record starts idle and unowned; this page's own engines set
     // status live through the store as they run turns.
-    const snapshot: SessionMeta = { ...native, status: 'idle', claudeSessionId: native.id, origin: 'cli' }
+    const snapshot: SessionMeta = {
+      ...native,
+      status: 'idle',
+      claudeSessionId: native.id,
+      origin: 'cli',
+      // The native row came out of the root in force, so that is the root the
+      // sidecar record belongs to for as long as it exists.
+      configDir: this.activeConfigDir(),
+    }
     delete snapshot.terminalOwned
     return await this.store.adopt(snapshot)
   }

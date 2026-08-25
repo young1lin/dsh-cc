@@ -44,6 +44,7 @@ dsh plugin --profile web add C:/PythonProject/dev/dsh-cc
     effort: high                    # 新会话默认思考档位：low / medium / high / xhigh / max；不填 = CLI 默认
     cwd: D:/work                    # 新会话的默认工作目录
     dataDir: C:/Users/me/.dsh/claude-code
+    configDir: C:/Users/me/.claude-work   # Claude Code 配置目录（CLAUDE_CONFIG_DIR）；空 = dsh 启动时的环境值，再回落 ~/.claude
     maxLiveSessions: 4              # 同时存活的 claude 进程上限，超出关闭最久未用的
     maxTurns: 0                     # 单回合工具调用上限；0 = 不限
     executablePath: ''              # 覆盖 claude 可执行文件路径；空 = 用 SDK 自带载荷
@@ -68,6 +69,19 @@ dsh plugin --profile web add C:/PythonProject/dev/dsh-cc
 注意：**id 定位的补丁会整行替换 config** —— 改哪项就把整块写全。保存后 profile 补丁层会热重载（watchUserPatches），但已存活的 claude 进程要新会话/重发消息后才会带上新环境。
 
 `provider.model`（→ `ANTHROPIC_MODEL`，由 CLI 在网关目录里解析）与顶层 `model`（SDK 查询参数）是两条独立的解析通道，可只设其一或都设。
+
+### 多账号（CLAUDE_CONFIG_DIR）
+
+Claude Code 把一个账号的全部家当放在同一个根目录下：凭证、`settings.json`、记忆与技能、活进程注册表，以及 `projects/<编码后的 cwd>/` 里的会话转录。所以「换账号」就是换这个根目录。
+
+设置面板顶部的**账号**区维护一张目录列表（「添加账号」按钮加行，可浏览目录选路径），并标出当前用的是哪一个。点「切换」立即生效：会话列表、登录身份、模型目录、用量读数、记忆与技能、以及该根目录自己 `settings.json` 里的 `permissions.defaultMode` 一起换过去。列表的增删改随「保存」落盘，切换本身是独立接口 `POST /cc/api/accounts/active`。
+
+两条规则值得记住：
+
+- **有会话正在跑就切不了**（返回 409）。正在跑的回合握着一个用旧根目录起的 claude 进程，既搬不走也打断不了。
+- **`CLAUDE_CONFIG_DIR` 不能写进 `env`**（页面全局 env、会话 env 都会被拒），cordis 配置里写了则自动提升成 `configDir`。原因是 env 只影响被 spawn 的 claude 进程，不影响插件自己读会话目录 —— 两边一旦分叉，新会话会写进 A 账号却从 B 账号的列表里找，直接从会话栏消失。
+
+会话栏只显示属于当前根目录的会话：dsh-cc 的 sidecar 行在创建时会记下自己所属的根目录，切换后另一个账号的行不会串台。
 
 ### 页面内设置
 
@@ -127,7 +141,8 @@ C:/PythonProject/dev/dsh-cc
 | GET | /cc/api/config | 生效配置摘要：数据目录、默认 cwd、模型、权限模式、SDK 版本；环境变量逐键列出并标注来源层（进程 / 插件 / 页面设置），以 TOKEN / KEY / SECRET / PASSWORD / COOKIE 结尾的键打码，其余原样返回 |
 | GET | /cc/api/models | 当前全局配置下的模型目录（由 CLI / 网关解析；`available: false` 表示无 CLI 应答，回落静态别名） |
 | GET | /cc/api/settings | 读取页面可编辑设置层（模型 / permissionMode / env） |
-| PUT | /cc/api/settings | 替换页面可编辑设置层；持久化到 dataDir/settings.json 并即时生效 |
+| PUT | /cc/api/settings | 替换页面可编辑设置层（含账号列表）；持久化到 dataDir/settings.json 并即时生效 |
+| POST | /cc/api/accounts/active | 切换当前账号根目录（`{id}`，空 id = 回默认）；有会话在跑返回 409 |
 | POST | /cc/api/images | 上传一张图片（原始字节 + content-type，≤ 5MB），返回内容寻址引用 |
 | GET | /cc/api/blobs/:id.:ext | 回读已存图片（immutable 长缓存） |
 | GET | /cc/api/fs/list?path= | 工作目录选择器的目录列表（无 path 列盘符根） |

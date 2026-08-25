@@ -41,6 +41,24 @@ export function saveSettings(settings: CcSettings): Promise<{ ok: boolean }> {
 }
 
 /**
+ * POST /accounts/active — switch the whole plugin to one account's Claude Code
+ * home, or back to the host default with an empty id.
+ *
+ * Everything read out of that root moves with it: the session list, the
+ * authenticated identity, the model catalog, and the permission posture. The
+ * host refuses (409) while any session is mid-turn, since a running CLI process
+ * cannot be moved to another home.
+ * @param id - the account id to activate; empty selects the host default.
+ * @returns the acknowledgement carrying the id now in force.
+ */
+export function switchAccount(id: string): Promise<{ ok: boolean; activeAccountId: string }> {
+  return api<{ ok: boolean; activeAccountId: string }>('/accounts/active', {
+    method: 'POST',
+    body: JSON.stringify({ id }),
+  })
+}
+
+/**
  * GET /fs/list — one directory page for the working-directory picker.
  * @param path - directory to list; undefined lists the drive roots.
  * @returns the listing.

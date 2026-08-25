@@ -103,12 +103,13 @@ export class SessionStore {
   /**
    * Create and persist a new session.
    * @param input - optional name, cwd, and model from the request body.
-   * @param defaults - fallback cwd when the request supplies none.
+   * @param defaults - fallback cwd when the request supplies none, and the
+   *   Claude Code home the row belongs to.
    * @returns the created metadata.
    */
   async create(
     input: { name?: unknown; cwd?: unknown; model?: unknown; env?: unknown },
-    defaults: { cwd: string },
+    defaults: { cwd: string; configDir: string },
   ): Promise<SessionMeta> {
     const now = new Date().toISOString()
     const name = typeof input.name === 'string' && input.name.trim().length > 0
@@ -124,6 +125,9 @@ export class SessionStore {
         if (typeof value === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) env[key] = value
       }
     }
+    // The account root owns CLAUDE_CONFIG_DIR; a per-session copy would point
+    // the spawned process at one home while the catalog reads another.
+    delete env.CLAUDE_CONFIG_DIR
     const meta: SessionMeta = {
       id: randomUUID(),
       name,
@@ -135,6 +139,7 @@ export class SessionStore {
       status: 'idle',
       messageCount: 0,
       totalCostUsd: 0,
+      configDir: defaults.configDir,
       ...(Object.keys(env).length > 0 ? { env } : {}),
     }
     this.sessions.set(meta.id, meta)

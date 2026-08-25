@@ -10,6 +10,9 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
+import {
+  applyConfigDir, CONFIG_DIR_ENV, normalizeAccounts, resolveAccountDir, restoreConfigDir, sameDir,
+} from './accounts.ts'
 import type { ResolvedConfig } from './config.ts'
 import { SessionEngine, resolveSessionModel, type EngineHooks, type SendImage } from './engine.ts'
 import { BlobStore, isImageMediaType } from './blobs.ts'
@@ -19,7 +22,7 @@ import { reduceDelta, type LiveTurn } from './live-turn.ts'
 import { deleteNativeSession, renameNativeSession } from './native-sessions.ts'
 import { SessionStore } from './store.ts'
 import type {
-  AccountSummary, CcEvent, CcEventInput, CcSettings, ConfigSummary,
+  AccountSummary, CcAccount, CcEvent, CcEventInput, CcSettings, ConfigSummary,
   EffortLevel, ImageRef, LiveTurnSnapshot, PermissionDestination, SessionMeta, WireMessage,
 } from './types.ts'
 import { DEFAULT_EFFORT_LEVELS, MEDIA_TYPE_EXTENSIONS } from './types.ts'
@@ -38,6 +41,24 @@ const CATALOG_PROBE_TIMEOUT_MS = 15_000
  * each failed answer would spawn another throwaway CLI process, forever.
  */
 const MODEL_PROBE_NEGATIVE_TTL_MS = 30_000
+
+/**
+ * Native-store rescan cadence while at least one page is attached: fast enough
+ * that a turn driven from a terminal shows up on the rail as it happens.
+ */
+const RESCAN_ACTIVE_MS = 2_000
+
+/**
+ * Rescan cadence with no page attached.
+ *
+ * The sweep is not free — it enumerates every project directory in the CLI's
+ * store, which on a well-used machine is thousands of transcript files, and
+ * the result is only ever delivered over SSE. Running it at the active cadence
+ * with nobody listening burned a measurable fraction of a core around the
+ * clock. Nothing is lost by slowing down: a page that attaches forces its own
+ * full refresh, and `GET /sessions` refreshes before answering.
+ */
+const RESCAN_IDLE_MS = 30_000
 
 /**
  * Hooks for an engine started to read the control channel and nothing else.
@@ -114,6 +135,8 @@ export class CcRuntime {
   private heartbeat: ReturnType<typeof setInterval> | undefined
   /** Periodic native-store rescan; picks up sessions running in a terminal. */
   private rescan: ReturnType<typeof setInterval> | undefined
+  /** The cadence {@link rescan} is currently armed at; 0 when it is not armed. */
+  private rescanEveryMs = 0
   /** Page-editable overrides layered over the cordis config. */
   private settings: CcSettings
   /**
@@ -132,6 +155,14 @@ export class CcRuntime {
   private modelsInFlight: Promise<readonly unknown[] | undefined> | undefined
   /** When the last catalog probe failed; gates retries via a short negative TTL. */
   private modelsFailedAt = 0
+  /**
+   * Bumped on every account switch. Both CLI probes below run detached against
+   * whichever root was active when they started, so each captures this and
+   * refuses to publish an answer the switch has already invalidated — without
+   * it a slow probe writes the previous account's identity or model list onto
+   * the new one.
+   */
+  private configGeneration = 0
 
   constructor(
     private readonly ctx: Context,
@@ -140,11 +171,20 @@ export class CcRuntime {
     this.store = new SessionStore(baseConfig.dataDir)
     this.store.load()
     this.blobs = new BlobStore(baseConfig.dataDir)
-    this.catalog = new SessionCatalog(this.store, this.blobs, id => this.drivesNative(id))
+    // Settings hold the account selection, so they must be read before
+    // anything resolves a root — and the root must be on this process before
+    // the first catalog sweep, since the SDK reads it from the environment.
+    this.settings = loadSettings(baseConfig.dataDir)
+    applyConfigDir(this.activeConfigDir())
+    this.catalog = new SessionCatalog(
+      this.store,
+      this.blobs,
+      id => this.drivesNative(id),
+      () => this.activeConfigDir(),
+    )
     // The CLI store is read from disk, so the first list is served from the
     // sidecar alone and the broadcast that follows fills in the rest.
     void this.catalog.refresh().then(() => this.broadcastSessions())
-    this.settings = loadSettings(baseConfig.dataDir)
     this.sdkVersion = readSdkVersion()
     this.heartbeat = setInterval(() => {
       for (const res of this.clients) {
@@ -155,16 +195,29 @@ export class CcRuntime {
         }
       }
     }, 20_000)
-    // A session driven from a terminal CLI writes its transcript with no
-    // engine of ours involved; rescanning the native store keeps the page's
-    // list — statuses included — in step with it. The catalog only reports a
-    // change when something actually moved, so a quiet store costs one stat
-    // sweep and no broadcast.
+    this.armRescan()
+  }
+
+  /**
+   * (Re)arm the native-store rescan at the cadence the current audience earns.
+   *
+   * A session driven from a terminal CLI writes its transcript with no engine
+   * of ours involved, so rescanning is what keeps the rail — statuses included
+   * — in step with it. But the result only ever leaves over SSE, so the fast
+   * cadence is worth paying for exactly while somebody is attached to receive
+   * it. Idempotent: called on every client add and remove, and does nothing
+   * unless the cadence actually has to change.
+   */
+  private armRescan(): void {
+    const wanted = this.clients.size > 0 ? RESCAN_ACTIVE_MS : RESCAN_IDLE_MS
+    if (this.rescan !== undefined && this.rescanEveryMs === wanted) return
+    if (this.rescan !== undefined) clearInterval(this.rescan)
+    this.rescanEveryMs = wanted
     this.rescan = setInterval(() => {
       void this.catalog.refresh().then(changed => {
         if (changed) this.broadcastSessions()
       })
-    }, 2_000)
+    }, wanted)
   }
 
   /**
@@ -178,14 +231,30 @@ export class CcRuntime {
    */
   private effectiveConfig(): ResolvedConfig {
     const overrides = this.settings
+    const configDir = this.activeConfigDir()
     return {
       ...this.baseConfig,
+      configDir,
       model: overrides.model !== '' ? overrides.model : this.baseConfig.model,
       permissionMode: overrides.permissionMode !== ''
         ? overrides.permissionMode as ResolvedConfig['permissionMode']
         : this.baseConfig.permissionMode,
-      env: { ...this.baseConfig.env, ...overrides.env },
+      // The account root rides in the env layer rather than being poked into
+      // the spawn separately, so the engine's spawn-time env comparison sees an
+      // account switch as the environment change it is and recycles the idle
+      // engines still pointed at the old home. It is last because no other
+      // layer may supply this key: both env editors reject it.
+      env: { ...this.baseConfig.env, ...overrides.env, [CONFIG_DIR_ENV]: configDir },
     }
+  }
+
+  /**
+   * The Claude Code home in force: the selected account's directory, else the
+   * cordis config's, else whatever dsh was launched with.
+   * @returns the absolute account root.
+   */
+  private activeConfigDir(): string {
+    return resolveAccountDir(this.settings.accounts, this.settings.activeAccountId, this.baseConfig.configDir)
   }
 
   /**
@@ -203,7 +272,10 @@ export class CcRuntime {
     const base = this.effectiveConfig()
     const effort = this.effortFor(session)
     const env = Object.keys(session.env ?? {}).length > 0
-      ? { ...base.env, ...session.env }
+      // The account root is re-asserted after the session layer: a row
+      // persisted before accounts existed may still carry the key, and honoring
+      // it would spawn against a home the catalog is not reading.
+      ? { ...base.env, ...session.env, [CONFIG_DIR_ENV]: base.configDir }
       : base.env
     return { ...base, env, ...(effort !== undefined ? { effort } : {}) }
   }
@@ -250,11 +322,12 @@ export class CcRuntime {
    * @returns the catalog, or undefined when nothing could answer.
    */
   private async probeModels(): Promise<readonly unknown[] | undefined> {
+    const generation = this.configGeneration
     for (const engine of this.engines.values()) {
       if (engine.isClosed || engine.isDead) continue
       const live = await engine.supportedModels()
       if (live !== undefined) {
-        this.modelCatalog = live
+        if (generation === this.configGeneration) this.modelCatalog = live
         return live
       }
     }
@@ -270,7 +343,7 @@ export class CcRuntime {
         probe.supportedModels(),
         new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), CATALOG_PROBE_TIMEOUT_MS)),
       ])
-      if (models !== undefined) this.modelCatalog = models
+      if (models !== undefined && generation === this.configGeneration) this.modelCatalog = models
       return models
     } catch (error) {
       this.ctx.logger?.warn?.(`dsh-cc: could not read the model catalog: ${String(error)}`)
@@ -308,11 +381,39 @@ export class CcRuntime {
       for (const [key, value] of Object.entries(body.env as Record<string, unknown>)) {
         if (typeof value !== 'string') continue
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue
+        if (key === CONFIG_DIR_ENV) {
+          return json(res, { error: `${CONFIG_DIR_ENV} 请在「账号」里配置：写成环境变量只会改到 claude 进程，页面读取的会话目录不会跟着走。` }, 400)
+        }
         env[key] = value
       }
     }
-    this.settings = { model, permissionMode, env }
+    const accounts = normalizeAccounts(body.accounts)
+    // The list is editable here; which one is ACTIVE is not — that is its own
+    // endpoint. But editing the list can still move the root out from under the
+    // plugin: deleting the active account, or repointing its directory. That is
+    // an account switch by another name, so it carries the same guarantees.
+    const activeAccountId = accounts.some(account => account.id === this.settings.activeAccountId)
+      ? this.settings.activeAccountId
+      : ''
+    const before = this.activeConfigDir()
+    const after = resolveAccountDir(accounts, activeAccountId, this.baseConfig.configDir)
+    const moved = !sameDir(before, after)
+    if (moved) {
+      const busy = [...this.engines.values()].filter(engine => engine.busy).length
+      if (busy > 0) {
+        return json(res, { error: `有 ${busy} 个会话正在运行，等它们结束再改动当前账号的目录。` }, 409)
+      }
+    }
+    this.settings = { model, permissionMode, env, accounts, activeAccountId }
     persistSettings(this.baseConfig.dataDir, this.settings)
+    if (moved) {
+      // Same cascade as an explicit switch: move the environment, then drop
+      // every answer that came out of the root being left behind.
+      this.configGeneration += 1
+      applyConfigDir(after)
+      this.account = undefined
+      this.catalog.invalidate()
+    }
     // The catalog is derived from the environment that just changed; a stale
     // negative cache must not suppress the re-probe the new settings deserve.
     this.modelCatalog = undefined
@@ -322,9 +423,55 @@ export class CcRuntime {
     for (const [id, engine] of [...this.engines]) {
       if (!engine.busy) await this.closeEngine(id)
     }
+    await this.catalog.refresh()
     this.broadcast({ t: 'hello', config: this.configSummary() })
     this.broadcastSessions()
     return json(res, { ok: true, settings: this.settings })
+  }
+
+  /**
+   * Switch the whole plugin to one account's Claude Code home.
+   *
+   * Everything the page shows about Claude Code is read out of that root —
+   * the session list and their transcripts, the live-process registry behind
+   * terminal ownership, the authenticated identity, the model catalog the
+   * gateway reports, and the permission posture in the root's own
+   * settings.json. So the switch is not a filter: it repoints the process,
+   * drops every cached answer that came from the old root, and re-reads.
+   *
+   * Refused while any engine is busy. A running turn holds a CLI process
+   * spawned against the old home, and there is no way to move it — nor to
+   * interrupt it, which is the same cross-process limit the read-only terminal
+   * sessions live under.
+   * @param req - the request carrying `{ id }`; an empty id selects the host default.
+   * @param res - the response to write.
+   */
+  private async switchAccount(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = await readJson(req)
+    const id = typeof body?.id === 'string' ? body.id.trim() : ''
+    if (id !== '' && !this.settings.accounts.some(account => account.id === id)) {
+      return json(res, { error: '账号不存在' }, 404)
+    }
+    if (id === this.settings.activeAccountId) return json(res, { ok: true, activeAccountId: id })
+    const busy = [...this.engines.entries()].filter(([, engine]) => engine.busy).map(([key]) => key)
+    if (busy.length > 0) {
+      return json(res, { error: `有 ${busy.length} 个会话正在运行，等它们结束再切换账号。` }, 409)
+    }
+    this.settings = { ...this.settings, activeAccountId: id }
+    persistSettings(this.baseConfig.dataDir, this.settings)
+    // Order matters: the environment must be moved before anything re-reads,
+    // and the generation bumped before the detached probes can land.
+    this.configGeneration += 1
+    applyConfigDir(this.activeConfigDir())
+    for (const key of [...this.engines.keys()]) await this.closeEngine(key)
+    this.account = undefined
+    this.modelCatalog = undefined
+    this.modelsFailedAt = 0
+    this.catalog.invalidate()
+    await this.catalog.refresh()
+    this.broadcast({ t: 'hello', config: this.configSummary() })
+    this.broadcastSessions()
+    return json(res, { ok: true, activeAccountId: id })
   }
 
   /**
@@ -408,6 +555,9 @@ export class CcRuntime {
       if (parts[0] === 'settings' && parts.length === 1 && method === 'PUT') {
         return await this.saveSettings(req, res)
       }
+      if (parts[0] === 'accounts' && parts[1] === 'active' && parts.length === 2 && method === 'POST') {
+        return await this.switchAccount(req, res)
+      }
       if (parts[0] === 'blobs' && parts.length === 2 && method === 'GET') {
         return await this.serveBlob(parts[1] ?? '', res)
       }
@@ -424,7 +574,11 @@ export class CcRuntime {
         }
         if (parts.length === 1 && method === 'POST') {
           const body = await readJson(req)
-          const session = await this.store.create(body ?? {}, { cwd: this.effectiveConfig().cwd })
+          const effective = this.effectiveConfig()
+          const session = await this.store.create(body ?? {}, {
+            cwd: effective.cwd,
+            configDir: effective.configDir,
+          })
           this.broadcastSessions()
           return json(res, { session })
         }
@@ -503,6 +657,9 @@ export class CcRuntime {
             for (const [key, value] of Object.entries(body.env as Record<string, unknown>)) {
               if (typeof value !== 'string') continue
               if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue
+              if (key === CONFIG_DIR_ENV) {
+                return json(res, { error: `${CONFIG_DIR_ENV} 不能按会话覆盖：会话目录是整个插件级的账号选择。` }, 400)
+              }
               env[key] = value
             }
           }
@@ -657,6 +814,9 @@ export class CcRuntime {
       }
     }
     this.clients.clear()
+    // An account switch wrote CLAUDE_CONFIG_DIR onto the host process; unloading
+    // the plugin must not leave that behind for whatever mounts next.
+    restoreConfigDir()
   }
 
   /**
@@ -959,13 +1119,16 @@ export class CcRuntime {
     } catch {
       return
     }
+    let dropped = false
     for (const res of this.clients) {
       try {
         res.write(payload)
       } catch {
         this.clients.delete(res)
+        dropped = true
       }
     }
+    if (dropped) this.armRescan()
   }
 
   private sse(req: IncomingMessage, res: ServerResponse): void {
@@ -982,8 +1145,18 @@ export class CcRuntime {
     // the page short of every CLI session until something unrelated changed.
     this.write(res, { t: 'sessions', sessions: this.catalog.list() })
     this.clients.add(res)
+    // With nobody attached the rescan runs slowly, so that cached list can be
+    // most of RESCAN_IDLE_MS old. The page gets it immediately anyway — a list
+    // that renders now beats a blank rail — and this forced sweep corrects it.
+    this.armRescan()
+    void this.catalog.refresh().then(changed => {
+      if (changed) this.broadcastSessions()
+    })
     const remove = (): void => {
       this.clients.delete(res)
+      // Last page gone: fall back to the idle cadence rather than sweeping the
+      // whole CLI store every two seconds for an empty room.
+      this.armRescan()
     }
     req.on('close', remove)
     req.on('error', remove)
@@ -1007,10 +1180,14 @@ export class CcRuntime {
       defaultCwd: this.baseConfig.cwd,
       model: effective.model,
       permissionMode: effective.permissionMode,
-      env: effectiveEnvEntries(this.baseConfig.env, this.settings.env),
+      env: effectiveEnvEntries(this.baseConfig.env, this.settings.env, { [CONFIG_DIR_ENV]: effective.configDir }),
       liveSessions: this.engines.size,
       sdkVersion: this.sdkVersion,
       ...(this.account !== undefined ? { account: this.account } : {}),
+      configDir: effective.configDir,
+      defaultConfigDir: resolveAccountDir([], '', this.baseConfig.configDir),
+      accounts: this.settings.accounts,
+      activeAccountId: this.settings.activeAccountId,
     }
   }
 
@@ -1022,8 +1199,10 @@ export class CcRuntime {
    * @param engine - the engine to interrogate.
    */
   private refreshAccount(engine: SessionEngine): void {
+    const generation = this.configGeneration
     void engine.accountInfo().then(account => {
       if (account === undefined) return
+      if (generation !== this.configGeneration) return
       if (JSON.stringify(account) === JSON.stringify(this.account)) return
       this.account = account
       this.broadcast({ t: 'hello', config: this.configSummary() })
@@ -1181,7 +1360,7 @@ function readDestination(value: unknown): PermissionDestination | undefined {
 }
 
 /** Default settings: every field empty, so the cordis config stays authoritative. */
-const EMPTY_SETTINGS: CcSettings = { model: '', permissionMode: '', env: {} }
+const EMPTY_SETTINGS: CcSettings = { model: '', permissionMode: '', env: {}, accounts: [], activeAccountId: '' }
 
 /**
  * Load the page-editable settings file from the data directory.
@@ -1191,7 +1370,7 @@ const EMPTY_SETTINGS: CcSettings = { model: '', permissionMode: '', env: {} }
 function loadSettings(dataDir: string): CcSettings {
   try {
     const file = join(dataDir, 'settings.json')
-    if (!existsSync(file)) return { ...EMPTY_SETTINGS, env: {} }
+    if (!existsSync(file)) return { ...EMPTY_SETTINGS, env: {}, accounts: [] }
     const raw = JSON.parse(readFileSync(file, 'utf8')) as Partial<CcSettings>
     const env: Record<string, string> = {}
     if (typeof raw.env === 'object' && raw.env !== null) {
@@ -1199,13 +1378,23 @@ function loadSettings(dataDir: string): CcSettings {
         if (typeof value === 'string') env[key] = value
       }
     }
+    // A file written before the key was reserved can still carry it; the
+    // account layer owns it now, so it is dropped rather than obeyed.
+    delete env[CONFIG_DIR_ENV]
+    const accounts = normalizeAccounts(raw.accounts)
+    const activeAccountId = typeof raw.activeAccountId === 'string'
+      && accounts.some(account => account.id === raw.activeAccountId)
+      ? raw.activeAccountId
+      : ''
     return {
       model: typeof raw.model === 'string' ? raw.model : '',
       permissionMode: typeof raw.permissionMode === 'string' ? raw.permissionMode : '',
       env,
+      accounts,
+      activeAccountId,
     }
   } catch {
-    return { ...EMPTY_SETTINGS, env: {} }
+    return { ...EMPTY_SETTINGS, env: {}, accounts: [] }
   }
 }
 

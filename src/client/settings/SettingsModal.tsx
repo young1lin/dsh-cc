@@ -14,13 +14,14 @@
 import { useEffect, useState, type ReactElement } from 'react'
 import { Button, DisclosureRow, IconDataOutline16, IconSettingsOutline16, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
 import { AccountPanel } from './AccountPanel.tsx'
+import { AccountsPanel } from './AccountsPanel.tsx'
 import { EnvEditor, fromRows, toRows, type EnvRow } from './EnvEditor.tsx'
 import { ProviderForm } from './ProviderForm.tsx'
 import { LAYER_LABELS, omitStructuredKeys, pickStructuredKeys } from './providerFields.ts'
 import { fetchGlobalModels, fetchSettings, saveSettings } from '../api/settings.ts'
 import type { ModelRow } from '../api/telemetry.ts'
 import { registerCss } from '../css.ts'
-import type { ConfigSummary } from '../../types.ts'
+import type { CcAccount, ConfigSummary } from '../../types.ts'
 
 // Shared atoms for the whole settings/ sub-tree (`.cc-field`, `.cc-row`, `.cc-hint`,
 // `.cc-mono` come from theme.ts): ProviderForm and AccountPanel both reference the
@@ -145,6 +146,7 @@ export function SettingsModal(props: {
   const [model, setModel] = useState('')
   const [permissionMode, setPermissionMode] = useState('')
   const [env, setEnv] = useState<Record<string, string>>({})
+  const [accounts, setAccounts] = useState<CcAccount[]>([])
   const [advancedRows, setAdvancedRows] = useState<EnvRow[]>([])
   const [ready, setReady] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -173,14 +175,33 @@ export function SettingsModal(props: {
         // would rebuild their identities and lose input focus mid-edit.
         setEnv(pickStructuredKeys(result.settings.env))
         setAdvancedRows(toRows(omitStructuredKeys(result.settings.env)))
+        setAccounts(result.settings.accounts)
         setReady(true)
       })
       .catch(cause => setMessage(cause instanceof Error ? cause.message : String(cause)))
   }, [])
 
+  /**
+   * Write the whole page-editable layer as the form currently stands. Shared by
+   * the footer's save and by the account switch, which has to land the account
+   * list before the host can be asked to activate a row from it.
+   * @returns a promise settling when the save lands.
+   */
+  const persist = async (): Promise<void> => {
+    await saveSettings({
+      model,
+      permissionMode,
+      env: { ...env, ...fromRows(advancedRows) },
+      accounts,
+      // Which account is active is switched through its own endpoint, never
+      // saved from here; the host keeps whatever is in force.
+      activeAccountId: props.config?.activeAccountId ?? '',
+    })
+  }
+
   const save = (): void => {
     setSaving(true)
-    saveSettings({ model, permissionMode, env: { ...env, ...fromRows(advancedRows) } })
+    persist()
       .then(() => {
         props.onSaved()
         props.onClose()
@@ -210,6 +231,15 @@ export function SettingsModal(props: {
     >
       <div className="cc-settings">
         <AccountPanel account={props.config?.account} />
+
+        <AccountsPanel
+          accounts={accounts}
+          activeAccountId={props.config?.activeAccountId ?? ''}
+          defaultConfigDir={props.config?.defaultConfigDir ?? ''}
+          onChange={setAccounts}
+          onPersist={persist}
+          onSwitched={props.onSaved}
+        />
 
         <div className="cc-section-title">服务商与代理</div>
         <ProviderForm env={env} onChange={setEnv} config={props.config} />

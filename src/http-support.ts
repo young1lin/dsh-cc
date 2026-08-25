@@ -19,7 +19,7 @@ import type { DirListing, EffectiveEnvEntry } from './types.ts'
  * the CLI gains later is still reported. Used only to decide what is worth
  * showing on the settings page; it never filters what the CLI is given.
  */
-const CLI_ENV_KEY = /^(ANTHROPIC_|CLAUDE_CODE_|API_TIMEOUT_MS$|(HTTPS?|NO)_PROXY$)/i
+const CLI_ENV_KEY = /^(ANTHROPIC_|CLAUDE_CODE_|CLAUDE_CONFIG_DIR$|API_TIMEOUT_MS$|(HTTPS?|NO)_PROXY$)/i
 
 /**
  * Variables a parent Claude Code process injects into the processes it spawns.
@@ -92,11 +92,16 @@ export function readSdkVersion(): string {
  * leaves the host.
  * @param plugin - the cordis plugin config env.
  * @param settings - the page-editable settings env, layered over it per key.
+ * @param account - variables the active account root supplies. Applied last
+ *   and reported as its own layer: CLAUDE_CONFIG_DIR is written onto this
+ *   process when an account is selected, so the process layer would otherwise
+ *   claim a value the account chose.
  * @returns one entry per variable, sorted by key.
  */
 export function effectiveEnvEntries(
   plugin: Record<string, string>,
   settings: Record<string, string>,
+  account: Record<string, string> = {},
 ): EffectiveEnvEntry[] {
   const winner = new Map<string, { value: string; layer: EffectiveEnvEntry['layer'] }>()
   // The CLI is spawned with this process's environment, so a variable set in
@@ -114,6 +119,7 @@ export function effectiveEnvEntries(
   // layer underpins both — the CLI inherits it from the spawn regardless.
   for (const [key, value] of Object.entries(plugin)) winner.set(key, { value, layer: 'plugin' })
   for (const [key, value] of Object.entries(settings)) winner.set(key, { value, layer: 'settings' })
+  for (const [key, value] of Object.entries(account)) winner.set(key, { value, layer: 'account' })
   return [...winner.entries()]
     .map(([key, { value, layer }]) => SECRET_KEY.test(key)
       ? { key, value: maskSecret(value), masked: true, layer }

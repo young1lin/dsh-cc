@@ -130,12 +130,38 @@ export interface ProviderPreset {
   hint: string
 }
 
+/** The preset that means "no baseUrl at all", i.e. Claude's own endpoint. */
+const OFFICIAL_PRESET_ID = 'official'
+
+/** The preset that means "some endpoint none of the named presets covers". */
+export const CUSTOM_PRESET_ID = 'custom'
+
 /** Offered presets, in display order. */
 export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
-  { id: 'official', label: '官方 API', baseUrl: '', hint: '清空 API 地址，直连 Claude 官方端点' },
+  { id: OFFICIAL_PRESET_ID, label: '官方 API', baseUrl: '', hint: '清空 API 地址，直连 Claude 官方端点' },
   { id: 'zhipu-glm', label: '智谱 GLM', baseUrl: 'https://open.bigmodel.cn/api/anthropic', hint: '智谱 Anthropic 兼容网关' },
-  { id: 'custom', label: '自定义中转', baseUrl: '', hint: '清空 API 地址，手动填写中转站地址' },
+  { id: CUSTOM_PRESET_ID, label: '自定义中转', baseUrl: '', hint: '清空 API 地址，手动填写中转站地址' },
 ]
+
+/**
+ * Which single preset the current API address represents.
+ *
+ * The pill row is a readout of what is in the field, so exactly one pill is
+ * active at any time. Matching each pill against its own `baseUrl` cannot do
+ * that: 官方 API and 自定义中转 both carry an empty `baseUrl` (one clears the
+ * field to reach the official endpoint, the other clears it so the user can
+ * type), so an empty field lit both of them at once. Empty therefore resolves
+ * to 官方 API — that IS the official endpoint — and anything the named presets
+ * do not cover resolves to 自定义中转.
+ * @param baseUrl - the current API address field value.
+ * @returns the id of the one preset to render as active.
+ */
+export function activePresetId(baseUrl: string): string {
+  const trimmed = baseUrl.trim()
+  if (trimmed === '') return OFFICIAL_PRESET_ID
+  const named = PROVIDER_PRESETS.find(preset => preset.baseUrl !== '' && preset.baseUrl === trimmed)
+  return named?.id ?? CUSTOM_PRESET_ID
+}
 
 /** Human label for each configuration layer, shared by the settings dialog and the provider form. */
 export const LAYER_LABELS: Record<ConfigLayer, string> = {
@@ -143,6 +169,7 @@ export const LAYER_LABELS: Record<ConfigLayer, string> = {
   plugin: 'cordis 配置',
   settings: '页面设置',
   session: '会话覆盖',
+  account: '账号',
 }
 
 /**

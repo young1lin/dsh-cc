@@ -54,6 +54,14 @@ export interface ClaudeCodeProviderConfig {
 export interface ClaudeCodeConfig {
   /** Session store directory; defaults to $DSH_HOME (or ~/.dsh) + /claude-code. */
   dataDir?: string
+  /**
+   * Claude Code home (`CLAUDE_CONFIG_DIR`) to run against: credentials,
+   * settings, memory, skills, and the project transcripts all live under it.
+   * Empty = whatever dsh was launched with, else ~/.claude. The page's account
+   * list layers over this, so this field is the deployment's default account
+   * rather than a lock.
+   */
+  configDir?: string
   /** Default working directory for new sessions; defaults to the dsh process cwd. */
   cwd?: string
   /** Default model id (e.g. claude-sonnet-4-5); empty = Claude Code picks. */
@@ -93,6 +101,7 @@ const ProviderConfigSchema: z<ClaudeCodeProviderConfig> = z.object({
 /** Runtime configuration schema for the dsh-cc plugin. */
 export const Config: z<ClaudeCodeConfig> = z.object({
   dataDir: z.string(),
+  configDir: z.string(),
   cwd: z.string(),
   model: z.string(),
   permissionMode: z.union([
@@ -120,6 +129,12 @@ export const Config: z<ClaudeCodeConfig> = z.object({
 /** Fully resolved configuration with every default applied. */
 export interface ResolvedConfig {
   dataDir: string
+  /**
+   * The cordis config's Claude Code home; empty when it names none. This is
+   * the plugin-layer opinion only — the root actually in force is resolved in
+   * the runtime, where the page's account selection layers over it.
+   */
+  configDir: string
   cwd: string
   model: string
   permissionMode: NonNullable<ClaudeCodeConfig['permissionMode']>
@@ -137,14 +152,24 @@ export interface ResolvedConfig {
  */
 export function resolveConfig(config: ClaudeCodeConfig): ResolvedConfig {
   const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
+  // The structured fields resolve first so an explicit `env` key can always override its
+  // structured counterpart, matching `env`'s existing role as the escape hatch.
+  const env = { ...resolveProviderEnv(config.provider ?? {}), ...config.env }
+  // CLAUDE_CONFIG_DIR has exactly one owner (see accounts.ts): left in `env` it
+  // would move the spawned process without moving this plugin's own session
+  // reads. A config that sets it there is honored by promoting it to
+  // `configDir` rather than dropped — the two mean the same thing, and the
+  // dedicated field wins when both are present.
+  const inheritedConfigDir = env.CLAUDE_CONFIG_DIR ?? ''
+  delete env.CLAUDE_CONFIG_DIR
+  const configDir = (config.configDir || inheritedConfigDir).trim()
   return {
     dataDir: resolve(config.dataDir || join(dshHome, 'claude-code')),
+    configDir: configDir === '' ? '' : resolve(configDir),
     cwd: resolve(config.cwd || process.cwd()),
     model: config.model || '',
     permissionMode: config.permissionMode || 'auto',
-    // The structured fields resolve first so an explicit `env` key can always override its
-    // structured counterpart, matching `env`'s existing role as the escape hatch.
-    env: { ...resolveProviderEnv(config.provider ?? {}), ...config.env },
+    env,
     maxLiveSessions: config.maxLiveSessions || 4,
     maxTurns: config.maxTurns || 0,
     executablePath: config.executablePath || '',
