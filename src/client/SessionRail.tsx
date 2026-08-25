@@ -1,43 +1,91 @@
 /**
- * The session rail: new-session entry, the session list with inline rename and
- * delete, and the connection footer.
+ * The session rail: new-session entry, session search, the session list with
+ * inline rename and delete, the resizable/collapsible chrome, and the
+ * connection footer.
  *
  * @module dsh-cc/client/SessionRail
  */
 
-import { useEffect, useState, type ReactElement } from 'react'
+import { useEffect, useRef, useState, type ReactElement } from 'react'
 import {
   Button,
+  IconChevronLeftOutline14,
+  IconChevronRightOutline14,
   IconFolderClose16,
   IconFolderOpen16,
   IconPlusOutline16,
+  IconSearchOutline16,
   IconTriangleRightFill14,
   Input,
   StateDot,
 } from '@deepseek-ai/dsh-client-ui-primitives'
-import { DirectoryPicker } from './DirectoryPicker.tsx'
-import { registerCss } from './css.ts'
+import { NewSessionCard } from './NewSessionCard.tsx'
 import { useOverlay } from './overlay.ts'
 import type { ConfigSummary, SessionMeta } from '../types.ts'
 
-registerCss('session-rail', `
-.cc-new-form {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--dsw-alias-border-l2);
-}
-.cc-new-form .cc-row > span:first-child { flex: 1; }
-`)
+/** localStorage key holding the user's chosen rail width in px. */
+const WIDTH_KEY = 'dsh-cc.rail-width'
+/** localStorage key holding whether the rail is collapsed to the thin strip. */
+const COLLAPSED_KEY = 'dsh-cc.rail-collapsed'
+/** Rail width when nothing was ever stored. */
+const WIDTH_DEFAULT = 240
+/** Narrowest the rail can be dragged. */
+const WIDTH_MIN = 180
+/** Widest the rail can be dragged. */
+const WIDTH_MAX = 480
+/** How many px one arrow-key press on the resizer moves. */
+const KEY_STEP = 16
 
-/** The model choices offered when creating a session. */
-const MODEL_CHOICES: { value: string; label: string }[] = [
-  { value: '', label: '默认（跟随配置）' },
-  { value: 'opus', label: 'opus' },
-  { value: 'sonnet', label: 'sonnet' },
-  { value: 'haiku', label: 'haiku' },
-]
+/**
+ * Clamp a candidate rail width into the draggable range.
+ * @param value - the candidate width in px.
+ * @returns the clamped width, rounded to whole px.
+ */
+function clampWidth(value: number): number {
+  return Math.min(WIDTH_MAX, Math.max(WIDTH_MIN, Math.round(value)))
+}
+
+/**
+ * Read the persisted rail width; any missing or malformed entry falls back to
+ * the default, and storage failures (sandboxed host) never break the rail.
+ * @returns the stored width, clamped.
+ */
+function readWidth(): number {
+  try {
+    const raw = window.localStorage.getItem(WIDTH_KEY)
+    if (raw === null) return WIDTH_DEFAULT
+    const value = Number.parseInt(raw, 10)
+    if (!Number.isFinite(value)) return WIDTH_DEFAULT
+    return clampWidth(value)
+  } catch {
+    return WIDTH_DEFAULT
+  }
+}
+
+/**
+ * Read whether the rail was left collapsed to the thin strip.
+ * @returns true when collapsed.
+ */
+function readCollapsed(): boolean {
+  try {
+    return window.localStorage.getItem(COLLAPSED_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Persist one preference; storage failures are silently dropped.
+ * @param key - the preference key.
+ * @param value - the serialized value.
+ */
+function persist(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value)
+  } catch {
+    // Storage unavailable; the width simply does not survive a reload.
+  }
+}
 
 /** One project directory and the sessions that ran in it, in list order. */
 interface SessionGroup {
@@ -93,6 +141,22 @@ function dotState(status: SessionMeta['status']): 'done' | 'ongoing' | 'error' {
   if (status === 'busy') return 'ongoing'
   if (status === 'error') return 'error'
   return 'done'
+}
+
+/**
+ * Filter the catalog down to sessions matching a query in their name, working
+ * directory, or git branch — the cheap, instantly client-side kind of search.
+ * Matching runs against the full cwd path, so a directory's middle segment
+ * hits even though the group label shows only the last one.
+ * @param sessions - the merged catalog list.
+ * @param needle - the lower-cased, trimmed query.
+ * @returns the matching sessions, list order (newest first) preserved.
+ */
+function filterSessions(sessions: SessionMeta[], needle: string): SessionMeta[] {
+  return sessions.filter(session =>
+    session.name.toLowerCase().includes(needle)
+    || session.cwd.toLowerCase().includes(needle)
+    || (session.gitBranch ?? '').toLowerCase().includes(needle))
 }
 
 /**
@@ -223,7 +287,7 @@ function ProjectGroup(props: {
   onSelect(id: string): void
   onDelete(id: string): void
   onRename(id: string, name: string): void
-  onCreate(form: { name?: string; cwd?: string; model?: string }): void
+  onCreate(form: { cwd?: string; model?: string }): void
 }): ReactElement {
   const containsCurrent =
     props.currentId !== undefined && props.group.sessions.some(session => session.id === props.currentId)
@@ -284,73 +348,6 @@ function ProjectGroup(props: {
 }
 
 /**
- * The new-session form; shown inline under the rail head.
- * @param props - the effective config for defaults, plus submit and cancel.
- * @returns the form node.
- */
-function NewSessionForm(props: {
-  config: ConfigSummary | undefined
-  onCancel(): void
-  onCreate(form: { name?: string; cwd?: string; model?: string }): void
-}): ReactElement {
-  const [name, setName] = useState('')
-  const [cwd, setCwd] = useState(props.config?.defaultCwd ?? '')
-  const [model, setModel] = useState('')
-  const [picking, setPicking] = useState(false)
-  // The form is a transient editing layer over the rail: while it holds a
-  // half-filled draft, Escape must not close the whole surface under it.
-  useOverlay(true)
-
-  return (
-    <div className="cc-new-form">
-      <label className="cc-field">
-        名称（可选）
-        <Input value={name} placeholder="默认按时间命名" onChange={event => setName(event.target.value)} />
-      </label>
-      <div className="cc-field">
-        工作目录
-        <div className="cc-row">
-          <Input value={cwd} placeholder={props.config?.defaultCwd} onChange={event => setCwd(event.target.value)} />
-          <Button size="sm" onClick={() => setPicking(true)}>浏览…</Button>
-        </div>
-      </div>
-      <label className="cc-field">
-        模型
-        <select value={model} onChange={event => setModel(event.target.value)}>
-          {MODEL_CHOICES.map(choice => (
-            <option key={choice.value} value={choice.value}>{choice.label}</option>
-          ))}
-        </select>
-      </label>
-      <div className="cc-row">
-        <Button
-          variant="primary"
-          size="sm"
-          onClick={() => props.onCreate({
-            name: name || undefined,
-            cwd: cwd || undefined,
-            model: model || undefined,
-          })}
-        >
-          创建
-        </Button>
-        <Button size="sm" onClick={props.onCancel}>取消</Button>
-      </div>
-      {picking && (
-        <DirectoryPicker
-          initial={cwd}
-          onCancel={() => setPicking(false)}
-          onPick={picked => {
-            setCwd(picked)
-            setPicking(false)
-          }}
-        />
-      )}
-    </div>
-  )
-}
-
-/**
  * The complete rail.
  * @param props - session list state, connection state, pending-interaction
  *   counts per session, and rail callbacks.
@@ -364,22 +361,72 @@ export function SessionRail(props: {
   /** Pending permissions/questions per session id, for the row badges. */
   pending: Record<string, number>
   onSelect(id: string): void
-  onCreate(form: { name?: string; cwd?: string; model?: string }): void
+  onCreate(form: { cwd?: string; model?: string }): void
   onDelete(id: string): void
   onRename(id: string, name: string): void
   onOpenSettings(): void
 }): ReactElement {
   const [creating, setCreating] = useState(false)
+  const [query, setQuery] = useState('')
+  const [width, setWidth] = useState(readWidth)
+  const [collapsed, setCollapsed] = useState(readCollapsed)
+  /** Mirror of the drag target, so the pointerup handler persists the last value. */
+  const widthRef = useRef(width)
+  /** The ＋ control the new-session card anchors against, expanded or thin. */
+  const plusRef = useRef<HTMLSpanElement>(null)
+  // A search in progress holds one Escape: the key clears the query first and
+  // only then reaches the surface close.
+  useOverlay(query.trim().length > 0)
+  useEffect(() => {
+    widthRef.current = width
+  }, [width])
 
-  return (
-    <aside className="cc-rail">
-      <div className="cc-rail-head">
-        <Button variant="primary" style={{ width: '100%' }} onClick={() => setCreating(value => !value)}>
-          ＋ 新会话
-        </Button>
-      </div>
-      {creating && (
-        <NewSessionForm
+  const needle = query.trim().toLowerCase()
+  const searching = needle.length > 0
+  const matched = searching ? filterSessions(props.sessions, needle) : []
+  /** Total pending interactions across every session, for the thin strip. */
+  const totalPending = Object.values(props.pending).reduce((sum, count) => sum + count, 0)
+
+  /**
+   * Begin a width drag from the rail's right edge: window-level move/up
+   * listeners with the initial press as the origin, and a body class that
+   * suppresses text selection and keeps the resize cursor for the drag.
+   * @param event - the press on the resize handle.
+   */
+  const startResize = (event: React.PointerEvent<HTMLDivElement>): void => {
+    if (!event.isPrimary) return
+    event.preventDefault()
+    const startX = event.clientX
+    const startWidth = widthRef.current
+    document.body.classList.add('cc-resizing')
+    const onMove = (move: PointerEvent): void => {
+      const next = clampWidth(startWidth + move.clientX - startX)
+      widthRef.current = next
+      setWidth(next)
+    }
+    const stop = (): void => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', stop)
+      window.removeEventListener('pointercancel', stop)
+      document.body.classList.remove('cc-resizing')
+      persist(WIDTH_KEY, String(widthRef.current))
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', stop)
+    window.addEventListener('pointercancel', stop)
+  }
+
+  /** Expand back to the remembered width. */
+  const expand = (): void => {
+    setCollapsed(false)
+    persist(COLLAPSED_KEY, '0')
+  }
+
+  const newCard = creating
+    ? (
+        <NewSessionCard
+          anchor={plusRef.current}
+          side={collapsed ? 'right' : 'below'}
           config={props.config}
           onCancel={() => setCreating(false)}
           onCreate={form => {
@@ -387,21 +434,117 @@ export function SessionRail(props: {
             setCreating(false)
           }}
         />
-      )}
+      )
+    : undefined
+
+  if (collapsed) {
+    return (
+      <aside className="cc-rail-thin">
+        <div className="cc-thin-col">
+          <span className="cc-new-anchor" ref={plusRef}>
+            <button
+              type="button"
+              className="cc-thin-button"
+              title="新建会话"
+              onClick={() => setCreating(true)}
+            >
+              <IconPlusOutline16 />
+            </button>
+          </span>
+          <button
+            type="button"
+            className="cc-thin-button"
+            title="展开侧栏"
+            onClick={expand}
+          >
+            <IconChevronRightOutline14 />
+          </button>
+        </div>
+        <div className="cc-thin-spacer" />
+        <div className="cc-thin-foot">
+          {totalPending > 0 && (
+            <span className="cc-session-alert" title="有等待处理的权限请求或问题">
+              <span className="cc-session-alert-dot" aria-hidden />
+              {totalPending > 1 ? totalPending : null}
+            </span>
+          )}
+          <StateDot state={props.connected ? 'done' : 'warning'} />
+        </div>
+        {newCard}
+      </aside>
+    )
+  }
+
+  return (
+    <aside className="cc-rail" style={{ width: `${width}px` }}>
+      <div className="cc-rail-head">
+        <div className="cc-rail-actions">
+          <span className="cc-new-anchor" ref={plusRef}>
+            <Button variant="primary" style={{ width: '100%' }} onClick={() => setCreating(value => !value)}>
+              ＋ 新会话
+            </Button>
+          </span>
+          <button
+            type="button"
+            className="cc-rail-collapse"
+            title="收起侧栏"
+            onClick={() => {
+              setCollapsed(true)
+              persist(COLLAPSED_KEY, '1')
+            }}
+          >
+            <IconChevronLeftOutline14 />
+          </button>
+        </div>
+        <Input
+          icon={<IconSearchOutline16 />}
+          value={query}
+          placeholder="搜索会话（名称 / 目录 / 分支）"
+          title="按名称、工作目录或 git 分支过滤会话"
+          onChange={event => setQuery(event.target.value)}
+          onKeyDown={event => {
+            if (event.key !== 'Escape') return
+            // The Escape of an IME composition belongs to the input.
+            if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return
+            setQuery('')
+          }}
+        />
+      </div>
       <div className="cc-rail-list">
-        {groupByProject(props.sessions).map((group, index) => (
-          <ProjectGroup
-            key={group.cwd}
-            group={group}
-            currentId={props.currentId}
-            defaultOpen={index === 0}
-            pending={props.pending}
-            onSelect={props.onSelect}
-            onDelete={props.onDelete}
-            onRename={props.onRename}
-            onCreate={props.onCreate}
-          />
-        ))}
+        {searching ? (
+          matched.length === 0
+            ? <div className="cc-empty">没有匹配的会话</div>
+            : (
+              <>
+                <div className="cc-search-count">{matched.length} 个会话</div>
+                {matched.map(session => (
+                  <SessionRow
+                    key={session.id}
+                    session={session}
+                    active={session.id === props.currentId}
+                    pending={props.pending[session.id] ?? 0}
+                    onSelect={() => props.onSelect(session.id)}
+                    onDelete={() => props.onDelete(session.id)}
+                    onRename={name => props.onRename(session.id, name)}
+                  />
+                ))}
+              </>
+            )
+        ) : (
+          groupByProject(props.sessions).map((group, index) => (
+            <ProjectGroup
+              key={group.cwd}
+              group={group}
+              currentId={props.currentId}
+              defaultOpen={index === 0}
+              pending={props.pending}
+              onSelect={props.onSelect}
+              onDelete={props.onDelete}
+              onRename={props.onRename}
+              onCreate={props.onCreate}
+            />
+          ))
+        )}
         {props.sessions.length === 0 && !creating && <div className="cc-empty">暂无会话</div>}
       </div>
       <div className="cc-rail-foot">
@@ -410,6 +553,24 @@ export function SessionRail(props: {
         <span className="cc-spacer" />
         <Button size="sm" onClick={props.onOpenSettings}>设置</Button>
       </div>
+      <div
+        className="cc-rail-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="调整侧栏宽度"
+        aria-valuenow={width}
+        tabIndex={0}
+        onPointerDown={startResize}
+        onKeyDown={event => {
+          const step = event.key === 'ArrowLeft' ? -KEY_STEP : event.key === 'ArrowRight' ? KEY_STEP : 0
+          if (step === 0) return
+          const next = clampWidth(widthRef.current + step)
+          widthRef.current = next
+          setWidth(next)
+          persist(WIDTH_KEY, String(next))
+        }}
+      />
+      {newCard}
     </aside>
   )
 }

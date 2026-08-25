@@ -30,9 +30,13 @@ registerCss('shell', `
 @keyframes cc-fade-in { from { opacity: 0; } to { opacity: 1; } }
 
 /* ── session rail ─────────────────────────────────────────── */
+/* Width comes from inline style (the draggable, persisted value); the 240px
+   here is the pre-hydration fallback. position:relative anchors the
+   resize handle that straddles the right border. */
 .cc-rail {
   width: 240px;
   flex: none;
+  position: relative;
   display: flex;
   flex-direction: column;
   border-right: 1px solid var(--dsw-alias-border-l2);
@@ -40,8 +44,111 @@ registerCss('shell', `
   background: var(--dsw-specific-sidebar-fill);
 }
 
-.cc-rail-head { padding: 12px; }
+.cc-rail-head {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 12px 8px;
+}
+
+.cc-rail-actions { display: flex; align-items: stretch; gap: 6px; }
+
+/* Wraps the ＋ control so the new-session card can anchor on a plain element
+   without depending on the Button primitive forwarding refs. */
+.cc-new-anchor { flex: 1; display: inline-flex; min-width: 0; }
+
+.cc-rail-collapse {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 7px;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-tertiary);
+  cursor: pointer;
+}
+
+.cc-rail-collapse:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+
+/* Drag handle straddling the rail's right border: a 7px hit area that only
+   reveals itself on hover, focus, or an active drag. */
+.cc-rail-resizer {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  width: 7px;
+  height: 100%;
+  z-index: 2;
+  border-radius: 4px;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.cc-rail-resizer:hover,
+.cc-rail-resizer:focus-visible,
+body.cc-resizing .cc-rail-resizer {
+  background: var(--dsw-alias-state-business-primary);
+  opacity: 0.45;
+}
+
+.cc-rail-resizer:focus-visible { outline: none; opacity: 0.7; }
+
+/* While a width drag is live, the whole page holds the resize cursor and
+   suspends text selection. */
+body.cc-resizing { cursor: col-resize; user-select: none; }
+
+.cc-search-count {
+  padding: 6px 10px 2px;
+  font: var(--dsw-font-xxs-12);
+  color: var(--dsw-alias-label-caption);
+}
+
 .cc-rail-list { flex: 1; overflow-y: auto; padding: 0 8px 8px; }
+
+/* ── collapsed rail strip ─────────────────────────────────── */
+.cc-rail-thin {
+  flex: none;
+  width: 44px;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-specific-sidebar-fill);
+}
+
+.cc-thin-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 12px 0;
+}
+
+.cc-thin-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+}
+
+.cc-thin-button:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+
+.cc-thin-spacer { flex: 1; }
+
+.cc-thin-foot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 0;
+}
 
 /* A project group header, mirroring the host workspace browser's project row
    (ui-workspace Rows.module.css): 34px cell, folder glyph by default, expand

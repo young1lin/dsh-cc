@@ -132,6 +132,20 @@ export function fetchModels(id: string): Promise<{
 }
 
 /**
+ * GET /models — the global catalog under the current configuration, without
+ * needing any session. Served from the CLI's resolved config (gateway aliases
+ * included), so a not-yet-created session can be given a real model choice.
+ * @returns the catalog and the plugin's configured default selection.
+ */
+export function fetchGlobalModels(): Promise<{
+  available: boolean
+  models: ModelRow[]
+  current: string
+}> {
+  return api<{ available: boolean; models: ModelRow[]; current: string }>('/models')
+}
+
+/**
  * POST /sessions/:id/model — make this the session's model.
  * @param id - session id.
  * @param model - model id or alias; empty resets to the plugin default.

@@ -91,7 +91,7 @@ const EMPTY_CATALOG: Catalog = { rows: [], current: '', effort: '' }
  * @param row - the catalog row.
  * @returns the label node for this row's menu entry.
  */
-function modelLabel(row: ModelRow): ReactElement {
+export function modelLabel(row: ModelRow): ReactElement {
   const resolved = row.resolvedModel
   const showsResolved = resolved !== undefined && resolved !== row.value
   return (
