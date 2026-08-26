@@ -6,29 +6,12 @@
  * @module dsh-cc/client/CommandMenu
  */
 
-import type { ReactElement } from 'react'
+import { useEffect, useRef, type ReactElement } from 'react'
 import type { SlashCommand } from '../types.ts'
-import { registerCss } from './css.ts'
 
-// Shares .cc-menu-pop with the mention picker: one registration, two users
-// (MentionPicker re-registers the same id harmlessly).
-registerCss('composer-menus', `
-.cc-menu-pop {
-  position: absolute; bottom: 100%; left: 12px; right: 12px; z-index: 10;
-  max-height: 240px; overflow-y: auto;
-  margin-bottom: 4px; padding: 4px;
-  border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px;
-  background: var(--dsw-alias-bg-layer-2);
-  box-shadow: var(--dsw-shadow-lv2);
-  font: var(--dsw-font-xs-13);
-}
-.cc-menu-row { display: flex; align-items: baseline; gap: 8px; padding: 4px 8px; border-radius: 6px; cursor: pointer; }
-.cc-menu-row[data-selected='true'] { background: var(--dsw-alias-bg-layer-3); }
-.cc-menu-row-name { flex: none; color: var(--dsw-alias-label-primary); }
-.cc-menu-row-args { flex: none; color: var(--dsw-alias-label-tertiary); }
-.cc-menu-row-desc { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dsw-alias-label-secondary); }
-.cc-menu-empty { padding: 8px; color: var(--dsw-alias-label-tertiary); }
-`)
+// The popup chrome (.cc-menu-pop and the row rules) lives in the composer's
+// own sheet — registerCss replaces whole sheets by id, so the shared rules
+// must have exactly one owning module (see Composer.tsx).
 
 /**
  * Filter a command list by the draft's first word: prefix match on name or
@@ -50,6 +33,8 @@ export function filterCommands(commands: readonly SlashCommand[], filter: string
  * @param props.commands - the full cached list (already filtered by the caller).
  * @param props.filter - the typed text after the slash (unused for filtering;
  *   kept for a future empty-state message).
+ * @param props.emptyHint - what the empty popup says: no catalog at all vs
+ *   no match against a known one (the caller knows which).
  * @param props.selected - the selected row index into `commands`.
  * @param props.onSelectedChange - hover/pointer moves the selection.
  * @param props.onPick - a row was activated.
@@ -58,19 +43,27 @@ export function filterCommands(commands: readonly SlashCommand[], filter: string
 export function CommandMenu(props: {
   commands: SlashCommand[]
   filter: string
+  emptyHint?: string
   selected: number
   onSelectedChange(index: number): void
   onPick(command: SlashCommand): void
 }): ReactElement {
+  // Keyboard selection must stay on screen: the list scrolls inside its
+  // 240px box, and without this the highlight walks out of view and the
+  // arrows read as dead. `nearest` only scrolls the popup, never the page.
+  const popRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    popRef.current?.querySelector<HTMLElement>('[data-selected="true"]')?.scrollIntoView({ block: 'nearest' })
+  }, [props.selected])
   if (props.commands.length === 0) {
     return (
       <div className="cc-menu-pop">
-        <div className="cc-menu-empty">没有匹配的命令</div>
+        <div className="cc-menu-empty">{props.emptyHint ?? '没有匹配的命令'}</div>
       </div>
     )
   }
   return (
-    <div className="cc-menu-pop" role="listbox">
+    <div className="cc-menu-pop" ref={popRef} role="listbox">
       {props.commands.map((command, index) => (
         <div
           key={command.name}

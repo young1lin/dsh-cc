@@ -67,6 +67,27 @@ const NO_EVENTS: CcEvent[] = []
 /** Shared empty command list, so an uncached session keeps one stable identity. */
 const NO_COMMANDS: SlashCommand[] = []
 
+/** localStorage key holding the last live slash-command catalog (see CcApp). */
+const COMMAND_CACHE_KEY = 'dsh-cc:commands-v1'
+
+/**
+ * Read the persisted slash-command catalog; anything unreadable, absent, or
+ * wrong-shaped reads as empty (the first live fetch rewrites it).
+ * @returns the cached commands, or a shared empty list.
+ */
+function readCommandCache(): SlashCommand[] {
+  try {
+    const raw = localStorage.getItem(COMMAND_CACHE_KEY)
+    if (raw === null) return NO_COMMANDS
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return NO_COMMANDS
+    return parsed.filter((item): item is SlashCommand =>
+      typeof item === 'object' && item !== null && typeof (item as SlashCommand).name === 'string')
+  } catch {
+    return NO_COMMANDS
+  }
+}
+
 /**
  * Union two views of one session's transcript by `seq`. The SSE stream and a
  * re-read snapshot can overlap arbitrarily — the same event seen over the wire
@@ -134,6 +155,14 @@ export function CcApp(props: { onClose(): void }): ReactElement {
    * ends — a catalog is readable only while the engine is live.
    */
   const [commandsBySession, setCommandsBySession] = useState<Record<string, SlashCommand[]>>({})
+  /**
+   * The last live catalog, persisted across page loads: every session runs
+   * the same CLI payload, so after ANY session has gone live once, cold
+   * sessions (a restarted dsh, a page opened before the first turn) can open
+   * the menu with it instead of claiming an empty catalog. A live fetch
+   * always wins and rewrites the cache.
+   */
+  const [cachedCommands, setCachedCommands] = useState<SlashCommand[]>(readCommandCache)
   const [connected, setConnected] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [envSessionId, setEnvSessionId] = useState<string | undefined>()
@@ -282,6 +311,24 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   }
 
   /**
+   * Adopt a freshly read catalog: per-session for freshness, and into the
+   * persistent global cache so cold sessions can open the menu after a
+   * restart.
+   * @param id - the session the catalog was read from.
+   * @param commands - the live catalog.
+   */
+  const adoptCommands = (id: string, commands: SlashCommand[]): void => {
+    setCommandsBySession(previous => ({ ...previous, [id]: commands }))
+    if (commands.length === 0) return
+    setCachedCommands(commands)
+    try {
+      localStorage.setItem(COMMAND_CACHE_KEY, JSON.stringify(commands))
+    } catch {
+      // Private mode or quota: the in-memory copy still serves this page.
+    }
+  }
+
+  /**
    * Refetch one session's slash-command catalog into the cache — the
    * composer's menu-open refresh and the turn-end warm both route here.
    * @param id - the session whose catalog to read.
@@ -289,7 +336,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   const refreshCommands = (id: string): void => {
     fetchCommands(id)
       .then(result => {
-        if (result.available) setCommandsBySession(previous => ({ ...previous, [id]: result.commands }))
+        if (result.available) adoptCommands(id, result.commands)
       })
       .catch(() => {
         // Best effort; the next menu open retries.
@@ -515,12 +562,13 @@ export function CcApp(props: { onClose(): void }): ReactElement {
     setUsage(undefined)
     refreshTelemetry(currentId)
     // The command cache loads on selection when the engine is already live
-    // (a returning visit); a cold session reads available:false and stays
-    // empty until its first turn ends or the composer's menu opens.
+    // (a returning visit); a cold session reads available:false and falls
+    // back to the persisted global catalog until its first turn ends or the
+    // composer's menu opens.
     fetchCommands(currentId)
       .then(result => {
         if (currentIdRef.current === currentId && result.available) {
-          setCommandsBySession(previous => ({ ...previous, [currentId]: result.commands }))
+          adoptCommands(currentId, result.commands)
         }
       })
       .catch(() => {
@@ -669,7 +717,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                     pinnedRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80
                   }}
                 >
-                  <Transcript events={events} commands={commandsBySession[current.id] ?? NO_COMMANDS} />
+                  <Transcript events={events} commands={commandsBySession[current.id] ?? cachedCommands} />
                   <LiveTurnView turn={live} />
                   {events.length === 0 && live === undefined
                     && <div className="cc-empty">发送第一条消息，开始与 Claude Code 对话</div>}
@@ -707,7 +755,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                 <Composer
                   sessionId={current.id}
                   cwd={current.cwd}
-                  commands={commandsBySession[current.id] ?? NO_COMMANDS}
+                  commands={commandsBySession[current.id] ?? cachedCommands}
                   onRefreshCommands={() => refreshCommands(current.id)}
                   busy={current.status === 'busy'}
                   readOnly={current.terminalOwned === true}

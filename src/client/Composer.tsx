@@ -83,6 +83,30 @@ registerCss('composer', `
  * cue, in the host's brand blue. */
 .cc-cmd-token { color: var(--dsw-alias-brand-primary); }
 
+/* Shared popup chrome for the two composer menus (slash commands and @
+   mentions). Declared here on purpose: the composer is the component that
+   always loads with either popup, and registerCss replaces a whole sheet by
+   id — a second module re-registering these rules under its own id would
+   silently drop whatever the first registered (exactly the bug that shipped
+   both menus unstyled). */
+.cc-menu-pop {
+  position: absolute; bottom: 100%; left: 12px; right: 12px; z-index: 10;
+  max-height: 240px; overflow-y: auto;
+  margin-bottom: 4px; padding: 4px;
+  border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-2);
+  box-shadow: var(--dsw-shadow-lv2);
+  font: var(--dsw-font-xs-13);
+}
+.cc-menu-row { display: flex; align-items: baseline; gap: 8px; padding: 4px 8px; border-radius: 6px; cursor: pointer; }
+/* The rail's selected-row token: bg-layer-3 reads white-on-white in light
+   themes, which made keyboard selection invisible. */
+.cc-menu-row[data-selected='true'] { background: var(--dsw-alias-interactive-bg-active); }
+.cc-menu-row-name { flex: none; color: var(--dsw-alias-label-primary); }
+.cc-menu-row-args { flex: none; color: var(--dsw-alias-label-tertiary); }
+.cc-menu-row-desc { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dsw-alias-label-secondary); }
+.cc-menu-empty { padding: 8px; color: var(--dsw-alias-label-tertiary); }
+
 /* While the mirror is up the textarea's own text goes invisible; the caret
    stays put and the placeholder keeps its own color. */
 .cc-input[data-ghost='true'] { color: transparent; caret-color: var(--dsw-alias-label-primary); }
@@ -488,6 +512,16 @@ export function Composer(props: {
                 }
                 if (event.key === 'Enter' || event.key === 'Tab') {
                   event.preventDefault()
+                  const count = menu.kind === 'command' ? filteredCommands.length : mentionRows.length
+                  if (count === 0) {
+                    // Nothing to complete — the menu is advisory, like the
+                    // CLI's: Enter sends the draft exactly as typed (an
+                    // unknown /command reaches the CLI, which answers for
+                    // itself); Tab only closes.
+                    setMenu(undefined)
+                    if (event.key === 'Enter') submit()
+                    return
+                  }
                   if (menu.kind === 'command') {
                     const command = filteredCommands[menuIndex]
                     if (command !== undefined) insertCommand(command.name)
@@ -514,6 +548,9 @@ export function Composer(props: {
           <CommandMenu
             commands={filteredCommands}
             filter={menu.filter}
+            emptyHint={props.commands.length === 0
+              ? '命令列表将在会话首次对话后可用'
+              : '没有匹配的命令，Enter 将原样发送'}
             selected={menuIndex}
             onSelectedChange={setMenuIndex}
             onPick={command => insertCommand(command.name)}

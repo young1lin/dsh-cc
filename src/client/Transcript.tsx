@@ -353,6 +353,10 @@ function EventItem(props: {
         const reason = event.errors?.join('；') ?? event.terminalReason ?? event.subtype
         return <div className="cc-fail">回合异常结束：{reason}</div>
       }
+      // A zero-turn result closes a local slash command's bypass: the
+      // command's own output and notices already ride their rows, and
+      // 「0 步 · 0.0s · 输入 0 · 输出 0」 under them is pure noise.
+      if (event.numTurns === 0) return null
       const parts = tailParts(event)
       return (
         <div className="cc-tail">

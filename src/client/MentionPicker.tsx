@@ -8,11 +8,13 @@
  * @module dsh-cc/client/MentionPicker
  */
 
-import type { ReactElement } from 'react'
+import { useEffect, useRef, type ReactElement } from 'react'
 import { registerCss } from './css.ts'
 
-// Same sheet as CommandMenu (see the note there).
-registerCss('composer-menus', `
+// Only the folder marker is picker-specific: the popup chrome and row rules
+// are shared and live in the composer's sheet (registerCss replaces whole
+// sheets by id, so shared rules have exactly one owner — see Composer.tsx).
+registerCss('mention-picker', `
 .cc-menu-row-folder::after { content: '/'; color: var(--dsw-alias-label-tertiary); }
 `)
 
@@ -78,8 +80,14 @@ export function MentionPicker(props: {
   onSelectedChange(index: number): void
   onActivate(index: number): void
 }): ReactElement {
+  // Same follow-the-selection scroll as the command menu (see the note
+  // there): the highlighted row stays inside the popup's scroll box.
+  const popRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    popRef.current?.querySelector<HTMLElement>('[data-selected="true"]')?.scrollIntoView({ block: 'nearest' })
+  }, [props.selected])
   return (
-    <div className="cc-menu-pop" role="listbox">
+    <div className="cc-menu-pop" ref={popRef} role="listbox">
       {props.loading && <div className="cc-menu-empty">读取目录中…</div>}
       {!props.loading && props.rows.length === 0 && <div className="cc-menu-empty">没有匹配的文件</div>}
       {props.rows.map((row, index) => (
