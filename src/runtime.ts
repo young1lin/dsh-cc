@@ -75,6 +75,7 @@ const SILENT_HOOKS: EngineHooks = {
   permissionRequest: () => {},
   dialogRequest: () => {},
   tasks: () => {},
+  telemetry: () => {},
 }
 
 /**
@@ -1150,6 +1151,9 @@ export class CcRuntime {
       },
       tasks: rows => {
         this.broadcast({ t: 'tasks', sessionId, tasks: rows })
+      },
+      telemetry: payload => {
+        this.broadcast({ t: 'telemetry', sessionId, ...payload })
       },
       onEngineFailure: async error => {
         await this.recoverWithLastGoodModel(sessionId, error)

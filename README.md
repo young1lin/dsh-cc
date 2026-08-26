@@ -17,7 +17,7 @@ dsh-cc 是一个 DSH 外挂双面插件：在 DSH Web GUI 右缘加入一个 **C
 - **@ 文件/文件夹提及**：打 `@` 即全项目模糊搜索 —— 一次有界索引（5000 行 / 层 2000 / 深 16，忽略 node_modules、`.git` 等重目录）覆盖整个工作目录，子序列匹配（`mc` 找 `mention-core`）按 basename 精确>前缀>连续>子序列排名；输入绝对路径则实时列出该目录子项导航盘上任何位置。↑↓/PageUp/PageDown/Home/End 选择，Enter/Tab 插入（整段替换半打的 token、自动补尾空格、文件夹补 `/`）；手打的 `@相对路径` / `@绝对路径` 同样生效 —— 文件内容与文件夹目录树随消息注入上下文（总量上限 1MB）
 - **文件路径点击查看**：对话文本里反引号包裹的文本文件路径（带分隔符或绝对路径 + 已知文本扩展名）可点击打开查看器，显示磁盘最新内容（行号 + 语法高亮，> 2MB 截断）
 - **图片输入**：粘贴或拖入图片（每张 ≤ 5MB）随消息发送，转录回读同一份内容寻址存储
-- **用量与上下文读数**：状态栏显示模型 / 档位选择、上下文窗口占用与账户用量
+- **用量与上下文读数**：状态栏显示模型 / 档位选择、上下文窗口占用与账户用量；每次模型响应完成后经 SSE 自动刷新一次（CLI statusline 的节奏 —— 按响应计，不按流式增量计）
 - 会话持久化：JSONL 转录存放在数据目录，重启 DSH 后会话列表与记录仍在；继续对话自动通过 Claude 原生 session resume
 - 环境变量可配置：`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL`、`HTTPS_PROXY` 等任意变量，通过 profile 的 cordis.patch.yml、结构化 provider 字段或页内设置面板注入
 - **环境预设一键切换**：设置面板顶部预设条（首启自动播种「账号直连」＝只剩代理、「GLM 中转」＝快照本机 GLM 网关配置）。激活的预设整体接管服务商键域——没列出的变量一律从生效环境里移除，**包括 dsh 进程继承的用户级环境变量**（逐键覆盖做不到的删除语义）；可另存 / 删除预设，激活时保存会把表单同步进该预设
@@ -180,7 +180,7 @@ C:/PythonProject/dev/dsh-cc
 | POST | /cc/api/sessions/:id/tasks/:taskId/background | 把前台任务转后台继续跑（CLI 的 Ctrl+B 等价物） |
 | POST | /cc/api/sessions/:id/dialogs/:requestId | 应答 AskUserQuestion（`cancel: true` 取消） |
 | POST | /cc/api/sessions/:id/permissions/:requestId | 权限审批（allow / deny，可选 message 与 remember 目标） |
-| GET | /cc/api/events | SSE 实时推送（hello / sessions / event / delta / permission / dialog / tasks …） |
+| GET | /cc/api/events | SSE 实时推送（hello / sessions / event / delta / permission / dialog / tasks / telemetry …） |
 
 ## 已知限制
 

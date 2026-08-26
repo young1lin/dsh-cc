@@ -528,3 +528,9 @@ export type WireMessage =
   | { t: 'dialog'; sessionId: string; request: { id: string; kind: string; payload: Record<string, unknown> } }
   | { t: 'dialog-done'; sessionId: string; requestId: string }
   | { t: 'tasks'; sessionId: string; tasks: TaskRow[] }
+  /**
+   * Telemetry refreshed after one completed model response (the statusline
+   * cadence). Payloads are the CLI control channel's answers, passed through
+   * in the same shape the /context and /usage endpoints return.
+   */
+  | { t: 'telemetry'; sessionId: string; context?: unknown; usage?: unknown }

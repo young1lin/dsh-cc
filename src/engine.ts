@@ -60,6 +60,11 @@ export interface EngineHooks {
   dialogRequest(request: DialogRequest): void
   /** Publish the session's whole task table; display state, never persisted. */
   tasks(rows: TaskRow[]): void
+  /**
+   * Publish a telemetry snapshot (context accounting, plan usage) probed
+   * after each completed model response — the statusline cadence.
+   */
+  telemetry(payload: TelemetrySnapshot): void
   /** Optional failure hook: the runtime may auto-recover with a fallback model. */
   onEngineFailure?(error: Error): Promise<void> | void
 }
@@ -69,6 +74,18 @@ export interface SendImage {
   mediaType: ImageRef['mediaType']
   /** Base64 body without a data: URL prefix. */
   data: string
+}
+
+/**
+ * One telemetry push: the control channel's context-accounting and usage
+ * answers, passed through as the CLI shaped them. Either half may be absent
+ * when its probe failed; presence is the signal the page renders on.
+ */
+export interface TelemetrySnapshot {
+  /** Context-window breakdown (getContextUsage's answer). */
+  context?: unknown
+  /** Session cost plus plan rate-limit windows (the usage probe's answer). */
+  usage?: unknown
 }
 
 /** One blocking dialog awaiting a page answer. */
@@ -389,6 +406,36 @@ export class SessionEngine {
       return await this.query?.getContextUsage()
     } catch {
       return undefined
+    }
+  }
+
+  /** Whether a telemetry probe is running; a second trigger is dropped, not queued. */
+  private telemetryInFlight = false
+
+  /**
+   * Probe both telemetry readouts and hand the answers to the host for
+   * broadcast. Fired once per completed model response — the low frequency
+   * is the point (the page's status bar follows the turn, not the stream).
+   * A probe already in flight swallows the trigger: queueing would replay a
+   * stale moment's answer after the next response already completed, and the
+   * next completed response fires a fresh one anyway.
+   */
+  private async pushTelemetry(): Promise<void> {
+    if (this.telemetryInFlight || this.closed) return
+    this.telemetryInFlight = true
+    try {
+      const [context, usage] = await Promise.all([
+        this.getContextUsage(),
+        this.getUsage(),
+      ])
+      if (context !== undefined || usage !== undefined) {
+        this.hooks.telemetry({
+          ...(context !== undefined ? { context } : {}),
+          ...(usage !== undefined ? { usage } : {}),
+        })
+      }
+    } finally {
+      this.telemetryInFlight = false
     }
   }
 
@@ -802,6 +849,13 @@ export class SessionEngine {
         // the envelope; without this the failure never reaches the transcript.
         if (!emittedText && message.error !== undefined) {
           this.publish({ kind: 'assistant', text: '', ...outcome })
+        }
+        // A successful main-thread response has just completed — exactly the
+        // moment the CLI's statusline refreshes. Probe the telemetry readouts
+        // now (per response, never per delta); subagent envelopes carry their
+        // own little contexts and say nothing about the main thread.
+        if (message.error === undefined && message.parent_tool_use_id === null) {
+          void this.pushTelemetry()
         }
         return
       }

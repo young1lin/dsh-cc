@@ -561,6 +561,16 @@ export function CcApp(props: { onClose(): void }): ReactElement {
           // authoritative fold, so partial merges would only add staleness.
           setTasksBySession(previous => ({ ...previous, [message.sessionId]: message.tasks }))
           break
+        case 'telemetry': {
+          // Refreshed once per completed model response (the statusline
+          // cadence) — no polling, no per-delta churn. Only the watched
+          // session's status bar shows these; a background session's frame
+          // is dropped here and refetched on switch.
+          if (message.sessionId !== currentIdRef.current) break
+          if (message.context !== undefined) setContext(message.context as ContextUsage)
+          if (message.usage !== undefined) setUsage(message.usage as UsageInfo)
+          break
+        }
         default:
           // An unknown frame from a newer node half is ignored rather than
           // breaking the stream.

@@ -40,7 +40,7 @@ node 半区各模块（读懂 catalog 这一层是理解全局的关键）：
 | 模块 | 职责 |
 |---|---|
 | `runtime.ts` | `/cc/api` HTTP 面：REST 变更 + SSE 推送；重扫 catalog（有页面接入 2s / 无人接入 30s），有变化才广播 `sessions` 帧 |
-| `engine.ts` | 每会话一个 SDK query：流式多轮、`canUseTool` 权限桥；关掉的引擎下次发消息按原生 id resume；`maxLiveSessions` LRU 挤出 |
+| `engine.ts` | 每会话一个 SDK query：流式多轮、`canUseTool` 权限桥；每个成功完成的主线模型响应后探测一次遥测（context/usage）并经 SSE `telemetry` 帧推送 —— 按响应计频，探测在途时丢弃新触发而不排队；关掉的引擎下次发消息按原生 id resume；`maxLiveSessions` LRU 挤出 |
 | `catalog.ts` | **统一会话目录**：CLI 自己的磁盘存储 + dsh-cc sidecar 合并成一张列表 |
 | `native-sessions.ts` / `native-transcript.ts` | 适配 CLI 原生存储（`~/.claude/projects/<encoded-cwd>/<id>.jsonl`）到 `SessionMeta` |
 | `peer-sessions.ts` | 只读观察 `~/.claude/sessions/<pid>.json` 活进程注册表，得出 `terminalOwned` |
