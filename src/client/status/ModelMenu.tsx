@@ -111,7 +111,7 @@ export function modelLabel(row: ModelRow): ReactElement {
  * @param props.busy - whether a turn is running on this session.
  * @returns the two picker controls.
  */
-export function ModelMenu(props: { sessionId: string; busy: boolean }): ReactElement {
+export function ModelMenu(props: { sessionId: string; busy: boolean; openSignal?: number }): ReactElement {
   const [catalog, setCatalog] = useState<Catalog>(EMPTY_CATALOG)
   const [openMenu, setOpenMenu] = useState<'model' | 'effort' | null>(null)
   /** Bumped to re-read the catalog; see the turn-start effect below. */
@@ -121,6 +121,13 @@ export function ModelMenu(props: { sessionId: string; busy: boolean }): ReactEle
   const failureTimer = useRef<ReturnType<typeof setTimeout>>(undefined)
 
   useEffect(() => () => clearTimeout(failureTimer.current), [])
+
+  // Alt+P reaches this menu from outside: the surface bumps the signal and
+  // the menu opens itself — the open state stays local (nothing lifted), and
+  // the unset default of 0 never opens anything on mount.
+  useEffect(() => {
+    if (props.openSignal !== undefined && props.openSignal > 0) setOpenMenu('model')
+  }, [props.openSignal])
 
   /**
    * Show the one-line switch failure and clear it again after a moment, so

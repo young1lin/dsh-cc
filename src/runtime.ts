@@ -14,17 +14,19 @@ import {
   applyConfigDir, CONFIG_DIR_ENV, normalizeAccounts, resolveAccountDir, restoreConfigDir, sameDir,
 } from './accounts.ts'
 import type { ResolvedConfig } from './config.ts'
-import { SessionEngine, resolveSessionModel, resolveSessionPermissionMode, type EngineHooks, type SendImage } from './engine.ts'
+import { SessionEngine, resolveSessionModel, resolveSessionPermissionMode, type EngineHooks, type QueuedMessage, type SendImage } from './engine.ts'
 import { BlobStore, isImageMediaType } from './blobs.ts'
+import { cachedCommands, rememberCommands } from './command-cache.ts'
 import { SessionCatalog } from './catalog.ts'
 import { fileIndexFor } from './file-index.ts'
 import { effectiveEnvEntries, maskSecret, readDirListing, readSdkVersion, readTextFile } from './http-support.ts'
 import { reduceDelta, type LiveTurn } from './live-turn.ts'
-import { deleteNativeSession, renameNativeSession } from './native-sessions.ts'
+import { deleteNativeSession, forkNativeSession, renameNativeSession } from './native-sessions.ts'
 import { SessionStore } from './store.ts'
 import type {
   AccountSummary, CcAccount, CcEvent, CcEventInput, CcSettings, ConfigSummary, EffortLevel, EnvPreset,
-  ImageRef, LiveTurnSnapshot, PermissionDestination, PermissionModeValue, SessionMeta, TaskRow, WireMessage,
+  ImageRef, LiveTurnSnapshot, PermissionDestination, PermissionModeValue, QueuedMessageView, SessionMeta, TaskRow,
+  WireMessage,
 } from './types.ts'
 import {
   DEFAULT_EFFORT_LEVELS, MEDIA_TYPE_EXTENSIONS, PERMISSION_MODE_VALUES, PROVIDER_ENV_NAMES, TERMINAL_TASK_STATUSES,
@@ -140,6 +142,14 @@ export class CcRuntime {
   /** Image bytes attached to user messages. */
   private readonly blobs: BlobStore
   private readonly engines = new Map<string, SessionEngine>()
+  /**
+   * Undelivered queued messages orphaned by a dead engine, keyed by session
+   * id. They never reached the CLI, so they cost nothing to hold: the next
+   * engine for the session re-enters them in their original order (see
+   * {@link restoreRetainedQueue}), and the queue endpoints serve them while
+   * no live engine holds the session's queue.
+   */
+  private readonly retainedQueues = new Map<string, QueuedMessage[]>()
   /**
    * The in-flight turn per session, folded from the same deltas the page
    * receives. This is what a page that arrives mid-turn is handed, so a
@@ -742,6 +752,11 @@ export class CcRuntime {
           // destroys nothing — the conversation resumes on the next send.
           await this.closeEngine(key)
           if (id !== key) await this.closeEngine(id)
+          // The retained carry-over of any dead engine dies with the session:
+          // a resurrected row (the rescan re-adopting its native twin) must
+          // not inherit messages meant for the deleted conversation.
+          this.retainedQueues.delete(key)
+          if (id !== key) this.retainedQueues.delete(id)
           this.liveSeqs.delete(key)
           if (claudeSessionId !== undefined) {
             try {
@@ -932,10 +947,22 @@ export class CcRuntime {
         if (parts.length === 3 && parts[2] === 'commands' && method === 'GET') {
           const engine = this.liveEngine(id)
           if (engine === undefined) {
-            return json(res, { available: false, commands: [] })
+            // 冷会话回退：这个账号+项目上一次活进程报告过的目录。带 savedAt 让
+            // 页面可标注「来自缓存」；两者皆无才是真正的空目录（首条消息后会补上）。
+            const session = this.store.get(id)
+            const fallback = session === undefined
+              ? undefined
+              : cachedCommands(this.baseConfig.dataDir, this.activeConfigDir(), session.cwd)
+            if (fallback === undefined) return json(res, { available: false, commands: [] })
+            return json(res, { available: true, commands: fallback.commands, stale: true, savedAt: fallback.savedAt })
           }
           const commands = await engine.supportedCommands()
           if (commands === undefined) return json(res, { available: false, commands: [] })
+          // 活目录到手即记档：这个 (configDir, cwd) 对下一次冷会话的回退来源。
+          const session = this.store.get(id)
+          if (session !== undefined && commands.length > 0) {
+            rememberCommands(this.baseConfig.dataDir, this.activeConfigDir(), session.cwd, commands)
+          }
           return json(res, { available: true, commands })
         }
         if (parts.length === 3 && parts[2] === 'stop' && method === 'POST') {
@@ -943,6 +970,63 @@ export class CcRuntime {
           if (!engine) return json(res, { error: '会话没有正在运行的进程' }, 404)
           await engine.interrupt()
           return json(res, { ok: true })
+        }
+        if (parts.length === 3 && parts[2] === 'fork' && method === 'POST') {
+          const session = this.store.get(id) ?? await this.catalog.adopt(id)
+          if (!session) return json(res, { error: '会话不存在' }, 404)
+          if (session.claudeSessionId === undefined) {
+            return json(res, { error: '草稿会话无可分叉内容' }, 400)
+          }
+          // A busy engine is appending to the very transcript about to be
+          // copied; a half-turn slice would fork a torn conversation, so the
+          // fork waits for the turn to finish instead.
+          if (this.liveEngine(session.id)?.busy === true) {
+            return json(res, { error: '回合进行中，稍后再试' }, 409)
+          }
+          const body = await readJson(req)
+          const upToMessageId = typeof body?.upToMessageId === 'string' && body.upToMessageId !== ''
+            ? body.upToMessageId
+            : undefined
+          const title = typeof body?.title === 'string' && body.title.trim() !== '' ? body.title.trim() : undefined
+          const forked = await forkNativeSession(session.claudeSessionId, {
+            cwd: session.cwd,
+            ...(upToMessageId !== undefined ? { upToMessageId } : {}),
+            ...(title !== undefined ? { title } : {}),
+          })
+          // The fork is a native session like any other: it joins the list
+          // through the regular rescan/adopt path. Refreshing once here puts
+          // it in the broadcast frame immediately instead of up to one rescan
+          // tick later.
+          if (await this.catalog.refresh()) this.broadcastSessions()
+          return json(res, { sessionId: forked.sessionId })
+        }
+        if (parts.length === 3 && parts[2] === 'rewind-preview' && method === 'POST') {
+          return await this.rewindFiles(id, req, res, true)
+        }
+        if (parts.length === 3 && parts[2] === 'rewind' && method === 'POST') {
+          return await this.rewindFiles(id, req, res, false)
+        }
+        if (parts.length === 3 && parts[2] === 'queue' && method === 'GET') {
+          const session = this.store.get(id)
+          if (!session) return json(res, { error: '会话不存在' }, 404)
+          // The retained half (a dead engine's carry-over) precedes the live
+          // engine's queue: those messages were queued first and deliver first.
+          const retained = this.retainedQueues.get(session.id) ?? []
+          const queued = this.liveEngine(session.id)?.queuedItems() ?? []
+          return json(res, { items: [...retained, ...queued].map(queuedMessageView) })
+        }
+        if (parts.length === 4 && parts[2] === 'queue' && method === 'DELETE') {
+          const session = this.store.get(id)
+          if (!session) return json(res, { error: '会话不存在' }, 404)
+          const uuid = parts[3] ?? ''
+          const removed = this.removeRetainedQueued(session.id, uuid)
+            ?? this.liveEngine(session.id)?.removeQueued(uuid)
+          if (removed === undefined) return json(res, { error: '该消息已投递或不存在' }, 404)
+          // The engine patch (when the live half served the recall) plus this
+          // combined count agree in every single-half case; the belt-and-braces
+          // rewrite keeps the promise when both halves are non-empty at once.
+          await this.patchMeta(session.id, { queued: this.queuedTotal(session.id) })
+          return json(res, { item: queuedMessageView(removed) })
         }
         if (parts.length === 5 && parts[2] === 'tasks' && method === 'POST') {
           return await this.controlTask(id, parts[3] ?? '', parts[4] ?? '', res)
@@ -1032,6 +1116,10 @@ export class CcRuntime {
    * @param engine - the exact engine that ended.
    */
   private retireEngine(id: string, engine: SessionEngine): void {
+    // The queue hand-off runs before the identity check: a replacement may
+    // already hold the slot, but the dying engine's undelivered entries
+    // belong to the session either way and must not die with the object.
+    this.retainEngineQueue(id, engine)
     if (this.engines.get(id) !== engine) return
     this.engines.delete(id)
     // A closed/replaced engine can still be mid-fold; its live turn dies with
@@ -1053,6 +1141,29 @@ export class CcRuntime {
     const images = readImageRefs(body?.images)
     if (text.trim().length === 0 && images.length === 0) {
       return json(res, { error: '消息不能为空' }, 400)
+    }
+    // Shell mode (leading '!'): the line runs in the session cwd through the
+    // host's own runner, its output becomes a commandOutput row, and the
+    // wrapped report rides into the conversation as the CLI's shell mode
+    // does. An approval posture (default/plan) refuses rather than silently
+    // bypassing the posture - switch modes to run shell lines directly.
+    const shellMatch = /^!\s*(.+)$/s.exec(text.trimStart())
+    if (shellMatch !== null && images.length === 0) {
+      const shellKey = session.id
+      const shellEngine = this.liveEngine(shellKey)
+      if (shellEngine === undefined) return json(res, { error: '会话没有正在运行的进程' }, 404)
+      const shellMode = session.permissionMode || this.baseConfig.permissionMode
+      const approve = shellMode === 'default' || shellMode === 'plan'
+        ? async () => {
+            await this.emitEvent(shellKey, { kind: 'notice', level: 'warning', text: '当前权限模式需要审批才能执行 shell 命令；切换到接受编辑/自动等模式后可直接运行' })
+            return false
+          }
+        : async () => true
+      await this.emitEvent(shellKey, { kind: 'user', text })
+      void shellEngine.runShell(shellMatch[1] ?? '', shellMode, approve).catch(error => {
+        this.ctx.logger?.warn?.('dsh-cc: shell 模式执行失败 ' + String(error))
+      })
+      return json(res, { ok: true }, 202)
     }
     // Resolve every reference before starting the turn: a message whose image
     // has been evicted must fail as a request, not half-send.
@@ -1081,6 +1192,11 @@ export class CcRuntime {
       engine = this.liveEngine(key)
     }
     if (engine === undefined) engine = this.startEngine(session, session.model)
+    // A previous engine may have died holding undelivered messages — they
+    // never reached the CLI, so they re-enter ahead of this send, original
+    // order first. A live engine that already holds a queue keeps them ahead
+    // of anything queued after the death.
+    this.restoreRetainedQueue(key, engine)
     // CLI-parity titling: a page-created draft's first user message becomes
     // its name, unless the user titled the session by hand first. The
     // `claudeSessionId === undefined` guard keeps adopted CLI sessions out:
@@ -1107,6 +1223,34 @@ export class CcRuntime {
     await this.store.incrementMessageCount(key)
     await this.patchMeta(key, { status: 'busy', lastError: undefined })
     return json(res, { ok: true }, 202)
+  }
+
+  /**
+   * Shared body of the rewind-preview and rewind endpoints: both ask a live
+   * engine's control channel to restore tracked files to their state at one
+   * user message, differing only in the dryRun flag. The CLI's answer is
+   * passed through verbatim; a refusal (canRewind false) keeps its body but
+   * answers 409 so the page's generic error path shows the CLI's own reason,
+   * while a failing control channel is a plain 500.
+   * @param id - the session id (page id or native id).
+   * @param req - the request carrying { userMessageId }.
+   * @param res - the response to answer on.
+   * @param dryRun - true to preview the file changes without applying them.
+   */
+  private async rewindFiles(id: string, req: IncomingMessage, res: ServerResponse, dryRun: boolean): Promise<void> {
+    const engine = this.liveEngine(id)
+    if (engine === undefined) return json(res, { error: '先发一条消息启动会话' }, 404)
+    const body = await readJson(req)
+    const userMessageId = typeof body?.userMessageId === 'string' ? body.userMessageId : ''
+    if (userMessageId === '') return json(res, { error: '缺少 userMessageId' }, 400)
+    let result: Awaited<ReturnType<SessionEngine['rewindFiles']>>
+    try {
+      result = await engine.rewindFiles(userMessageId, dryRun)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return json(res, { error: message }, 500)
+    }
+    return json(res, result, result.canRewind ? 200 : 409)
   }
 
   private async answerPermission(
@@ -1218,18 +1362,23 @@ export class CcRuntime {
       const from = session.model
       const fallback = session.lastGoodModel
       if (fallback === undefined || fallback === '' || fallback === from) return
-      // The dead engine knows what it was given, attachments included. Reading
-      // it back out of the transcript instead would resolve to some earlier
-      // message: a CLI-owned session's store is read as a bounded tail, and the
-      // failed turn's own record is written by the process that just died.
-      const replay = this.engines.get(sessionId)?.lastSend
-      if (replay === undefined) return
       const dead = this.engines.get(sessionId)
+      // Replay only what was actually in flight when the process died. A
+      // termination that caught no turn running has nothing to replay — the
+      // last delivered message is already committed in the CLI's store — and
+      // anything still queued returns through the retained hand-off below
+      // instead of through a replay.
+      const replay = dead?.endedBusy === true ? dead.lastSend : undefined
+      if (replay === undefined) return
       const engine = this.startEngine(session, fallback)
       // Close the spent engine before the replay: closing denies whatever it
       // left pending. Its slot is already taken, so this close cannot unseat
-      // the replacement.
-      if (dead !== undefined && dead !== engine) await dead.close()
+      // the replacement. The undelivered queue is carried over first — an
+      // explicitly closed engine's end-of-life callback never runs.
+      if (dead !== undefined && dead !== engine) {
+        this.retainEngineQueue(sessionId, dead)
+        await dead.close()
+      }
       await this.patchMeta(sessionId, { model: fallback, lastError: undefined, status: 'idle' })
       await this.emitEvent(sessionId, {
         kind: 'system',
@@ -1238,6 +1387,9 @@ export class CcRuntime {
       })
       this.ctx.logger?.warn?.(`dsh-cc: session ${sessionId} fell back to ${fallback}: ${error.message}`)
       await engine.send(replay.text, replay.images)
+      // The dead engine's undelivered queue rides behind the replayed turn,
+      // original order intact; the replayed message itself is not in it.
+      this.restoreRetainedQueue(sessionId, engine)
       this.refreshAccount(engine)
       // Same death-race guard as the send path: a replacement that died
       // before this line has already written its own terminal status.
@@ -1306,6 +1458,65 @@ export class CcRuntime {
    */
   private taskSnapshot(sessionId: string): TaskRow[] {
     return this.liveEngine(sessionId)?.taskRows() ?? []
+  }
+
+  /**
+   * Carry a dying engine's undelivered queue into the retained map, where
+   * the next engine for the session re-enters it ({@link restoreRetainedQueue}).
+   * @param id - the session id; also the retained map's key.
+   * @param engine - the engine whose queue to carry over.
+   */
+  private retainEngineQueue(id: string, engine: SessionEngine): void {
+    const entries = engine.takeQueued()
+    if (entries.length === 0) return
+    // Entries already retained are older than anything this engine still
+    // held, so they keep their place ahead of the taken ones.
+    this.retainedQueues.set(id, [...(this.retainedQueues.get(id) ?? []), ...entries])
+  }
+
+  /**
+   * Re-enter a session's retained queue into its current engine. Called from
+   * the send paths around the send itself, so the entries keep their
+   * original order relative to the new message. An engine that cannot take
+   * them (already closed or dead) keeps them retained — the next engine
+   * picks them up; nothing is dropped on the floor.
+   * @param sessionId - the session whose retained queue applies.
+   * @param engine - the engine the entries go to.
+   */
+  private restoreRetainedQueue(sessionId: string, engine: SessionEngine): void {
+    const retained = this.retainedQueues.get(sessionId)
+    if (retained === undefined) return
+    if (engine.isClosed || engine.isDead) return
+    this.retainedQueues.delete(sessionId)
+    engine.restoreQueue(retained)
+  }
+
+  /**
+   * Recall one message from the retained half of a session's queue.
+   * @param id - the session id.
+   * @param uuid - the queued message's id.
+   * @returns the removed entry, or undefined when the retained half does not hold it.
+   */
+  private removeRetainedQueued(id: string, uuid: string): QueuedMessage | undefined {
+    const retained = this.retainedQueues.get(id)
+    if (retained === undefined) return undefined
+    const index = retained.findIndex(entry => entry.uuid === uuid)
+    if (index < 0) return undefined
+    const [removed] = retained.splice(index, 1)
+    if (retained.length === 0) this.retainedQueues.delete(id)
+    return removed
+  }
+
+  /**
+   * The whole undelivered count for one session: the live engine's queue
+   * plus the retained carry-over — together exactly the number the sessions
+   * frame's `queued` field promises.
+   * @param id - the session id.
+   * @returns live plus retained queued messages.
+   */
+  private queuedTotal(id: string): number {
+    return (this.liveEngine(id)?.queuedItems().length ?? 0)
+      + (this.retainedQueues.get(id)?.length ?? 0)
   }
 
   /**
@@ -1466,6 +1677,9 @@ export class CcRuntime {
     // A closed engine can still be mid-turn (recycling, disposal); its fold
     // would never be cleared by a result event, so it dies with the engine.
     this.liveTurns.delete(id)
+    // An explicitly closed engine's finish() skips the end-of-life callback,
+    // so its undelivered queue is carried over here or never.
+    this.retainEngineQueue(id, engine)
     await engine.close()
   }
 }
@@ -1571,6 +1785,22 @@ function sameEnv(left: Readonly<Record<string, string>>, right: Readonly<Record<
     if (left[key] !== right[key]) return false
   }
   return true
+}
+
+/**
+ * The wire shape of one queued message: identity, body, enqueue time, and
+ * the attachment count. The built SDK message and its base64 image bodies
+ * stay host-side — a recall returns to the composer as text, never payload.
+ * @param entry - the queued entry.
+ * @returns the GET/DELETE response row.
+ */
+function queuedMessageView(entry: QueuedMessage): QueuedMessageView {
+  return {
+    uuid: entry.uuid,
+    text: entry.text,
+    queuedAt: entry.queuedAt,
+    imageCount: entry.images.length,
+  }
 }
 
 /** Rule destinations the CLI accepts; anything else from the page is dropped. */

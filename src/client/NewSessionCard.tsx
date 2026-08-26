@@ -1,6 +1,7 @@
 /**
  * The new-session card: a compact fixed-position popover collecting a working
- * directory and a model, replacing the old inline rail form.
+ * directory, a model, and an optional session name (blank = auto-named from
+ * the first message), replacing the old inline rail form.
  *
  * The card is portaled to document.body and positioned from the anchor's
  * rect (below it, or to its right against the collapsed strip). Its z-index
@@ -98,10 +99,11 @@ export function NewSessionCard(props: {
   side?: 'below' | 'right'
   config: ConfigSummary | undefined
   onCancel(): void
-  onCreate(form: { cwd?: string; model?: string }): void
+  onCreate(form: { cwd?: string; model?: string; name?: string }): void
 }): ReactElement {
   const [cwd, setCwd] = useState(props.config?.defaultCwd ?? '')
   const [model, setModel] = useState('')
+  const [name, setName] = useState('')
   const [rows, setRows] = useState<ModelRow[]>([])
   const [modelMenuOpen, setModelMenuOpen] = useState(false)
   const [picking, setPicking] = useState(false)
@@ -225,11 +227,15 @@ export function NewSessionCard(props: {
           onClose={() => { setModelMenuOpen(false) }}
         />
       </div>
+      <div className="cc-field">
+        会话名称
+        <Input value={name} placeholder="留空则按首条消息自动命名" onChange={event => setName(event.target.value)} />
+      </div>
       <div className="cc-row">
         <Button
           variant="primary"
           size="sm"
-          onClick={() => props.onCreate({ cwd: cwd || undefined, model: model || undefined })}
+          onClick={() => props.onCreate({ cwd: cwd || undefined, model: model || undefined, name: name.trim() || undefined })}
         >
           创建
         </Button>

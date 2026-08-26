@@ -15,6 +15,19 @@ import type { FileIndexRow } from '../types.ts'
 /** A menu row is an index row: a workspace-relative (or absolute) POSIX path. */
 export type MenuRow = FileIndexRow
 
+/**
+ * A ranked row carrying where the query matched it, so the roster can
+ * highlight the matched characters. Ranking order is untouched — the
+ * positions ride along on data the ranker already computed.
+ */
+export interface RankedRow extends MenuRow {
+  /**
+   * Ascending indices into `path` of the matched characters; absent when the
+   * row was not ranked against a query (bare '@', the absolute-reference row).
+   */
+  readonly matched?: readonly number[]
+}
+
 /** Rendered-row cap; the viewport scrolls beyond it. */
 export const MAX_MENU_ROWS = 50
 
@@ -208,23 +221,29 @@ const byListingOrder = (a: MenuRow, b: MenuRow): number =>
  * keeps the listing order (dot-names last).
  * @param entries - the directory listing's child rows.
  * @param fragment - the basename fragment typed after the last separator.
- * @returns the children in pick order.
+ * @returns the children in pick order, each ranked row carrying where the
+ *   fragment matched its full path.
  */
-export function rankDirChildren(entries: readonly MenuRow[], fragment: string): readonly MenuRow[] {
+export function rankDirChildren(entries: readonly MenuRow[], fragment: string): readonly RankedRow[] {
   const ordered = [...entries].sort(byListingOrder)
   if (fragment === '') return ordered
-  const scored: { readonly row: MenuRow; readonly tier: number; readonly score: number }[] = []
+  const scored: { readonly row: MenuRow; readonly tier: number; readonly score: number; readonly hit: FuzzyHit }[] = []
   for (const row of entries) {
     const base = baseName(row.path)
     const hit = fuzzyMatch(base, fragment)
     if (hit === null) continue
     const tier = base.toLowerCase() === fragment.toLowerCase() ? 0 : base.toLowerCase().startsWith(fragment.toLowerCase()) ? 1 : 2
-    scored.push({ row, tier, score: hit.score })
+    scored.push({ row, tier, score: hit.score, hit })
   }
   if (scored.length === 0) return ordered
   return scored
     .sort((a, b) => a.tier - b.tier || b.score - a.score || (a.row.path < b.row.path ? -1 : a.row.path > b.row.path ? 1 : 0))
-    .map(entry => entry.row)
+    .map(entry => {
+      // The fragment matched the child's own name; shift those indices past
+      // the directory prefix so they point into the row's full path.
+      const offset = entry.row.path.length - baseName(entry.row.path).length
+      return { ...entry.row, matched: entry.hit.positions.map(at => at + offset) }
+    })
 }
 
 /** How the query relates to a row's basename; lower tiers rank higher. */
@@ -261,20 +280,21 @@ export function matchRow(row: MenuRow, query: string): { readonly tier: number; 
  * @param rows - the session's settled index.
  * @param query - the typed token body.
  * @param limit - rendered-row cap.
- * @returns the ranked, capped roster.
+ * @returns the ranked, capped roster, each row carrying where the query
+ *   matched it for the roster's highlight.
  */
 export function filterRows(
   rows: readonly MenuRow[],
   query: string,
   limit: number = MAX_MENU_ROWS,
-): readonly MenuRow[] {
+): readonly RankedRow[] {
   if (query === '') {
     return [...rows].sort(byListingOrder).slice(0, limit)
   }
-  const scored: { readonly row: MenuRow; readonly tier: number; readonly score: number }[] = []
+  const scored: { readonly row: MenuRow; readonly tier: number; readonly score: number; readonly hit: FuzzyHit }[] = []
   for (const row of rows) {
     const matched = matchRow(row, query)
-    if (matched !== null) scored.push({ row, tier: matched.tier, score: matched.hit.score })
+    if (matched !== null) scored.push({ row, tier: matched.tier, score: matched.hit.score, hit: matched.hit })
   }
   scored.sort((a, b) =>
     a.tier - b.tier
@@ -282,7 +302,7 @@ export function filterRows(
     || (Number(isDotName(a.row)) - Number(isDotName(b.row)))
     || a.row.path.length - b.row.path.length
     || (a.row.path < b.row.path ? -1 : a.row.path > b.row.path ? 1 : 0))
-  return scored.map(entry => entry.row).slice(0, limit)
+  return scored.map(entry => ({ ...entry.row, matched: entry.hit.positions })).slice(0, limit)
 }
 
 /**

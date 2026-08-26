@@ -9,6 +9,11 @@
  * its per-session map. One reducer guarantees the two never disagree about
  * what a frame sequence means.
  *
+ * The fold also stamps the turn's `startedAt` from an injected clock
+ * reading, so a surface can show elapsed time. Like everything here it is
+ * display state only, and a snapshot folded before the stamp existed simply
+ * reads as unknown.
+ *
  * Live blocks are display state only: nothing here is persisted, and every
  * block is superseded by the committed transcript event that follows it. The
  * surface drops the whole live turn once the turn's result commits, which is
@@ -22,6 +27,17 @@ import type { LiveBlock, LiveTurn, StreamDelta } from './types.ts'
 export type { LiveBlock, LiveTurn }
 
 /**
+ * The folded turn with the fold's clock stamps. The extension is optional
+ * on purpose: a turn folded by an older half — a snapshot taken before the
+ * stamp existed, or a turn already in flight across an upgrade — is still a
+ * valid input and a valid prop, and only the elapsed readout degrades.
+ */
+export interface LiveTurnState extends LiveTurn {
+  /** Epoch milliseconds stamped when the turn's `turn-start` frame folded. */
+  startedAt?: number
+}
+
+/**
  * Apply one delta frame to the live turn.
  *
  * Frames for a block that never opened are ignored rather than synthesising a
@@ -33,9 +49,16 @@ export type { LiveBlock, LiveTurn }
  *
  * @param turn - the current live turn, or undefined before one starts.
  * @param delta - the incoming frame.
+ * @param now - the clock reading the frame folds at; the default reads the
+ *   system clock, and an explicit reading keeps the fold a pure function of
+ *   (frames, clock) for deterministic use.
  * @returns the next live turn, or undefined when no turn is in flight.
  */
-export function reduceDelta(turn: LiveTurn | undefined, delta: StreamDelta): LiveTurn | undefined {
+export function reduceDelta(
+  turn: LiveTurnState | undefined,
+  delta: StreamDelta,
+  now: number = Date.now(),
+): LiveTurnState | undefined {
   switch (delta.d) {
     case 'turn-start':
       return {
@@ -43,6 +66,7 @@ export function reduceDelta(turn: LiveTurn | undefined, delta: StreamDelta): Liv
         ...(delta.ttftMs !== undefined ? { ttftMs: delta.ttftMs } : {}),
         blocks: [],
         stopped: false,
+        startedAt: now,
       }
     case 'block-start': {
       if (turn === undefined) return undefined

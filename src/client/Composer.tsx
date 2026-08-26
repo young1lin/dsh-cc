@@ -5,7 +5,11 @@
  * the draft: a slash-command menu and an @-mention file picker (the composer
  * owns both selections and all the keyboard routing), plus the blue
  * recognition mirror that underlays the textarea while the leading `/name`
- * names a known command.
+ * names a known command. The draft itself is persisted per session (text
+ * plus uploaded images, debounced into localStorage and restored on switch
+ * and reload), sent messages are recalled shell-style from a per-project
+ * history, and Escape interrupts a running turn of ours before it leaves
+ * the input.
  *
  * @module dsh-cc/client/Composer
  */
@@ -168,21 +172,133 @@ const EXTENSIONS = MEDIA_TYPE_EXTENSIONS
  */
 const MENU_KEYS = new Set(['ArrowDown', 'ArrowUp', 'PageDown', 'PageUp', 'Home', 'End', 'Escape', 'Enter', 'Tab'])
 
+/** localStorage key prefix for one session's persisted draft; the session id follows it. */
+const DRAFT_KEY = 'dsh-cc:draft:'
+
+/** How long a draft edit coasts before it is persisted, in milliseconds. */
+const DRAFT_DEBOUNCE_MS = 400
+
+/** localStorage key prefix for the input history; the environment stamp follows it. */
+const HISTORY_KEY = 'dsh-cc:history-v1:'
+
+/** History entries kept per environment stamp. */
+const HISTORY_CAP = 200
+
+/** One persisted draft: the text plus the images already uploaded for it. */
+interface DraftSnapshot {
+  text: string
+  images: ImageRef[]
+}
+
+/**
+ * Read one session's persisted draft; anything absent, unreadable, or
+ * wrong-shaped reads as absent (a fresh composer starts empty).
+ * @param sessionId - the session whose draft slot to read.
+ * @returns the stored draft, or undefined.
+ */
+function readDraft(sessionId: string): DraftSnapshot | undefined {
+  try {
+    const raw = localStorage.getItem(DRAFT_KEY + sessionId)
+    if (raw === null) return undefined
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null) return undefined
+    const { text, images } = parsed as { text?: unknown; images?: unknown }
+    if (typeof text !== 'string' || !Array.isArray(images)) return undefined
+    const clean = images.filter((item): item is ImageRef =>
+      typeof item === 'object' && item !== null
+      && typeof (item as ImageRef).id === 'string'
+      && typeof (item as ImageRef).mediaType === 'string'
+      && (item as ImageRef).mediaType in MEDIA_TYPE_EXTENSIONS)
+    return { text, images: clean }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Persist one session's draft, or clear its slot when the draft is empty.
+ * The image ids are content-addressed server-side, so a restored attachment
+ * keeps rendering after a reload.
+ * @param sessionId - the session whose draft slot to write.
+ * @param text - the draft text.
+ * @param images - the draft's uploaded images.
+ */
+function writeDraft(sessionId: string, text: string, images: ImageRef[]): void {
+  try {
+    if (text === '' && images.length === 0) localStorage.removeItem(DRAFT_KEY + sessionId)
+    else localStorage.setItem(DRAFT_KEY + sessionId, JSON.stringify({ text, images }))
+  } catch {
+    // Private mode or quota: the draft just does not survive this page.
+  }
+}
+
+/**
+ * The environment stamp of one input history, replicating the rule the
+ * command cache in App.tsx stamps itself with: `cwd` (which project) plus
+ * `configDir` (which account root). Sent messages are recalled across the
+ * sessions of one project and account, and never leak into another's.
+ * @param cwd - the session's working directory.
+ * @param configDir - the session's account root.
+ * @returns the stamp suffix of the history key.
+ */
+function historyStamp(cwd: string | undefined, configDir: string | undefined): string {
+  return `${encodeURIComponent(cwd ?? '')}@${encodeURIComponent(configDir ?? '')}`
+}
+
+/**
+ * Read the input history for one stamp; anything unreadable or wrong-shaped
+ * reads as empty.
+ * @param stamp - the environment stamp (see {@link historyStamp}).
+ * @returns the entries, newest first.
+ */
+function readHistory(stamp: string): string[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY + stamp)
+    if (raw === null) return []
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((item): item is string => typeof item === 'string')
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Record one sent message into its stamp's history: newest first, a
+ * consecutive repeat deduplicated, the list capped at {@link HISTORY_CAP}.
+ * @param stamp - the environment stamp (see {@link historyStamp}).
+ * @param text - the message text that was sent.
+ */
+function recordHistory(stamp: string, text: string): void {
+  if (text === '') return
+  try {
+    const entries = readHistory(stamp)
+    if (entries[0] === text) return
+    localStorage.setItem(HISTORY_KEY + stamp, JSON.stringify([text, ...entries].slice(0, HISTORY_CAP)))
+  } catch {
+    // Best effort: a full or locked store simply skips this entry.
+  }
+}
+
 /**
  * Render the composer.
  * @param props - `busy` state plus send and interrupt callbacks. `readOnly`
  *   marks a session a live CLI process holds open: the box turns read-only
  *   with a reason, because that process is a concurrent writer and no stop
  *   signal of ours can reach its turn. `sessionId` anchors the composer to
- *   one session (the caller closes it over for the command refresh); `cwd`
- *   gates and roots the mention picker; `commands` drives both the menu and
- *   the recognition token; `onRefreshCommands` refetches on menu open.
+ *   one session (the caller closes it over for the command refresh, and it
+ *   keys the persisted draft); `cwd` gates and roots the mention picker;
+ *   `configDir` joins `cwd` in stamping the shared input history;
+ *   `commands` drives both the menu and the recognition token;
+ *   `onRefreshCommands` refetches on menu open.
  * @returns the composer node.
  */
 export const Composer = memo(function Composer(props: {
   sessionId: string
   /** Session working directory — the mention browser's root and the trigger gate. */
   cwd?: string
+  /** The session's account root; with `cwd` it stamps the shared input history. */
+  configDir?: string
   /** The session's cached slash commands; empty when none were loadable. */
   commands: readonly SlashCommand[]
   /** Refetch the command list (menu just opened). */
@@ -194,6 +310,12 @@ export const Composer = memo(function Composer(props: {
    * rejection matters here, and it restores the cleared draft.
    */
   onSend(text: string, images: ImageRef[]): void | Promise<unknown>
+  /**
+   * A recalled queued message to append to the draft's end. The object — not
+   * its text — is the change signal: every recall supplies a fresh one, so
+   * the same text recalled twice still appends twice.
+   */
+  restoreRequest?: { text: string; nonce: number }
   onStop(): void
 }): ReactElement {
   const [value, setValue] = useState('')
@@ -239,6 +361,60 @@ export const Composer = memo(function Composer(props: {
   useEffect(() => {
     if (props.readOnly === true) setMenu(undefined)
   }, [props.readOnly])
+
+  // A recalled queued message re-enters the draft at its end, on a newline —
+  // never over whatever the user is typing when the recall lands.
+  useEffect(() => {
+    const request = props.restoreRequest
+    if (request === undefined) return
+    setValue(previous => (previous === '' ? request.text : previous + '\n' + request.text))
+  }, [props.restoreRequest])
+
+  // History recall, live only while navigating: the entry list snapshot,
+  // the cursor into it (newest = 0, -1 = the stashed-draft position below
+  // the newest), and the draft put aside on the way in. Editing, sending,
+  // or switching sessions nulls it.
+  const recallRef = useRef<{ entries: string[]; cursor: number; stash: string } | null>(null)
+  // Mirrors of the draft states, so the session-switch flush below can read
+  // the outgoing session’s last draft without waiting for the next render.
+  const valueRef = useRef(value)
+  const imagesRef = useRef(images)
+  useEffect(() => {
+    valueRef.current = value
+    imagesRef.current = images
+  })
+
+  // The composer instance survives session switches (App does not key it),
+  // so without a per-session slot the box’s states would cross sessions — a
+  // draft typed in one leaking into the next, everything lost on reload.
+  // Each switch flushes the outgoing draft under its own id and adopts the
+  // stored one; edits themselves coast DRAFT_DEBOUNCE_MS before writing.
+  const draftSessionRef = useRef(props.sessionId)
+  useEffect(() => {
+    if (draftSessionRef.current !== props.sessionId) {
+      writeDraft(draftSessionRef.current, valueRef.current, imagesRef.current)
+      draftSessionRef.current = props.sessionId
+    }
+    const draft = readDraft(props.sessionId)
+    setValue(draft?.text ?? '')
+    setImages(draft?.images ?? [])
+    setFailure(undefined)
+    setMenu(undefined)
+    recallRef.current = null
+  }, [props.sessionId])
+
+  // Closing the surface must not eat the tail of the debounce window: the
+  // last <400ms of typing is flushed on unmount too.
+  useEffect(() => () => {
+    writeDraft(draftSessionRef.current, valueRef.current, imagesRef.current)
+  }, [])
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      writeDraft(props.sessionId, value, images)
+    }, DRAFT_DEBOUNCE_MS)
+    return () => clearTimeout(timer)
+  }, [props.sessionId, value, images])
 
   // The mention query's derived navigation facts: whether it spells an
   // absolute path (the reference is the typed path itself, plus the live
@@ -370,11 +546,21 @@ export const Composer = memo(function Composer(props: {
     setImages([])
     setFailure(undefined)
     setMenu(undefined)
-    void Promise.resolve(props.onSend(text, attachments)).catch((error: unknown) => {
-      setFailure(error instanceof Error ? error.message : String(error))
-      setValue(previous => (previous === '' ? text : previous))
-      setImages(previous => (previous.length === 0 ? attachments : previous))
-    })
+    // Sending leaves history recall: the box holds a fresh turn now.
+    recallRef.current = null
+    void Promise.resolve(props.onSend(text, attachments))
+      .then(() => {
+        // A landed send retires the stored draft immediately (the debounce
+        // would write the emptiness anyway, 400ms later) and files the text
+        // into this project’s input history.
+        writeDraft(props.sessionId, '', [])
+        recordHistory(historyStamp(props.cwd, props.configDir), text)
+      })
+      .catch((error: unknown) => {
+        setFailure(error instanceof Error ? error.message : String(error))
+        setValue(previous => (previous === '' ? text : previous))
+        setImages(previous => (previous.length === 0 ? attachments : previous))
+      })
   }
 
   /**
@@ -545,6 +731,9 @@ export const Composer = memo(function Composer(props: {
                 : '向 Claude Code 发送消息，Enter 发送，Shift+Enter 换行，可粘贴或拖入图片'}
             onChange={event => {
               setValue(event.target.value)
+              // Any real edit leaves history recall; the recalled text is
+              // from here on just a draft being shaped.
+              recallRef.current = null
               updateMenu(event.target)
             }}
             onKeyUp={event => {
@@ -638,10 +827,52 @@ export const Composer = memo(function Composer(props: {
                   return
                 }
               }
-              // Escape only leaves the input; the surface closes on the next
-              // Escape, once focus is no longer holding a draft.
+              // Shell-style input history: with no popup open and the caret
+              // at the head of the first line, ArrowUp walks sent messages
+              // (from an empty draft, or from one already being recalled)
+              // and ArrowDown walks back — one step below the newest it
+              // restores the draft stashed on the way in. Any edit or send
+              // leaves the recall (see onChange/submit); an open menu owns
+              // the arrows above, and composition was guarded at the top.
+              if (menu === undefined && props.readOnly !== true
+                && (event.key === 'ArrowUp' || event.key === 'ArrowDown')
+                && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey
+                && event.currentTarget.selectionStart === 0 && event.currentTarget.selectionEnd === 0
+                && (value === '' || recallRef.current !== null)) {
+                const recall = recallRef.current
+                if (event.key === 'ArrowUp') {
+                  const entries = recall?.entries ?? readHistory(historyStamp(props.cwd, props.configDir))
+                  if (entries.length > 0) {
+                    event.preventDefault()
+                    const cursor = recall === null ? 0 : Math.min(recall.cursor + 1, entries.length - 1)
+                    recallRef.current = { entries, cursor, stash: recall?.stash ?? value }
+                    setValue(entries[cursor])
+                  }
+                } else if (recall !== null) {
+                  event.preventDefault()
+                  if (recall.cursor > 0) {
+                    recallRef.current = { ...recall, cursor: recall.cursor - 1 }
+                    setValue(recall.entries[recall.cursor - 1])
+                  } else {
+                    // One step below the newest: back to the stashed draft.
+                    recallRef.current = { ...recall, cursor: -1 }
+                    setValue(recall.stash)
+                  }
+                }
+              }
+              // Escape layers: an open menu took it above; next comes
+              // interrupting a running turn of ours (the same stop the
+              // button offers — a terminal-owned turn keeps the old
+              // behavior, no signal of ours can reach it); only then does
+              // it leave the input, leaving the surface’s close one key
+              // away.
               if (event.key === 'Escape') {
-                event.currentTarget.blur()
+                if (props.busy && props.readOnly !== true && menu === undefined) {
+                  event.preventDefault()
+                  props.onStop()
+                } else {
+                  event.currentTarget.blur()
+                }
                 return
               }
               if (event.key === 'Enter' && !event.shiftKey) {
@@ -677,7 +908,7 @@ export const Composer = memo(function Composer(props: {
         {props.busy && props.readOnly === true
           ? <Button size="sm" icon={<IconStopFill16 />} disabled title="回合属于另一个客户端（终端），网页无法中断它">停止</Button>
           : props.busy
-            ? <Button size="sm" icon={<IconStopFill16 />} onClick={props.onStop}>停止</Button>
+            ? <Button size="sm" icon={<IconStopFill16 />} onClick={props.onStop} title="停止 (Esc)">停止</Button>
             : (
               <Button
                 variant="primary"

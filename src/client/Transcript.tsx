@@ -124,6 +124,69 @@ registerCss('transcript', `
   max-height: 180px;
   border-radius: 10px;
 }
+
+/* A user turn plus its hover action row. The wrapper owns the right-edge
+   alignment and width cap the bubble used to carry, so the actions can sit
+   under the bubble without widening the conversation column. */
+.cc-user-wrap {
+  align-self: flex-end;
+  max-width: min(525px, 82%);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.cc-user-wrap .cc-user { max-width: 100%; }
+
+/* Time-travel affordances: quiet until the row is hovered, matching the
+   host's per-row hover controls. */
+.cc-user-actions {
+  display: flex;
+  gap: 8px;
+  padding: 2px 4px 0;
+  opacity: 0;
+  transition: opacity var(--ds-transition-duration) var(--ds-ease-in-out);
+}
+
+.cc-user-wrap:hover .cc-user-actions, .cc-user-actions:focus-within { opacity: 1; }
+
+.cc-user-action {
+  padding: 1px 8px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary);
+  font: var(--dsw-font-xxs-12);
+  cursor: pointer;
+}
+
+.cc-user-action:hover {
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* A compaction boundary: the conversation was summarized here; the line reads
+   as a quiet seam, not a message. */
+.cc-compact {
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 0;
+}
+
+.cc-compact-line {
+  font: var(--dsw-font-xxs-12);
+  color: var(--dsw-alias-label-tertiary);
+  letter-spacing: 1px;
+  user-select: none;
+}
+
+.cc-compact-meta {
+  font: var(--dsw-font-xxs-12);
+  color: var(--dsw-alias-label-caption);
+}
 `)
 
 /**
@@ -132,6 +195,12 @@ registerCss('transcript', `
  * route actually serves.
  */
 const IMAGE_EXTENSIONS = MEDIA_TYPE_EXTENSIONS
+
+/** Chinese labels for a compaction boundary's trigger; unknown values pass through. */
+const COMPACT_TRIGGERS: Record<string, string> = {
+  manual: '手动 (/compact)',
+  auto: '自动',
+}
 
 /** One tool call with its result, or any other transcript entry. */
 type Item =
@@ -284,14 +353,17 @@ function compact(tokens: number): string {
 /**
  * Render one non-tool transcript event.
  * @param props - the event, the file-mentions resolver its markdown renders
- *   with, and the session's cached slash commands for the user row's blue
- *   command token.
+ *   with, the session's cached slash commands for the user row's blue command
+ *   token, and the optional time-travel actions shown on rows that carry a
+ *   native message id.
  * @returns the node, or null for an entry with nothing to show.
  */
 function EventItem(props: {
   event: CcEvent
   mentions: MarkdownFileMentions
   commands: readonly SlashCommand[]
+  onFork?: (event: Extract<CcEvent, { kind: 'user' }>) => void
+  onRewind?: (event: Extract<CcEvent, { kind: 'user' }>) => void
 }): ReactElement | null {
   const { event } = props
   switch (event.kind) {
@@ -312,25 +384,58 @@ function EventItem(props: {
         )
         : event.text
       return (
-        <div className="cc-user">
-          {event.images !== undefined && event.images.length > 0 && (
-            <div className="cc-user-images">
-              {event.images.map(image => (
-                <a
-                  key={image.id}
-                  href={`/cc/api/blobs/${image.id}.${IMAGE_EXTENSIONS[image.mediaType]}`}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  <img
-                    src={`/cc/api/blobs/${image.id}.${IMAGE_EXTENSIONS[image.mediaType]}`}
-                    alt={image.name ?? '附件'}
-                  />
-                </a>
-              ))}
+        <div className="cc-user-wrap">
+          <div className="cc-user">
+            {event.images !== undefined && event.images.length > 0 && (
+              <div className="cc-user-images">
+                {event.images.map(image => (
+                  <a
+                    key={image.id}
+                    href={`/cc/api/blobs/${image.id}.${IMAGE_EXTENSIONS[image.mediaType]}`}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    <img
+                      src={`/cc/api/blobs/${image.id}.${IMAGE_EXTENSIONS[image.mediaType]}`}
+                      alt={image.name ?? '附件'}
+                    />
+                  </a>
+                ))}
+              </div>
+            )}
+            {body}
+          </div>
+          {event.nativeMessageId !== undefined
+            && (props.onFork !== undefined || props.onRewind !== undefined) && (
+            <div className="cc-user-actions">
+              {props.onFork !== undefined && (
+                <button type="button" className="cc-user-action" onClick={() => { props.onFork?.(event) }}>
+                  分叉
+                </button>
+              )}
+              {props.onRewind !== undefined && (
+                <button type="button" className="cc-user-action" onClick={() => { props.onRewind?.(event) }}>
+                  回滚文件
+                </button>
+              )}
             </div>
           )}
-          {body}
+        </div>
+      )
+    }
+    case 'compactBoundary': {
+      const parts: string[] = []
+      if (event.preTokens !== undefined && event.postTokens !== undefined) {
+        parts.push(`前 ${compact(event.preTokens)} tokens → 后 ${compact(event.postTokens)} tokens`)
+      } else if (event.preTokens !== undefined) {
+        parts.push(`压缩前 ${compact(event.preTokens)} tokens`)
+      }
+      const trigger = COMPACT_TRIGGERS[event.trigger] ?? event.trigger
+      if (trigger !== '') parts.push(`触发：${trigger}`)
+      return (
+        <div className="cc-compact">
+          <div className="cc-compact-line">── 对话已压缩 ──</div>
+          {parts.length > 0 && <div className="cc-compact-meta">{parts.join(' · ')}</div>}
         </div>
       )
     }
@@ -415,15 +520,19 @@ function ToolItem(props: { item: Extract<Item, { k: 'tool' }>; cwd: string | und
  * current session's events array keeps its identity until an event actually
  * commits, and the commands array only changes when the session's cached
  * catalog does, so the O(n) projection and every ToolRow's card parse run
- * only when the transcript really changed.
- * @param props - the ordered events, plus the session's cached slash
- *   commands (the user row's blue command token is best-effort: no cache,
- *   no blue).
+ * only when the transcript really changed. The action callbacks must be
+ * stable for the same reason — the parent passes useCallback'd handlers.
+ * @param props - the ordered events, the session's cached slash commands
+ *   (the user row's blue command token is best-effort: no cache, no blue),
+ *   and the optional fork / file-rewind callbacks for user rows that carry a
+ *   native message id.
  * @returns the transcript nodes.
  */
 export const Transcript = memo(function Transcript(props: {
   events: CcEvent[]
   commands: readonly SlashCommand[]
+  onFork?: (event: Extract<CcEvent, { kind: 'user' }>) => void
+  onRewind?: (event: Extract<CcEvent, { kind: 'user' }>) => void
 }): ReactElement {
   const items = useMemo(() => projectTranscript(props.events), [props.events])
   const cwd = useMemo(() => sessionCwd(props.events), [props.events])
@@ -440,6 +549,8 @@ export const Transcript = memo(function Transcript(props: {
             event={item.event}
             mentions={mentions}
             commands={props.commands}
+            onFork={props.onFork}
+            onRewind={props.onRewind}
           />)}
       {viewPath !== undefined && <FileViewer path={viewPath} onClose={() => setViewPath(undefined)} />}
     </>

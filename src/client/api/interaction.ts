@@ -53,8 +53,9 @@ export function answerDialog(id: string, requestId: string, answers: unknown): P
  * GET /sessions/:id/commands — the slash commands this session accepts,
  * including the user's own skills and project commands.
  * @param id - session id.
- * @returns the catalog; empty without a live process.
+ * @returns the catalog; empty without a live process. A cold session that
+ *  has a remembered catalog serves it with `stale: true` and its save time.
  */
-export function fetchCommands(id: string): Promise<{ available: boolean; commands: SlashCommand[] }> {
-  return api<{ available: boolean; commands: SlashCommand[] }>(`/sessions/${id}/commands`)
+export function fetchCommands(id: string): Promise<{ available: boolean; commands: SlashCommand[]; stale?: boolean; savedAt?: number }> {
+  return api<{ available: boolean; commands: SlashCommand[]; stale?: boolean; savedAt?: number }>(`/sessions/${id}/commands`)
 }

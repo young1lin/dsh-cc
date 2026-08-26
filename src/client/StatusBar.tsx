@@ -42,6 +42,8 @@ registerCss('status-bar', `
  * @param props.fallbackCostUsd - the session's cumulative cost from the session
  * list, shown when `usage` is unavailable (a cold session's live control
  * channel has no running process to ask, but its historical cost is still known).
+ * @param props.modelMenuSignal - bumped by the surface's Alt+P hotkey; each
+ *  change asks the model picker to open itself (see ModelMenu).
  * @returns the strip node.
  */
 export const StatusBar = memo(function StatusBar(props: {
@@ -52,11 +54,12 @@ export const StatusBar = memo(function StatusBar(props: {
   context: ContextUsage | undefined
   usage: UsageInfo | undefined
   fallbackCostUsd?: number
+  modelMenuSignal?: number
 }): ReactElement {
   return (
     <div className="cc-status">
       <PermissionModeMenu sessionId={props.sessionId} sessionMode={props.sessionMode} configMode={props.configMode} />
-      <ModelMenu sessionId={props.sessionId} busy={props.busy} />
+      <ModelMenu sessionId={props.sessionId} busy={props.busy} openSignal={props.modelMenuSignal} />
       {props.context !== undefined && <ContextMeter context={props.context} />}
       <UsageReadout info={props.usage} fallbackCostUsd={props.fallbackCostUsd} />
     </div>

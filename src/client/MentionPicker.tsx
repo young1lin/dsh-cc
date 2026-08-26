@@ -10,10 +10,10 @@
  * @module dsh-cc/client/MentionPicker
  */
 
-import { useEffect, useRef, type ReactElement } from 'react'
+import { useEffect, useRef, type ReactElement, type ReactNode } from 'react'
 import { IconFolderClose16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { registerCss } from './css.ts'
-import { metaLabel, type MenuRow } from './mention-core.ts'
+import { metaLabel, type MenuRow, type RankedRow } from './mention-core.ts'
 
 registerCss('mention-picker', `
 /* The folder glyph rides in a fixed gutter so file paths align down the
@@ -31,8 +31,46 @@ registerCss('mention-picker', `
 export type MentionState = 'loading' | 'failed' | 'ready'
 
 /**
+ * Split a roster path into runs, wrapping the characters the query's fuzzy
+ * hit matched in the highlight span — data the ranking already computed, so
+ * a ranked row also shows WHY it ranked. The class itself lives in the
+ * shell sheet (theme.ts), beside the composer's other recognition cues.
+ * @param path - the row's full path.
+ * @param matched - ascending indices of the matched characters, or undefined
+ *   when the row was not ranked against a query.
+ * @returns the path as alternating plain and highlighted runs.
+ */
+function renderPath(path: string, matched: readonly number[] | undefined): ReactNode {
+  if (matched === undefined || matched.length === 0) return path
+  const marks = new Set(matched)
+  const runs: ReactNode[] = []
+  let text = ''
+  let hitting = false
+  let key = 0
+  const flush = (): void => {
+    if (text === '') return
+    runs.push(hitting
+      ? <span className="cc-mention-hit" key={key}>{text}</span>
+      : <span key={key}>{text}</span>)
+    key += 1
+    text = ''
+  }
+  for (let at = 0; at < path.length; at += 1) {
+    const mark = marks.has(at)
+    if (mark !== hitting) {
+      flush()
+      hitting = mark
+    }
+    text += path[at]
+  }
+  flush()
+  return runs
+}
+
+/**
  * Render the mention roster; the composer only mounts it while a token is open.
- * @param props.rows - the ranked rows (already capped at MAX_MENU_ROWS).
+ * @param props.rows - the ranked rows (already capped at MAX_MENU_ROWS),
+ *   each carrying where the query matched it for the highlight.
  * @param props.state - whether the index/listing is still loading, failed, or settled.
  * @param props.truncated - a bound cut the underlying index or listing.
  * @param props.absolutePath - the absolute query's typed-reference row path, labeled as such.
@@ -42,7 +80,7 @@ export type MentionState = 'loading' | 'failed' | 'ready'
  * @returns the popup node.
  */
 export function MentionPicker(props: {
-  rows: readonly MenuRow[]
+  rows: readonly RankedRow[]
   state: MentionState
   truncated: boolean
   absolutePath: string | undefined
@@ -79,7 +117,7 @@ export function MentionPicker(props: {
           <span className="cc-mention-icon" aria-hidden>
             {row.directory === true && <IconFolderClose16 />}
           </span>
-          <span className="cc-mention-path">{row.path}</span>
+          <span className="cc-mention-path">{renderPath(row.path, row.matched)}</span>
           <span className="cc-mention-label">
             {props.absolutePath === row.path ? '绝对路径' : row.directory === true ? '文件夹' : metaLabel(row.path)}
           </span>

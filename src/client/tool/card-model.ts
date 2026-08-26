@@ -102,7 +102,10 @@ export function toolCard(
       const todo = todoCard(input)
       return todo === null ? GENERIC : { kind: 'todo', todo }
     }
+    // `Agent` is the same delegation tool under its newer wire name; both
+    // spellings draw the task card.
     case 'Task':
+    case 'Agent':
       return { kind: 'task', task: taskCard(input, result) }
     default:
       return GENERIC

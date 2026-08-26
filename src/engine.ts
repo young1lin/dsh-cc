@@ -16,6 +16,7 @@ import {
   type PermissionResult,
   type PermissionUpdate,
   type Query,
+  type RewindFilesResult,
   type SDKMessage,
   type SDKPartialAssistantMessage,
   type SDKResultMessage,
@@ -24,6 +25,8 @@ import {
 } from '@anthropic-ai/claude-agent-sdk'
 import type { ResolvedConfig } from './config.ts'
 import { mentionBlocks } from './mentions.ts'
+import { runShell } from './shell-run.ts'
+import { shellPolicyFor } from './shell-policy.ts'
 import type {
   AccountSummary,
   CcEventInput,
@@ -74,6 +77,28 @@ export interface SendImage {
   mediaType: ImageRef['mediaType']
   /** Base64 body without a data: URL prefix. */
   data: string
+}
+
+/**
+ * One message held host-side because a turn was already running. Built in
+ * full — mention expansion included — at submit time and carried verbatim:
+ * what was queued is exactly what delivers, across recalls and even across
+ * the death of the process it was queued for (the host re-enters undelivered
+ * entries into the rebuilt engine; nothing is ever re-built).
+ */
+export interface QueuedMessage {
+  /** Per-message identity, minted at submit; the recall handle. */
+  uuid: string
+  /** The submitted text, verbatim. */
+  text: string
+  /** The submitted attachments, already base64-encoded for the SDK. */
+  images: SendImage[]
+  /** When the message joined the queue (ISO timestamp). */
+  queuedAt: string
+  /** The fully-built SDK message this entry delivers. */
+  message: SDKUserMessage
+  /** Whether the message starts with `/`; seeds the turn shape at delivery. */
+  wasCommand: boolean
 }
 
 /**
@@ -188,8 +213,12 @@ export class SessionEngine {
    * the 0.3.220 payload: no queue-operation, no echo, the message vanishes),
    * so the queue lives here and drains into the input stream only at the
    * model-call boundary — the moment a turn's result leaves the CLI idle.
+   * An entry leaves this queue ONLY by being delivered; when the process
+   * dies first, the host carries the undelivered entries into the rebuilt
+   * engine instead (see takeQueued / restoreQueue) — they never reached
+   * the CLI, so re-entering them loses nothing.
    */
-  private readonly pendingQueue: { message: SDKUserMessage; wasCommand: boolean }[] = []
+  private readonly pendingQueue: QueuedMessage[] = []
   /** The session's live task table in start order; display state only. */
   private readonly taskTable = new Map<string, TaskRow>()
   /** Trailing CLI stderr, capped at STDERR_TAIL_LIMIT characters. */
@@ -216,8 +245,11 @@ export class SessionEngine {
    */
   onEnd: (() => void) | undefined
   /**
-   * The most recent submission, kept verbatim so the host can replay it when
-   * the process dies mid-turn.
+   * The most recently DELIVERED submission, kept verbatim so the host can
+   * replay it when the process dies mid-turn. Delivering — not submitting —
+   * is the assignment point: a message still queued was never handed to the
+   * CLI, so it returns through the queue's own hand-off and a replay of this
+   * field can never duplicate it.
    *
    * The transcript cannot answer "what was just sent" for a session the CLI
    * owns: that store is read as a bounded tail and its own copy of the message
@@ -226,6 +258,12 @@ export class SessionEngine {
    * some earlier one — attachments included.
    */
   lastSend: { text: string; images: SendImage[] } | undefined
+  /**
+   * Whether the query ended while a turn was still in flight — the only
+   * moment a replay of {@link lastSend} is warranted. Captured in finish()
+   * before `busy` flips, read by the host's recovery path.
+   */
+  private failedWhileBusy = false
 
   /** Whether close() already ran; a closed engine restarts through a new instance. */
   get isClosed(): boolean {
@@ -241,6 +279,16 @@ export class SessionEngine {
    */
   get isDead(): boolean {
     return this.queryEnded
+  }
+
+  /**
+   * Whether the last query termination caught a turn still in flight. A
+   * replay of {@link lastSend} is correct only then; a termination while
+   * nothing ran leaves the last delivered message already committed in the
+   * CLI's store, and replaying it would duplicate the turn.
+   */
+  get endedBusy(): boolean {
+    return this.failedWhileBusy
   }
 
   /**
@@ -317,7 +365,6 @@ export class SessionEngine {
   async send(text: string, images: SendImage[] = []): Promise<void> {
     if (this.closed) throw new Error('dsh-cc: engine is closed')
     this.lastUsed = Date.now()
-    this.lastSend = { text, images }
     this.ensureStarted()
     // Images lead the content list: the model reads the attachment before the
     // sentence about it, which is the order the CLI's own client uses.
@@ -331,15 +378,21 @@ export class SessionEngine {
       ...(text.length > 0 ? [{ type: 'text', text }] : []),
       ...await mentionBlocks(text, this.startSpec.cwd),
     ]
-    const entry = {
+    // One identity per submission: the queue's recall handle today, and the
+    // field a future per-message cancellation key (query.cancelAsyncMessage)
+    // would read.
+    const uuid = randomUUID()
+    const entry: QueuedMessage = {
+      uuid,
+      text,
+      images,
+      queuedAt: new Date().toISOString(),
       message: {
         type: 'user',
         message: { role: 'user', content },
         session_id: this.claudeSessionId ?? '',
         parent_tool_use_id: null,
-        // Future per-message cancellation key (query.cancelAsyncMessage);
-        // nothing reads it yet.
-        uuid: randomUUID(),
+        uuid,
       } as SDKUserMessage,
       // A locally-dispatched command turn NEVER echoes a user message (verified
       // against the payload: init → synthetic assistant → result, no echo), so
@@ -358,13 +411,110 @@ export class SessionEngine {
    * Hand one built message to the CLI at a moment it can actually accept it:
    * no turn in flight. Seeding the turn-shape flags here — not in send() — is
    * what keeps a queued `/cmd` from reclassifying the envelope still running.
+   * This is also where a submission becomes the replay anchor: only a
+   * delivered message belongs in {@link lastSend}.
    * @param entry - the queued-built message with its command-ness seed.
    */
-  private deliver(entry: { message: SDKUserMessage; wasCommand: boolean }): void {
+  private deliver(entry: QueuedMessage): void {
+    this.lastSend = { text: entry.text, images: entry.images }
     this.streamedThisTurn = false
     this.turnWasCommand = entry.wasCommand
     this.busy = true
     this.input.push(entry.message)
+  }
+
+  /**
+   * A read-only snapshot of the undelivered queue, oldest first. The copy is
+   * shallow; entries are immutable outside the delivery path.
+   * @returns the queued entries in delivery order.
+   */
+  queuedItems(): readonly QueuedMessage[] {
+    return [...this.pendingQueue]
+  }
+
+  /**
+   * Recall one queued message: remove it before the CLI ever sees it. An
+   * entry already delivered left the queue at its model-call boundary, so it
+   * simply does not match — the caller's 404 semantics.
+   * @param uuid - the entry's id from the queue snapshot.
+   * @returns the removed entry, or undefined when no queued entry matches.
+   */
+  removeQueued(uuid: string): QueuedMessage | undefined {
+    const index = this.pendingQueue.findIndex(entry => entry.uuid === uuid)
+    if (index < 0) return undefined
+    const [removed] = this.pendingQueue.splice(index, 1)
+    this.patch({ queued: this.pendingQueue.length })
+    return removed
+  }
+
+  /**
+   * Take the whole undelivered queue out — the death hand-off. The host
+   * holds the entries and re-enters them into the next engine for this
+   * session; taking rather than copying is what makes the hand-off
+   * idempotent when more than one end-of-life path passes through here.
+   * @returns the entries in delivery order; the engine keeps none.
+   */
+  takeQueued(): QueuedMessage[] {
+    const entries = [...this.pendingQueue]
+    this.pendingQueue.length = 0
+    return entries
+  }
+
+  /**
+   * Re-enter undelivered entries from a previous engine, original order
+   * first. The entries are the submissions as built — nothing is re-expanded
+   * — so what was queued is exactly what delivers. An idle engine starts
+   * draining immediately through the normal boundary path; a busy one holds
+   * the entries ahead of anything queued after the hand-off.
+   * @param entries - the retained entries, oldest first.
+   */
+  restoreQueue(entries: readonly QueuedMessage[]): void {
+    if (entries.length === 0) return
+    this.lastUsed = Date.now()
+    // Delivering below pushes into the input stream, which needs its query.
+    this.ensureStarted()
+    this.pendingQueue.unshift(...entries)
+    if (!this.busy) {
+      const first = this.pendingQueue.shift()
+      if (first !== undefined) this.deliver(first)
+    }
+    this.patch({ queued: this.pendingQueue.length })
+  }
+
+  /**
+   * Run one shell-mode line (the `!` prefix) in the session's working
+   * directory, then hand the command plus its merged output to the CLI as a
+   * normal user message — the CLI's own shell-mode contract (the model sees
+   * the output and answers it). The permission posture gates execution:
+   * default/plan surface the approval card first; everything else runs.
+   * @param command - the line after `!`, already trimmed.
+   * @param mode - the session's effective permission posture (the caller
+   *   reads the session override; hot switches live in the meta, not here).
+   * @param approve - how 'ask' resolves a pending approval; resolves true to
+   *   run, false (or throws) to abort. The caller owns the card.
+   * @returns the exit code the command settled with; 125 marks an aborted ask.
+   */
+  async runShell(command: string, mode: string, approve: () => Promise<boolean>): Promise<number> {
+    if (shellPolicyFor(mode) === 'ask') {
+      const allowed = await approve()
+      if (!allowed) {
+        this.publish({ kind: 'commandOutput', text: '已拒绝执行该命令' })
+        return 125
+      }
+    }
+    this.publish({ kind: 'commandOutput', text: '$ ' + command })
+    const result = await runShell(command, { cwd: this.startSpec.cwd })
+    const report = [
+      '$ ' + command,
+      result.output,
+      result.timedOut ? '（命令超时被终止，保留已产生的输出）' : '',
+      '（退出码 ' + result.exitCode + '）',
+    ].filter(part => part !== '').join('\n')
+    this.publish({ kind: 'commandOutput', text: report })
+    // The wrapped transcript message: the model reads the command and its
+    // output exactly as the CLI's own shell mode presents them.
+    await this.send('下面是我在终端直接执行的命令及其输出：\n\n' + report, [])
+    return result.exitCode
   }
 
   /**
@@ -566,6 +716,24 @@ export class SessionEngine {
     } catch {
       return undefined
     }
+  }
+
+  /**
+   * Rewind the session's tracked files to their state at one user message.
+   * Checkpointing is enabled at spawn (see ensureStarted), so a live CLI can
+   * always answer; the refusal shape mirrors supportedCommands' unavailable
+   * semantics — a session without a running process says so in the result
+   * rather than throwing.
+   * @param userMessageId - the native UUID of the user message to rewind to.
+   * @param dryRun - true to preview the changes without touching the files.
+   * @returns the CLI's rewind answer: feasibility, per-file stats, and
+   *   link-safety refusals.
+   */
+  async rewindFiles(userMessageId: string, dryRun: boolean): Promise<RewindFilesResult> {
+    this.lastUsed = Date.now()
+    const q = this.query
+    if (q === undefined) return { canRewind: false, error: '会话没有正在运行的进程' }
+    return await q.rewindFiles(userMessageId, { dryRun })
   }
 
   /**
@@ -774,6 +942,10 @@ export class SessionEngine {
       onUserDialog: this.onUserDialog,
       supportedDialogKinds: ['ask_user_question'],
       includePartialMessages: true,
+      // Track file changes so the page can rewind tracked files to any user
+      // message (rewindFiles below); without checkpoints there is nothing to
+      // rewind to.
+      enableFileCheckpointing: true,
       stderr: chunk => this.appendStderr(chunk),
       ...(model !== undefined ? { model } : {}),
       ...(this.config.maxTurns > 0 ? { maxTurns: this.config.maxTurns } : {}),
@@ -1150,12 +1322,14 @@ export class SessionEngine {
    *   end of stream (which can still be a CLI that exited mid-turn).
    */
   private async finish(error: Error | undefined): Promise<void> {
+    this.failedWhileBusy = this.busy
     this.busy = false
     this.queryEnded = true
     this.streamedThisTurn = false
-    // The held queue dies with the process: its messages never reached the
-    // CLI, and the host's replay path (lastSend) is the recovery.
-    this.pendingQueue.length = 0
+    // The held queue OUTLIVES the process: nothing in it ever reached the
+    // CLI, so it stays put for the host to carry into the rebuilt engine
+    // (takeQueued / restoreQueue) instead of dying here. Only a delivered
+    // message ever leaves the queue, and delivered ones never return.
     // Tasks are bound to the CLI process; the transcript cards survive it.
     this.taskTable.clear()
     this.publishTasks()
@@ -1163,11 +1337,11 @@ export class SessionEngine {
     try {
       if (error !== undefined) {
         await this.hooks.emit({ kind: 'error', message: this.describeFailure(error) })
-        await this.hooks.updateMeta({ status: 'error', lastError: error.message, queued: 0 })
+        await this.hooks.updateMeta({ status: 'error', lastError: error.message, queued: this.pendingQueue.length })
         await this.hooks.onEngineFailure?.(error)
         return
       }
-      await this.hooks.updateMeta({ status: 'idle', queued: 0 })
+      await this.hooks.updateMeta({ status: 'idle', queued: this.pendingQueue.length })
     } finally {
       this.onEnd?.()
     }

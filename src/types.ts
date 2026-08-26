@@ -188,6 +188,23 @@ export interface SessionMeta {
 }
 
 /**
+ * One host-held queued message as the queue endpoints serve it: a message
+ * submitted while a turn was running, still waiting for its model-call
+ * boundary. The built SDK payload — base64 image bodies included — never
+ * leaves the host; the page recalls by text, so only the count rides along.
+ */
+export interface QueuedMessageView {
+  /** Stable per-message id, minted at submit time; the recall target. */
+  uuid: string
+  /** The message body verbatim, so a recall can refill the composer. */
+  text: string
+  /** When the message joined the queue (ISO timestamp). */
+  queuedAt: string
+  /** How many images the queued message carries. */
+  imageCount: number
+}
+
+/**
  * Where an accepted permission rule is written. `session` dies with the CLI
  * process, `localSettings` is the gitignored per-project file, `projectSettings`
  * is checked in, and `userSettings` applies to every project.
@@ -265,12 +282,41 @@ export interface ImageRef {
 
 /** One transcript entry: one JSONL line and one SSE event payload. */
 export type CcEvent =
-  | { kind: 'user'; seq: number; ts: string; text: string; images?: ImageRef[] }
+  | {
+    kind: 'user'
+    seq: number
+    ts: string
+    text: string
+    images?: ImageRef[]
+    /**
+     * The CLI transcript record's own UUID, when this row was mapped from a
+     * native session file — the anchor the fork and file-rewind endpoints
+     * address. Absent on rows that only ever lived in the sidecar.
+     */
+    nativeMessageId?: string
+  }
   | { kind: 'assistant'; seq: number; ts: string; text: string; error?: string; aborted?: boolean }
   | { kind: 'thinking'; seq: number; ts: string; text: string }
   | { kind: 'tool_use'; seq: number; ts: string; toolUseId: string; name: string; input: unknown }
   | { kind: 'tool_result'; seq: number; ts: string; toolUseId: string; text: string; isError: boolean }
   | { kind: 'system'; seq: number; ts: string; subtype: string; data: Record<string, unknown> }
+  /**
+   * A compaction boundary the CLI wrote into the native transcript: the
+   * conversation was summarized here, and the token counts straddle the cut.
+   */
+  | {
+    kind: 'compactBoundary'
+    seq: number
+    ts: string
+    /** What caused the compaction, e.g. `manual` (`/compact`) or `auto`. */
+    trigger: string
+    /** Context tokens before the cut, when the CLI recorded them. */
+    preTokens?: number
+    /** Context tokens after the cut, when the CLI recorded them. */
+    postTokens?: number
+    /** Tokens dropped by compactions so far in this session, when recorded. */
+    cumulativeDroppedTokens?: number
+  }
   /** Output of a local slash command (`/compact`, `/usage`, …) — no model turn ran. */
   | { kind: 'commandOutput'; seq: number; ts: string; text: string }
   /** A loop banner: hook feedback, slash-command notices; level picks the styling. */

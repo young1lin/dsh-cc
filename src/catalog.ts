@@ -287,6 +287,9 @@ export class SessionCatalog {
       native = await readNativeTranscript(meta.claudeSessionId, {
         cwd: meta.cwd,
         limit,
+        // The boundary reader needs the account root the session was recorded
+        // under; a row without its own stamp belongs to the active root.
+        configDir: meta.configDir ?? this.activeConfigDir(),
         storeImage: (mediaType, base64) => this.blobs.put(Buffer.from(base64, 'base64'), mediaType),
       })
     } catch {

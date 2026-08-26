@@ -16,7 +16,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react'
-import { Button } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
 import { Composer } from './Composer.tsx'
 import { PermissionCard, QuestionCard } from './Interaction.tsx'
 import { SessionRail } from './SessionRail.tsx'
@@ -26,21 +26,23 @@ import { reduceDelta, type LiveTurn } from '../live-turn.ts'
 import { TodoPin } from './TodoPin.tsx'
 import { TaskPanel } from './TaskPanel.tsx'
 import { Transcript } from './Transcript.tsx'
+import { QueuedList } from './QueuedList.tsx'
 import { SettingsModal } from './settings/SettingsModal.tsx'
 import { SessionEnvModal } from './settings/SessionEnvModal.tsx'
 import { OverlayContext, useOverlay, type OverlaySignal } from './overlay.ts'
 import { connectEvents } from './api/http.ts'
 import { answerDialog, answerPermission, fetchCommands } from './api/interaction.ts'
 import {
-  backgroundTask, createSession, deleteSession, fetchSession, fetchSessions, renameSession, sendMessage,
-  stopSession, stopTask,
+  backgroundTask, createSession, deleteSession, fetchSession, fetchSessions, forkSession, renameSession,
+  rewindApply, rewindPreview, sendMessage, stopSession, stopTask, type RewindResult,
 } from './api/sessions.ts'
 import { fetchConfig } from './api/settings.ts'
-import { fetchContext, fetchUsage, type ContextUsage, type UsageInfo } from './api/telemetry.ts'
+import { fetchContext, fetchUsage, setPermissionMode, setEffort, type ContextUsage, type UsageInfo } from './api/telemetry.ts'
 import type {
   CcEvent, ConfigSummary, LiveTurnSnapshot, PermissionAnswer, PermissionRequest, SessionMeta, SlashCommand,
   TaskRow,
 } from '../types.ts'
+import { PERMISSION_MODE_VALUES } from '../types.ts'
 
 /** One pending permission request, tagged with the session it belongs to. */
 interface PendingPermission {
@@ -53,6 +55,19 @@ interface PendingDialog {
   sessionId: string
   id: string
   payload: Record<string, unknown>
+}
+
+/**
+ * One file-rewind in flight through its confirm popover: the anchor message,
+ * the preview the CLI answered with, and whether the apply already ran (the
+ * popover then shows the result posture with the CLI's own skipped-links
+ * report instead of the confirm buttons).
+ */
+interface RewindTarget {
+  sessionId: string
+  userMessageId: string
+  result: RewindResult
+  applied: boolean
 }
 
 /** One session's folded live turn plus the delta counter it was folded to. */
@@ -204,7 +219,13 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   const [commandCache, setCommandCache] = useState<CommandCache | undefined>(readCommandCache)
   const [connected, setConnected] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+  /** Alt+P 信号：每次递增请求模型菜单自开（0 是未触发默认值，挂载永不生效）。 */
+  const [modelMenuSignal, setModelMenuSignal] = useState(0)
+  /** Alt+T 切换的回退档位：会话最近一次显式 effort，见下方热键 effect。 */
+  const lastEffortRef = useRef('')
   const [envSessionId, setEnvSessionId] = useState<string | undefined>()
+  /** 待确认/待展示结果的文件回滚，见 RewindTarget。 */
+  const [rewindTarget, setRewindTarget] = useState<RewindTarget | undefined>()
   const [error, setError] = useState<string | undefined>()
   const currentIdRef = useRef(currentId)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -238,6 +259,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   }), [])
   useOverlay(showSettings)
   useOverlay(envSessionId !== undefined)
+  useOverlay(rewindTarget !== undefined)
 
   const current = sessions.find(session => session.id === currentId)
   const events = currentId !== undefined ? eventsBySession[currentId] ?? NO_EVENTS : NO_EVENTS
@@ -413,12 +435,17 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   const refreshCommands = useCallback((id: string): void => {
     fetchCommands(id)
       .then(result => {
-        if (result.available) adoptCommands(id, result.commands)
+        // A stale answer is the server's remembered catalog for a cold session;
+        // adopting it is fine (it usually matches the local cache) but it must
+        // not displace a live catalog that an earlier fetch already landed.
+        if (result.available && !(result.stale === true && commandsBySession[id] !== undefined)) {
+          adoptCommands(id, result.commands)
+        }
       })
       .catch(() => {
         // Best effort; the next menu open retries.
       })
-  }, [adoptCommands])
+  }, [adoptCommands, commandsBySession])
 
   useEffect(() => {
     let disposed = false
@@ -727,6 +754,46 @@ export function CcApp(props: { onClose(): void }): ReactElement {
     return () => window.removeEventListener('keydown', onKey, true)
   }, [props.onClose])
 
+  // 会话最近一次显式 effort 档：Alt+T 从「默认」切回时用它。
+  useEffect(() => {
+    if (current?.effort) lastEffortRef.current = current.effort
+  }, [current?.effort])
+
+  // CLI 三手势：Shift+Tab 轮换权限模式、Alt+P 开模型菜单、Alt+T 切换思考档。
+  // 全部经 refs 读当前会话（流帧高频重渲本组件，effect 不随其重订阅）；守卫与
+  // Esc 相同：IME 组合键与任何打开的浮层都让位。失败统一进错误条。
+  useEffect(() => {
+    const onHotkey = (event: KeyboardEvent): void => {
+      if (event.isComposing || event.keyCode === 229) return
+      if (overlaysRef.current.size > 0) return
+      const id = currentIdRef.current
+      if (id === undefined) return
+      const session = sessionsRef.current.find(item => item.id === id)
+      if (session === undefined) return
+      if (event.shiftKey && event.key === 'Tab') {
+        event.preventDefault()
+        const from = session.permissionMode || config?.permissionMode || 'auto'
+        const index = PERMISSION_MODE_VALUES.indexOf(from as never)
+        const next = PERMISSION_MODE_VALUES[(index + 1) % PERMISSION_MODE_VALUES.length]
+        void setPermissionMode(id, next).catch(fail)
+        return
+      }
+      if (event.altKey && (event.key === 'p' || event.key === 'P')) {
+        event.preventDefault()
+        setModelMenuSignal(value => value + 1)
+        return
+      }
+      if (event.altKey && (event.key === 't' || event.key === 'T')) {
+        event.preventDefault()
+        const effort = session.effort ?? ''
+        const target = effort !== '' ? '' : (lastEffortRef.current || 'high')
+        void setEffort(id, target).catch(fail)
+      }
+    }
+    window.addEventListener('keydown', onHotkey, true)
+    return () => window.removeEventListener('keydown', onHotkey, true)
+  }, [config?.permissionMode, fail])
+
   const decide = (requestId: string, answer: PermissionAnswer): void => {
     if (current === undefined) return
     answerPermission(current.id, requestId, answer).catch(fail)
@@ -742,13 +809,25 @@ export function CcApp(props: { onClose(): void }): ReactElement {
    */
   const deletedIdsRef = useRef<Set<string>>(new Set())
 
+  /**
+   * A recalled queued message waiting to re-enter the composer's draft. The
+   * nonce makes every recall a distinct request even when the text repeats;
+   * the composer consumes it append-only, so nothing typed meanwhile is lost.
+   */
+  const [restoreRequest, setRestoreRequest] = useState<{ text: string; nonce: number } | undefined>()
+  const restoreNonceRef = useRef(0)
+  const recallQueuedText = useCallback((text: string): void => {
+    restoreNonceRef.current += 1
+    setRestoreRequest({ text, nonce: restoreNonceRef.current })
+  }, [])
+
   // The rail/composer/status callbacks below are stable across delta frames:
   // every streaming frame re-renders this root, and inline closures would
   // defeat the child memoization that keeps a 268-row rail from reconciling
   // on each stream chunk. `currentIdRef`/`sessionsRef` carry the current
   // selection instead of closing over per-render state.
   const openSettings = useCallback(() => setShowSettings(true), [])
-  const create = useCallback((form: { cwd?: string; model?: string }) => {
+  const create = useCallback((form: { cwd?: string; model?: string; name?: string }) => {
     createSession(form)
       .then(result => {
         // Deleted while this response was in flight (frozen page or stalled
@@ -810,6 +889,52 @@ export function CcApp(props: { onClose(): void }): ReactElement {
     const id = currentIdRef.current
     if (id !== undefined) backgroundTask(id, taskId).catch(fail)
   }, [fail])
+  // 时间旅行两入口：都从 refs 读当前会话（Transcript 是 memo 组件，回调必须
+  // 稳定，否则每帧流式重渲都会击穿整列转录的 memo）。
+  const forkFrom = useCallback((event: Extract<CcEvent, { kind: 'user' }>): void => {
+    const id = currentIdRef.current
+    const messageId = event.nativeMessageId
+    if (id === undefined || messageId === undefined) return
+    forkSession(id, { upToMessageId: messageId })
+      .then(result => {
+        setCurrentId(result.sessionId)
+        // The fork route refreshed the catalog before answering, but its SSE
+        // frame and this response race; one direct list read settles the new
+        // row even when the frame was lost on a stalled stream.
+        fetchSessions()
+          .then(list => setSessions(list.sessions))
+          .catch(() => {
+            // The next sessions frame lands the same rows.
+          })
+      })
+      .catch(fail)
+  }, [fail])
+  const rewindFrom = useCallback((event: Extract<CcEvent, { kind: 'user' }>): void => {
+    const id = currentIdRef.current
+    const messageId = event.nativeMessageId
+    if (id === undefined || messageId === undefined) return
+    rewindPreview(id, messageId)
+      .then(result => {
+        setRewindTarget({ sessionId: id, userMessageId: messageId, result, applied: false })
+      })
+      .catch(fail)
+  }, [fail])
+  const applyRewind = (): void => {
+    const target = rewindTarget
+    if (target === undefined || target.applied) return
+    rewindApply(target.sessionId, target.userMessageId)
+      .then(result => {
+        setRewindTarget({ ...target, result, applied: true })
+        // The files on disk changed; the transcript text did not, but a fresh
+        // read is the cheapest way to settle anything derived from it.
+        fetchSession(target.sessionId)
+          .then(detail => mergeSessionEvents(target.sessionId, detail.events))
+          .catch(() => {
+            // The rewind itself succeeded; the next selection re-reads anyway.
+          })
+      })
+      .catch(fail)
+  }
 
   return (
     <OverlayContext.Provider value={overlaySignal}>
@@ -854,13 +979,16 @@ export function CcApp(props: { onClose(): void }): ReactElement {
               context={context}
               usage={usage}
               fallbackCostUsd={current.totalCostUsd}
+              modelMenuSignal={modelMenuSignal}
             />
           )}
 
           {current !== undefined && (current.queued ?? 0) > 0 && (
-            <div className="cc-queued-note">
-              已排队 {current.queued} 条消息，将在本轮结束后发出
-            </div>
+            <QueuedList
+              sessionId={current.id}
+              count={current.queued ?? 0}
+              onRecall={recallQueuedText}
+            />
           )}
 
           {error !== undefined && (
@@ -882,7 +1010,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                     pinnedRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80
                   }}
                 >
-                  <Transcript events={events} commands={commandsFor(current)} />
+                  <Transcript events={events} commands={commandsFor(current)} onFork={forkFrom} onRewind={rewindFrom} />
                   <LiveTurnView turn={live} />
                   {events.length === 0 && live === undefined
                     && <div className="cc-empty">发送第一条消息，开始与 Claude Code 对话</div>}
@@ -916,11 +1044,13 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                 <Composer
                   sessionId={current.id}
                   cwd={current.cwd}
+                  configDir={current.configDir}
                   commands={commandsFor(current)}
                   onRefreshCommands={refreshCommandsForCurrent}
                   busy={current.status === 'busy'}
                   readOnly={current.terminalOwned === true}
                   onSend={send}
+                  restoreRequest={restoreRequest}
                   onStop={stop}
                 />
               </>
@@ -950,6 +1080,43 @@ export function CcApp(props: { onClose(): void }): ReactElement {
               fetchSessions().then(result => setSessions(result.sessions)).catch(fail)
             }}
           />
+        )}
+        {rewindTarget !== undefined && (
+          <Modal
+            open
+            onClose={() => setRewindTarget(undefined)}
+            title="回滚文件"
+            closeLabel="关闭"
+            footer={rewindTarget.applied
+              ? <Button variant="primary" onClick={() => setRewindTarget(undefined)}>知道了</Button>
+              : (
+                <>
+                  <Button onClick={() => setRewindTarget(undefined)}>取消</Button>
+                  <Button variant="primary" onClick={applyRewind}>回滚</Button>
+                </>
+              )}
+          >
+            <div className="cc-rewind">
+              <div className="cc-rewind-hint">
+                {rewindTarget.applied
+                  ? '已把会话修改过的文件恢复到该消息时的状态；对话记录本身不变。'
+                  : '将把会话修改过的文件恢复到这条消息时的状态；对话记录本身不变，文件改动不经过回收站。'}
+              </div>
+              <div className="cc-rewind-stats">
+                {rewindTarget.applied ? '已回滚 ' : '将回滚 '}
+                {rewindTarget.result.filesChanged?.length ?? 0}
+                {' 个文件'}
+                {rewindTarget.result.insertions !== undefined || rewindTarget.result.deletions !== undefined
+                  ? `（+${rewindTarget.result.insertions ?? 0} 行 / -${rewindTarget.result.deletions ?? 0} 行）`
+                  : ''}
+              </div>
+              {(rewindTarget.result.skippedLinks ?? 0) > 0 && (
+                <div className="cc-rewind-warn">
+                  有 {rewindTarget.result.skippedLinks} 个文件因符号链接或备份不可读等原因未被回滚，请手动检查。
+                </div>
+              )}
+            </div>
+          </Modal>
         )}
       </div>
     </OverlayContext.Provider>

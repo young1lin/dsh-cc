@@ -419,6 +419,30 @@ body.cc-resizing { cursor: col-resize; user-select: none; }
 .cc-row { display: flex; align-items: center; gap: 8px; }
 .cc-spacer { flex: 1; }
 
+/* ── file-rewind confirm popover ──────────────────────────── */
+.cc-rewind {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cc-rewind-hint {
+  font: var(--dsw-font-xs-13);
+  color: var(--dsw-alias-label-secondary);
+}
+
+.cc-rewind-stats {
+  font: var(--dsw-font-xs-13);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* Link-safety refusals the real rewind reports: the restore happened, but
+   these files need a human look — warn, don't error. */
+.cc-rewind-warn {
+  font: var(--dsw-font-xs-13);
+  color: var(--dsw-alias-state-warn-primary);
+}
+
 .cc-mono {
   font: var(--dsw-font-markdown-code-block-small);
   font-family: var(--ds-font-family-code);
@@ -483,5 +507,91 @@ body.cc-resizing { cursor: col-resize; user-select: none; }
 @media (prefers-reduced-motion: reduce) {
   .cc-overlay { animation: none; }
   .cc-dock, .cc-session, .cc-session-action, .cc-project-row .cc-chevron svg { transition: none; }
+}
+`)
+
+/* Appended sheets live below the shell sheet: each adds its own registration
+   instead of editing the shell text above, so independently developed
+   features never collide inside one template literal. */
+
+/* The characters an @-mention query matched in a roster path — brand blue and
+   one weight up, the same recognition cue as the composer's slash-command
+   token (MentionPicker wraps the matched runs in this class). */
+registerCss('mention-highlight', `
+.cc-mention-hit { color: var(--dsw-alias-brand-primary); font-weight: 600; }
+`)
+
+/* The expandable queued-messages strip under the status bar: the host-held
+   messages waiting for the next model-call boundary, one row each with a
+   recall control (QueuedList renders it). */
+registerCss('queued-list', `
+.cc-queued-strip {
+  border-bottom: 1px solid var(--dsw-alias-border-l2);
+  font: var(--dsw-font-xs-13);
+}
+
+.cc-queued-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 5px 20px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  color: var(--dsw-alias-state-warn-primary);
+  font: inherit;
+}
+
+.cc-queued-chevron {
+  display: inline-flex;
+  flex: none;
+  transition: transform 150ms var(--ds-ease-in-out);
+}
+
+.cc-queued-head[aria-expanded='true'] .cc-queued-chevron { transform: rotate(90deg); }
+
+.cc-queued-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 20px 8px;
+}
+
+.cc-queued-row { display: flex; align-items: center; gap: 8px; }
+
+.cc-queued-time {
+  flex: none;
+  color: var(--dsw-alias-label-tertiary);
+  font: var(--dsw-font-xxs-12);
+}
+
+.cc-queued-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.cc-queued-empty { padding: 2px 0 6px; color: var(--dsw-alias-label-tertiary); }
+
+.cc-queued-recall {
+  flex: none;
+  padding: 1px 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-secondary);
+  font: var(--dsw-font-xxs-12);
+  cursor: pointer;
+}
+
+.cc-queued-recall:hover { border-color: var(--dsw-alias-border-l3); color: var(--dsw-alias-label-primary); }
+
+@media (prefers-reduced-motion: reduce) {
+  .cc-queued-chevron { transition: none; }
 }
 `)
