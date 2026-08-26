@@ -68,23 +68,39 @@ const NO_EVENTS: CcEvent[] = []
 const NO_COMMANDS: SlashCommand[] = []
 
 /** localStorage key holding the last live slash-command catalog (see CcApp). */
-const COMMAND_CACHE_KEY = 'dsh-cc:commands-v1'
+const COMMAND_CACHE_KEY = 'dsh-cc:commands-v2'
+
+/**
+ * The persisted slash-command catalog, stamped with the environment it was
+ * read under: the list mixes built-ins, project commands (`cwd`), and account
+ * skills (`configDir`), so an unstamped cache would offer one project's
+ * `/deploy` in another project's menu — and paint the recognition token on
+ * drafts the CLI would reject.
+ */
+interface CommandCache {
+  cwd: string
+  configDir: string
+  commands: SlashCommand[]
+}
 
 /**
  * Read the persisted slash-command catalog; anything unreadable, absent, or
- * wrong-shaped reads as empty (the first live fetch rewrites it).
- * @returns the cached commands, or a shared empty list.
+ * wrong-shaped reads as absent (the first live fetch rewrites it).
+ * @returns the stamped cache, or undefined.
  */
-function readCommandCache(): SlashCommand[] {
+function readCommandCache(): CommandCache | undefined {
   try {
     const raw = localStorage.getItem(COMMAND_CACHE_KEY)
-    if (raw === null) return NO_COMMANDS
+    if (raw === null) return undefined
     const parsed: unknown = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return NO_COMMANDS
-    return parsed.filter((item): item is SlashCommand =>
+    if (typeof parsed !== 'object' || parsed === null) return undefined
+    const { cwd, configDir, commands } = parsed as { cwd?: unknown; configDir?: unknown; commands?: unknown }
+    if (typeof cwd !== 'string' || typeof configDir !== 'string' || !Array.isArray(commands)) return undefined
+    const clean = commands.filter((item): item is SlashCommand =>
       typeof item === 'object' && item !== null && typeof (item as SlashCommand).name === 'string')
+    return { cwd, configDir, commands: clean }
   } catch {
-    return NO_COMMANDS
+    return undefined
   }
 }
 
@@ -156,13 +172,13 @@ export function CcApp(props: { onClose(): void }): ReactElement {
    */
   const [commandsBySession, setCommandsBySession] = useState<Record<string, SlashCommand[]>>({})
   /**
-   * The last live catalog, persisted across page loads: every session runs
-   * the same CLI payload, so after ANY session has gone live once, cold
-   * sessions (a restarted dsh, a page opened before the first turn) can open
-   * the menu with it instead of claiming an empty catalog. A live fetch
-   * always wins and rewrites the cache.
+   * The last live catalog, persisted across page loads, stamped with the
+   * environment it was read under (cwd + account root): the command list
+   * mixes built-ins, project commands, and account skills, so the cache only
+   * serves a session in the same environment. A live fetch always wins and
+   * rewrites the cache.
    */
-  const [cachedCommands, setCachedCommands] = useState<SlashCommand[]>(readCommandCache)
+  const [commandCache, setCommandCache] = useState<CommandCache | undefined>(readCommandCache)
   const [connected, setConnected] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [envSessionId, setEnvSessionId] = useState<string | undefined>()
@@ -298,12 +314,21 @@ export function CcApp(props: { onClose(): void }): ReactElement {
    */
   const refreshTelemetry = (id: string | undefined): void => {
     if (id === undefined) return
+    // Both readouts are single global states under the current session's
+    // status bar; a slow answer from a session the user already left must
+    // not land there (the currency check mirrors the commands fetch below).
     fetchUsage(id)
-      .then(result => setUsage(result.usage))
-      .catch(() => setUsage(undefined))
+      .then(result => {
+        if (currentIdRef.current === id) setUsage(result.usage)
+      })
+      .catch(() => {
+        if (currentIdRef.current === id) setUsage(undefined)
+      })
     fetchContext(id)
       .then(result => {
-        if (result.available && result.context !== undefined) setContext(result.context)
+        if (currentIdRef.current === id && result.available && result.context !== undefined) {
+          setContext(result.context)
+        }
       })
       .catch(() => {
         // A cold session has no live process to ask; the meter stays hidden.
@@ -312,7 +337,8 @@ export function CcApp(props: { onClose(): void }): ReactElement {
 
   /**
    * Adopt a freshly read catalog: per-session for freshness, and into the
-   * persistent global cache so cold sessions can open the menu after a
+   * persistent cache (stamped with this session's environment) so cold
+   * sessions in the SAME project and account can open the menu after a
    * restart.
    * @param id - the session the catalog was read from.
    * @param commands - the live catalog.
@@ -320,12 +346,31 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   const adoptCommands = (id: string, commands: SlashCommand[]): void => {
     setCommandsBySession(previous => ({ ...previous, [id]: commands }))
     if (commands.length === 0) return
-    setCachedCommands(commands)
+    const session = sessions.find(item => item.id === id)
+    if (session === undefined) return
+    const entry: CommandCache = { cwd: session.cwd, configDir: session.configDir ?? '', commands }
+    setCommandCache(entry)
     try {
-      localStorage.setItem(COMMAND_CACHE_KEY, JSON.stringify(commands))
+      localStorage.setItem(COMMAND_CACHE_KEY, JSON.stringify(entry))
     } catch {
       // Private mode or quota: the in-memory copy still serves this page.
     }
+  }
+
+  /**
+   * The command catalog a session should read right now: its live fetch when
+   * one landed, else the persisted cache — but only when the cache was read
+   * under the same cwd and account root, since the list is environment-bound.
+   * @param session - the session the menu/token is for.
+   * @returns the commands; a stable empty list when nothing applies.
+   */
+  const commandsFor = (session: SessionMeta): readonly SlashCommand[] => {
+    const live = commandsBySession[session.id]
+    if (live !== undefined) return live
+    if (commandCache === undefined) return NO_COMMANDS
+    return commandCache.cwd === session.cwd && commandCache.configDir === (session.configDir ?? '')
+      ? commandCache.commands
+      : NO_COMMANDS
   }
 
   /**
@@ -717,7 +762,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                     pinnedRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80
                   }}
                 >
-                  <Transcript events={events} commands={commandsBySession[current.id] ?? cachedCommands} />
+                  <Transcript events={events} commands={commandsFor(current)} />
                   <LiveTurnView turn={live} />
                   {events.length === 0 && live === undefined
                     && <div className="cc-empty">发送第一条消息，开始与 Claude Code 对话</div>}
@@ -755,7 +800,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                 <Composer
                   sessionId={current.id}
                   cwd={current.cwd}
-                  commands={commandsBySession[current.id] ?? cachedCommands}
+                  commands={commandsFor(current)}
                   onRefreshCommands={() => refreshCommands(current.id)}
                   busy={current.status === 'busy'}
                   readOnly={current.terminalOwned === true}

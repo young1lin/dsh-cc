@@ -139,6 +139,13 @@ export interface ResolvedConfig {
   model: string
   permissionMode: NonNullable<ClaudeCodeConfig['permissionMode']>
   env: Record<string, string>
+  /**
+   * Provider-scope keys to strip from the inherited environment at spawn.
+   * Carried while a preset owns the provider scope: a key it omits must not
+   * leak through from the shell that launched dsh — per-key layering can
+   * override an inherited value but never remove it.
+   */
+  envDeletes?: readonly string[]
   maxLiveSessions: number
   maxTurns: number
   executablePath: string

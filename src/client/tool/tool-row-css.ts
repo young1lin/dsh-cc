@@ -75,7 +75,7 @@ export const TOOL_ROW_CSS = `
   margin-left: 6px;
   white-space: nowrap;
   font: var(--dsw-font-s-14);
-  color: var(--dsw-alias-label-quaternary);
+  color: var(--dsw-alias-label-dimmed);
 }
 
 .cc-tool-body { display: flex; flex-direction: column; }
@@ -174,7 +174,7 @@ export const TOOL_ROW_CSS = `
 }
 
 .cc-todo-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cc-todo-item[data-status='completed'] .cc-todo-label { color: var(--dsw-alias-label-quaternary); text-decoration: line-through; }
+.cc-todo-item[data-status='completed'] .cc-todo-label { color: var(--dsw-alias-label-dimmed); text-decoration: line-through; }
 .cc-todo-item[data-status='in_progress'] .cc-todo-label { color: var(--dsw-alias-label-primary); font-weight: 500; }
 
 /* Subagent report: prose at the transcript's own markdown size, set in from the

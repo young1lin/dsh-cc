@@ -72,6 +72,7 @@ export function CommandMenu(props: {
           aria-selected={index === props.selected}
           data-selected={index === props.selected}
           onPointerEnter={() => props.onSelectedChange(index)}
+          onMouseDown={event => event.preventDefault()}
           onClick={() => props.onPick(command)}
         >
           <span className="cc-menu-row-name">/{command.name}</span>

@@ -153,8 +153,18 @@ export class SessionEngine {
    * Whether the main stream has opened at least one block this turn. A turn
    * that ends without any is one the model never ran — a local slash command
    * answering straight from the CLI — and its final text is command output.
+   * Reset only at CLI-reported turn boundaries (non-replay user echo, result),
+   * never in send(): a message queued mid-turn must not flip it under the
+   * envelope still in flight.
    */
   private streamedThisTurn = false
+  /**
+   * Whether the turn in progress was started by a `/` command — the only
+   * input that can produce local-command output. Guarding the
+   * command-output classification on it keeps a zero-stream envelope that is
+   * NOT command output (an interrupt acknowledgement) out of the bucket.
+   */
+  private turnWasCommand = false
   /** The session's live task table in start order; display state only. */
   private readonly taskTable = new Map<string, TaskRow>()
   /** Trailing CLI stderr, capped at STDERR_TAIL_LIMIT characters. */
@@ -279,8 +289,15 @@ export class SessionEngine {
     this.lastUsed = Date.now()
     this.lastSend = { text, images }
     this.ensureStarted()
+    // A locally-dispatched command turn NEVER echoes a user message (verified
+    // against the payload: init → synthetic assistant → result, no echo), so
+    // the turn's command-ness is seeded here and only refined by a later
+    // echo. The stream flag resets only when no turn is in flight: a message
+    // QUEUED under a streaming turn must not flip the flag under the envelope
+    // still in flight — that envelope's own message_start already armed it.
+    if (!this.busy) this.streamedThisTurn = false
+    this.turnWasCommand = text.trimStart().startsWith('/')
     this.busy = true
-    this.streamedThisTurn = false
     // Images lead the content list: the model reads the attachment before the
     // sentence about it, which is the order the CLI's own client uses.
     // @-mentions follow the text: the sentence names the reference first, the
@@ -641,6 +658,27 @@ export class SessionEngine {
     if (changed) this.publishTasks()
   }
 
+  /**
+   * The child's whole environment: everything this process carries, the
+   * config layer applied over it, and — while a preset owns the provider
+   * scope — that scope's omitted keys stripped, so they cannot leak in from
+   * the shell that launched dsh. Windows env vars are case-insensitive, so
+   * the common case variants of each deleted key go too.
+   */
+  private spawnEnvironment(): Record<string, string> {
+    const env: Record<string, string> = {}
+    for (const [key, value] of Object.entries(process.env)) {
+      if (value !== undefined) env[key] = value
+    }
+    Object.assign(env, this.config.env)
+    for (const key of this.config.envDeletes ?? []) {
+      delete env[key]
+      delete env[key.toLowerCase()]
+      delete env[key.toUpperCase()]
+    }
+    return env
+  }
+
   private ensureStarted(): void {
     if (this.started) return
     this.started = true
@@ -649,7 +687,7 @@ export class SessionEngine {
     const options: Options = {
       cwd: this.startSpec.cwd,
       abortController: this.abort,
-      env: { ...process.env, ...this.config.env },
+      env: this.spawnEnvironment(),
       permissionMode,
       // The SDK refuses to skip permission checks unless the caller restates
       // the intent through this companion flag.
@@ -745,6 +783,7 @@ export class SessionEngine {
         // transcript row survives reloads instead of living one SSE broadcast.
         const localCommand = !('isReplay' in message)
           && message.parent_tool_use_id === null
+          && this.turnWasCommand
           && !this.streamedThisTurn
         let emittedText = false
         for (const block of message.message.content) {
@@ -773,6 +812,15 @@ export class SessionEngine {
         if ('isReplay' in message) return
         const content = message.message.content
         const blocks = typeof content === 'string' ? [{ type: 'text' as const, text: content }] : content
+        // The non-replay user echo refines the turn state seeded at send: a
+        // command turn announces itself either way the CLI echoes it — the
+        // raw `/cmd` text or the expanded `<command-name>` marker XML. A
+        // tool_result echo mid-loop also lands here; it clears the stream
+        // flag, which the next envelope's own message_start re-arms before
+        // that envelope completes.
+        this.streamedThisTurn = false
+        this.turnWasCommand = blocks.some(block => block.type === 'text'
+          && (block.text.trimStart().startsWith('/') || block.text.includes('<command-name>')))
         for (const block of blocks) {
           if (block.type === 'tool_result') {
             const text = toolResultText(block.content)
@@ -791,6 +839,8 @@ export class SessionEngine {
       }
       case 'result': {
         this.busy = false
+        this.streamedThisTurn = false
+        this.turnWasCommand = false
         const isError = message.subtype !== 'success' || message.is_error === true
         this.publish({
           kind: 'result',

@@ -70,7 +70,11 @@ export async function mentionBlocks(
   const blocks: { type: 'text'; text: string }[] = []
   let budget = MAX_TOTAL_BYTES
   for (const token of scanMentionPaths(text)) {
-    const path = isAbsolute(token) ? resolve(token) : resolve(cwd, token)
+    // Always through the session cwd: on Windows a drive-relative token
+    // (`\notes\a.md`, `/notes/a.md`) counts as "absolute" to isAbsolute but
+    // would anchor to the dsh process's own drive — resolve(cwd, ·) keeps
+    // it on the session's, and drive-ful absolutes still win outright.
+    const path = resolve(cwd, token)
     const info = await stat(path).catch(() => undefined)
     if (info === undefined) continue
     if (info.isFile()) {
@@ -81,9 +85,8 @@ export async function mentionBlocks(
         blocks.push({ type: 'text', text: `<file path="${displayPath(path, cwd)}">（已省略：附件总量超限）</file>` })
         continue
       }
-      const body = file.content.slice(0, budget)
-      const cut = body.length < file.content.length
-      budget -= body.length
+      const { body, cut } = cutToBytes(file.content, budget)
+      budget -= Buffer.byteLength(body)
       const notes = [
         ...(file.truncated ? ['文件超过 2MB，仅开头部分'] : []),
         ...(cut ? ['附件总量超限，仅开头部分'] : []),
@@ -94,9 +97,8 @@ export async function mentionBlocks(
       })
     } else if (info.isDirectory()) {
       const tree = await folderTree(path)
-      const body = tree.slice(0, Math.max(budget, 0))
-      const cut = body.length < tree.length
-      budget -= body.length
+      const { body, cut } = cutToBytes(tree, Math.max(budget, 0))
+      budget -= Buffer.byteLength(body)
       blocks.push({
         type: 'text',
         text: `<folder path="${displayPath(path, cwd)}">\n${body}${cut ? '\n（已省略：附件总量超限）' : ''}\n</folder>`,
@@ -104,6 +106,36 @@ export async function mentionBlocks(
     }
   }
   return blocks
+}
+
+/**
+ * Cut text to a UTF-8 byte budget. A `.slice` by code units counts UTF-16
+ * units, letting CJK attachments through at up to 3× the cap; this cuts at
+ * the byte boundary (binary search, so a 1MB budget stays cheap) and never
+ * ends inside a surrogate pair.
+ * @param text - the candidate body.
+ * @param maxBytes - the byte budget remaining.
+ * @returns the body and whether it is shorter than the input.
+ */
+function cutToBytes(text: string, maxBytes: number): { body: string; cut: boolean } {
+  const clean = (end: number): number => {
+    // A trailing high surrogate would re-encode as U+FFFD; drop the pair half.
+    const last = end > 0 ? text.charCodeAt(end - 1) : 0
+    return last >= 0xd800 && last <= 0xdbff ? end - 1 : end
+  }
+  if (Buffer.byteLength(text) <= maxBytes) {
+    const end = clean(text.length)
+    return { body: text.slice(0, end), cut: end < text.length }
+  }
+  let low = 0
+  let high = text.length
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2)
+    if (Buffer.byteLength(text.slice(0, mid)) <= maxBytes) low = mid
+    else high = mid - 1
+  }
+  const end = clean(low)
+  return { body: text.slice(0, end), cut: end < text.length }
 }
 
 /**

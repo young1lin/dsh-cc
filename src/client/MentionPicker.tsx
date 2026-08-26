@@ -99,6 +99,7 @@ export function MentionPicker(props: {
           data-selected={index === props.selected}
           title={row.climb ? '上一级' : row.directory ? '提及整个文件夹（注入目录树）' : '提及此文件'}
           onPointerEnter={() => props.onSelectedChange(index)}
+          onMouseDown={event => event.preventDefault()}
           onClick={() => props.onActivate(index)}
         >
           <span className={row.directory ? 'cc-menu-row-name cc-menu-row-folder' : 'cc-menu-row-name'}>{row.name}</span>

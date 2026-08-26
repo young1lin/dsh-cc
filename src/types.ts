@@ -59,6 +59,13 @@ export const PROVIDER_ENV_KEYS = {
 export type ProviderEnvField = keyof typeof PROVIDER_ENV_KEYS
 
 /**
+ * The env var names of {@link PROVIDER_ENV_KEYS}: the key scope a preset
+ * owns while it is active. Shared by the runtime's preset composition and
+ * the spawn-time deletion, so the two can never drift apart.
+ */
+export const PROVIDER_ENV_NAMES: readonly string[] = Object.values(PROVIDER_ENV_KEYS)
+
+/**
  * Image media types mapped onto the file extension each one is stored under.
  * Shared by the blob store (forward direction) and the blob-serving URL
  * table (inverse), so the two can never drift apart.
@@ -73,9 +80,11 @@ export const MEDIA_TYPE_EXTENSIONS = {
 /**
  * Which layer supplied a resolved configuration value. Later layers win:
  * a session override beats page settings, which beat the cordis plugin
- * config, which beats the environment dsh itself was launched with.
+ * config, which beats the environment dsh itself was launched with. An
+ * active preset sits beside the page layer but owns the provider key
+ * scope outright — its keys replace, its omissions remove.
  */
-export type ConfigLayer = 'process' | 'plugin' | 'settings' | 'session' | 'account'
+export type ConfigLayer = 'process' | 'plugin' | 'settings' | 'preset' | 'session' | 'account'
 
 /**
  * One named Claude Code home. Switching to it repoints `CLAUDE_CONFIG_DIR` for
@@ -362,10 +371,34 @@ export interface CcSettings {
    * reads.
    */
   env: Record<string, string>
+  /**
+   * Named provider-env bundles the settings page switches between. While
+   * {@link activePresetId} names one, it owns the provider key scope: its
+   * keys replace every other layer, its omissions remove the key entirely —
+   * including one inherited from the environment dsh itself was launched
+   * with, which per-key layering can never express.
+   */
+  presets: EnvPreset[]
+  /** The preset in force; empty = none, and `env` layers per key as before. */
+  activePresetId: string
   /** Account roots the page can switch between. */
   accounts: CcAccount[]
   /** The selected account's id; empty = the cordis/host default root. */
   activeAccountId: string
+}
+
+/**
+ * One named bundle of the provider-scope environment. Two seeded presets —
+ * a logged-in account with nothing but the proxy, and a gateway relay —
+ * are the switch this exists for; more can be saved from the form.
+ */
+export interface EnvPreset {
+  /** Stable id; the seeded ones keep theirs across saves. */
+  id: string
+  /** Display name. */
+  name: string
+  /** The provider-scope env keys this preset applies; an empty value removes the key. */
+  env: Record<string, string>
 }
 
 /** One entry of a directory listing. */

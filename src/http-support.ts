@@ -12,6 +12,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { open, readdir, stat } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { dirname, join, resolve } from 'node:path'
+import { PROVIDER_ENV_NAMES } from './types.ts'
 import type { DirListing, EffectiveEnvEntry } from './types.ts'
 
 /**
@@ -32,6 +33,9 @@ const CLI_ENV_INJECTED = /^CLAUDE_CODE_(SESSION_ID|CHILD_SESSION|ENTRYPOINT|EXEC
 
 /** Keys whose values are credentials; the page only ever sees them masked. */
 const SECRET_KEY = /(TOKEN|KEY|SECRET|PASSWORD|COOKIE)$/i
+
+/** Cap on one directory page: a pathological directory must not serialize unbounded. */
+const DIR_PAGE_LIMIT = 1000
 
 /**
  * Read one directory page for the picker; an undefined path lists drive roots.
@@ -60,6 +64,7 @@ export async function readDirListing(pathname: string | undefined): Promise<DirL
       left.directory === right.directory
         ? left.name.localeCompare(right.name)
         : left.directory ? -1 : 1)
+    .slice(0, DIR_PAGE_LIMIT)
   const parent = dirname(dir) !== dir ? dirname(dir) : null
   return { path: dir, parent, entries }
 }
@@ -142,8 +147,24 @@ export function effectiveEnvEntries(
   plugin: Record<string, string>,
   settings: Record<string, string>,
   account: Record<string, string> = {},
+  preset?: { env: Record<string, string>; removed: readonly string[] },
 ): EffectiveEnvEntry[] {
-  const winner = new Map<string, { value: string; layer: EffectiveEnvEntry['layer'] }>()
+  const winner = new Map<string, { value: string; layer: EffectiveEnvEntry['layer']; removed?: boolean }>()
+  // While a preset owns the provider scope, its omissions remove the key from
+  // EVERY layer below it — including the process environment the CLI would
+  // otherwise inherit — so those keys drop out of the map here and re-enter
+  // as explicit removal rows: an inherited gateway credential silently
+  // vanishing is exactly the question this dialog exists to answer. A removal
+  // row is shown only for a key some lower layer actually carried; removing a
+  // key nobody set is not an event.
+  const removed = new Set((preset?.removed ?? []).map(key => key.toUpperCase()))
+  const isRemoved = (key: string): boolean => removed.size > 0 && removed.has(key.toUpperCase())
+  const providerScope = preset === undefined ? undefined : new Set(PROVIDER_ENV_NAMES.map(key => key.toUpperCase()))
+  const isPresetOwned = (key: string): boolean =>
+    providerScope !== undefined && providerScope.has(key.toUpperCase())
+  /** Every key any lower layer carries, uppercased — removal-row eligibility. */
+  const present = new Set<string>()
+  const note = (key: string): void => { present.add(key.toUpperCase()) }
   // The CLI is spawned with this process's environment, so a variable set in
   // the shell that launched dsh reaches Claude Code even though no dsh-cc
   // layer mentions it. Reporting it is what makes "which endpoint am I
@@ -151,19 +172,41 @@ export function effectiveEnvEntries(
   for (const [key, value] of Object.entries(process.env)) {
     if (value === undefined) continue
     if (!CLI_ENV_KEY.test(key) || CLI_ENV_INJECTED.test(key)) continue
+    note(key)
+    if (isRemoved(key)) continue
     winner.set(key, { value, layer: 'process' })
   }
   // Each layer overwrites the previous one key by key, mirroring
   // effectiveConfig: a settings entry beats the plugin entry of the same name,
   // and a plugin entry the settings layer never mentions survives. The process
   // layer underpins both — the CLI inherits it from the spawn regardless.
-  for (const [key, value] of Object.entries(plugin)) winner.set(key, { value, layer: 'plugin' })
-  for (const [key, value] of Object.entries(settings)) winner.set(key, { value, layer: 'settings' })
+  for (const [key, value] of Object.entries(plugin)) {
+    note(key)
+    if (isRemoved(key) || isPresetOwned(key)) continue
+    winner.set(key, { value, layer: 'plugin' })
+  }
+  for (const [key, value] of Object.entries(settings)) {
+    note(key)
+    if (isRemoved(key) || isPresetOwned(key)) continue
+    winner.set(key, { value, layer: 'settings' })
+  }
+  if (preset !== undefined) {
+    for (const [key, value] of Object.entries(preset.env)) {
+      if (value === '') continue
+      winner.set(key, { value, layer: 'preset' })
+    }
+    for (const key of preset.removed) {
+      if (!present.has(key.toUpperCase())) continue
+      // The marker is display-only and never a secret; masked:false keeps the
+      // SECRET_KEY branch below from masking the marker itself.
+      winner.set(key, { value: '（已由预设移除）', layer: 'preset', removed: true })
+    }
+  }
   for (const [key, value] of Object.entries(account)) winner.set(key, { value, layer: 'account' })
   return [...winner.entries()]
-    .map(([key, { value, layer }]) => SECRET_KEY.test(key)
-      ? { key, value: maskSecret(value), masked: true, layer }
-      : { key, value, masked: false, layer })
+    .map(([key, { value, layer, removed: isRemoval }]) => isRemoval === true || !SECRET_KEY.test(key)
+      ? { key, value, masked: false, layer }
+      : { key, value: maskSecret(value), masked: true, layer })
     .sort((left, right) => left.key.localeCompare(right.key))
 }
 

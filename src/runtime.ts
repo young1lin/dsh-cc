@@ -22,10 +22,12 @@ import { reduceDelta, type LiveTurn } from './live-turn.ts'
 import { deleteNativeSession, renameNativeSession } from './native-sessions.ts'
 import { SessionStore } from './store.ts'
 import type {
-  AccountSummary, CcAccount, CcEvent, CcEventInput, CcSettings, ConfigSummary,
-  EffortLevel, ImageRef, LiveTurnSnapshot, PermissionDestination, PermissionModeValue, SessionMeta, TaskRow, WireMessage,
+  AccountSummary, CcAccount, CcEvent, CcEventInput, CcSettings, ConfigSummary, EffortLevel, EnvPreset,
+  ImageRef, LiveTurnSnapshot, PermissionDestination, PermissionModeValue, SessionMeta, TaskRow, WireMessage,
 } from './types.ts'
-import { DEFAULT_EFFORT_LEVELS, MEDIA_TYPE_EXTENSIONS, PERMISSION_MODE_VALUES, TERMINAL_TASK_STATUSES } from './types.ts'
+import {
+  DEFAULT_EFFORT_LEVELS, MEDIA_TYPE_EXTENSIONS, PERMISSION_MODE_VALUES, PROVIDER_ENV_NAMES, TERMINAL_TASK_STATUSES,
+} from './types.ts'
 
 const MAX_BODY_BYTES = 1024 * 1024
 
@@ -233,19 +235,49 @@ export class CcRuntime {
   private effectiveConfig(): ResolvedConfig {
     const overrides = this.settings
     const configDir = this.activeConfigDir()
-    return {
+    const base = {
       ...this.baseConfig,
       configDir,
       model: overrides.model !== '' ? overrides.model : this.baseConfig.model,
       permissionMode: overrides.permissionMode !== ''
         ? overrides.permissionMode as ResolvedConfig['permissionMode']
         : this.baseConfig.permissionMode,
-      // The account root rides in the env layer rather than being poked into
-      // the spawn separately, so the engine's spawn-time env comparison sees an
-      // account switch as the environment change it is and recycles the idle
-      // engines still pointed at the old home. It is last because no other
-      // layer may supply this key: both env editors reject it.
-      env: { ...this.baseConfig.env, ...overrides.env, [CONFIG_DIR_ENV]: configDir },
+    }
+    const preset = overrides.presets.find(candidate => candidate.id === overrides.activePresetId)
+    if (preset === undefined) {
+      return {
+        ...base,
+        // The account root rides in the env layer rather than being poked into
+        // the spawn separately, so the engine's spawn-time env comparison sees an
+        // account switch as the environment change it is and recycles the idle
+        // engines still pointed at the old home. It is last because no other
+        // layer may supply this key: both env editors reject it.
+        env: { ...this.baseConfig.env, ...overrides.env, [CONFIG_DIR_ENV]: configDir },
+      }
+    }
+    // A preset owns the provider key scope outright. Within it, the preset is
+    // the whole truth: its keys replace the cordis and page layers, and a key
+    // it omits is REMOVED — from those layers and from the environment dsh
+    // itself inherited, which per-key layering can override but never delete.
+    // That removal is what makes 账号直连 possible on a machine whose shell
+    // exports a gateway's credentials to every process it spawns.
+    const providerScope = new Set(PROVIDER_ENV_NAMES.map(key => key.toUpperCase()))
+    const isProviderKey = (key: string): boolean => providerScope.has(key.toUpperCase())
+    const env: Record<string, string> = {}
+    for (const [key, value] of Object.entries(this.baseConfig.env)) {
+      if (!isProviderKey(key)) env[key] = value
+    }
+    for (const [key, value] of Object.entries(overrides.env)) {
+      if (!isProviderKey(key)) env[key] = value
+    }
+    for (const [key, value] of Object.entries(preset.env)) {
+      if (value !== '') env[key] = value
+    }
+    const envDeletes = PROVIDER_ENV_NAMES.filter(key => preset.env[key] === undefined || preset.env[key] === '')
+    return {
+      ...base,
+      env: { ...env, [CONFIG_DIR_ENV]: configDir },
+      envDeletes,
     }
   }
 
@@ -272,13 +304,26 @@ export class CcRuntime {
   private configFor(session: SessionMeta): ResolvedConfig {
     const base = this.effectiveConfig()
     const effort = this.effortFor(session)
-    const env = Object.keys(session.env ?? {}).length > 0
+    const layered = Object.keys(session.env ?? {}).length > 0
+    const env = layered
       // The account root is re-asserted after the session layer: a row
       // persisted before accounts existed may still carry the key, and honoring
       // it would spawn against a home the catalog is not reading.
       ? { ...base.env, ...session.env, [CONFIG_DIR_ENV]: base.configDir }
       : base.env
-    return { ...base, env, permissionMode: this.permissionModeFor(session), ...(effort !== undefined ? { effort } : {}) }
+    // A session override that re-adds a key a preset removed is deliberate:
+    // the session layer outranks the preset, so the deletion must not strip
+    // it back off at spawn.
+    const envDeletes = layered
+      ? base.envDeletes?.filter(key => session.env?.[key] === undefined)
+      : base.envDeletes
+    return {
+      ...base,
+      env,
+      ...(envDeletes !== undefined ? { envDeletes } : {}),
+      permissionMode: this.permissionModeFor(session),
+      ...(effort !== undefined ? { effort } : {}),
+    }
   }
 
   /**
@@ -399,6 +444,21 @@ export class CcRuntime {
       }
     }
     const accounts = normalizeAccounts(body.accounts)
+    // Presets are whole env bundles; a stray CLAUDE_CONFIG_DIR inside one
+    // would move the spawned process without moving the plugin's reads —
+    // the same fork the settings env refuses, named before any is saved.
+    for (const item of Array.isArray(body.presets) ? body.presets : []) {
+      if (typeof item === 'object' && item !== null && typeof (item as { env?: unknown }).env === 'object'
+        && (item as { env: Record<string, unknown> }).env !== null
+        && CONFIG_DIR_ENV in (item as { env: Record<string, unknown> }).env) {
+        return json(res, { error: `预设里的 ${CONFIG_DIR_ENV} 请在「账号」里配置，环境变量层不接收它。` }, 400)
+      }
+    }
+    const presets = normalizePresets(body.presets)
+    const activePresetId = typeof body.activePresetId === 'string'
+      && presets.some(preset => preset.id === body.activePresetId)
+      ? body.activePresetId
+      : ''
     // The list is editable here; which one is ACTIVE is not — that is its own
     // endpoint. But editing the list can still move the root out from under the
     // plugin: deleting the active account, or repointing its directory. That is
@@ -415,7 +475,7 @@ export class CcRuntime {
         return json(res, { error: `有 ${busy} 个会话正在运行，等它们结束再改动当前账号的目录。` }, 409)
       }
     }
-    this.settings = { model, permissionMode, env, accounts, activeAccountId }
+    this.settings = { model, permissionMode, env, presets, activePresetId, accounts, activeAccountId }
     persistSettings(this.baseConfig.dataDir, this.settings)
     if (moved) {
       // Same cascade as an explicit switch: move the environment, then drop
@@ -547,6 +607,17 @@ export class CcRuntime {
   /** The webserver route handler for the /cc/api prefix. */
   readonly handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const url = new URL(req.url ?? '/', 'http://localhost')
+    // The loopback fence. This prefix reads the whole machine's filesystem
+    // (file viewer, directory picker) and the CLI's stores, and nothing else
+    // validates Host for prefix routes — so a page from any other origin
+    // would reach it via DNS rebinding (attacker.com resolving to 127.0.0.1,
+    // a same-origin GET that needs no CORS). Only loopback hostnames may
+    // name us.
+    const rawHost = req.headers.host ?? ''
+    const host = (rawHost.startsWith('[') ? rawHost.slice(1, rawHost.indexOf(']')) : rawHost.split(':')[0]).toLowerCase()
+    if (host !== 'localhost' && host !== '127.0.0.1' && host !== '::1') {
+      return json(res, { error: '拒绝非本机 Host 的请求' }, 403)
+    }
     const parts = url.pathname.replace(/^\/cc\/api\/?/, '').split('/').filter(Boolean)
     const method = req.method ?? 'GET'
     try {
@@ -628,6 +699,13 @@ export class CcRuntime {
           }
           const key = row.id
           const claudeSessionId = row.claudeSessionId
+          // The send path's gate, for the same reason: a terminal claude is
+          // appending to this very transcript, and deleting the file under it
+          // would resurrect a truncated session on the next rescan (or fail
+          // EPERM halfway, after the sidecar is already gone).
+          if (this.catalog.terminalOwned(row.id)) {
+            return json(res, { error: '该会话正由终端中的 Claude 进程使用，等它退出后再删除' }, 409)
+          }
           // Stop our own writer first: it holds the very native file about to
           // be deleted open and would keep appending to it. Closing an engine
           // destroys nothing — the conversation resumes on the next send.
@@ -660,8 +738,10 @@ export class CcRuntime {
             return json(res, { error: '名称需为 1-80 个字符' }, 400)
           }
           await this.patchMeta(session.id, { name })
-          // Title the CLI's record too, so `claude --resume` lists the same name.
-          if (session.claudeSessionId !== undefined) {
+          // Title the CLI's record too, so `claude --resume` lists the same
+          // name — but never the record another process is appending to: the
+          // page-side rename alone carries a terminal-owned row.
+          if (session.claudeSessionId !== undefined && !this.catalog.terminalOwned(session.id)) {
             try {
               await renameNativeSession(session.claudeSessionId, name, { cwd: session.cwd })
             } catch (error) {
@@ -1267,12 +1347,18 @@ export class CcRuntime {
 
   private configSummary(): ConfigSummary {
     const effective = this.effectiveConfig()
+    const preset = this.settings.presets.find(candidate => candidate.id === this.settings.activePresetId)
     return {
       dataDir: this.baseConfig.dataDir,
       defaultCwd: this.baseConfig.cwd,
       model: effective.model,
       permissionMode: effective.permissionMode,
-      env: effectiveEnvEntries(this.baseConfig.env, this.settings.env, { [CONFIG_DIR_ENV]: effective.configDir }),
+      env: effectiveEnvEntries(
+        this.baseConfig.env,
+        this.settings.env,
+        { [CONFIG_DIR_ENV]: effective.configDir },
+        preset === undefined ? undefined : { env: preset.env, removed: effective.envDeletes ?? [] },
+      ),
       liveSessions: this.engines.size,
       sdkVersion: this.sdkVersion,
       ...(this.account !== undefined ? { account: this.account } : {}),
@@ -1452,7 +1538,71 @@ function readDestination(value: unknown): PermissionDestination | undefined {
 }
 
 /** Default settings: every field empty, so the cordis config stays authoritative. */
-const EMPTY_SETTINGS: CcSettings = { model: '', permissionMode: '', env: {}, accounts: [], activeAccountId: '' }
+const EMPTY_SETTINGS: Omit<CcSettings, 'presets' | 'activePresetId'> = {
+  model: '', permissionMode: '', env: {}, accounts: [], activeAccountId: '',
+}
+
+/**
+ * Validate the preset list from a settings write or a settings file: ids and
+ * names must be non-empty strings, env keys follow the same shape rules as
+ * the settings env (the account-owned key is refused earlier, in the route),
+ * and the list is capped so a runaway writer cannot grow the file unbounded.
+ * @param value - the raw `presets` field.
+ * @returns the valid presets, in order.
+ */
+function normalizePresets(value: unknown): EnvPreset[] {
+  if (!Array.isArray(value)) return []
+  const presets: EnvPreset[] = []
+  for (const item of value.slice(0, 16)) {
+    if (typeof item !== 'object' || item === null) continue
+    const { id, name, env } = item as { id?: unknown; name?: unknown; env?: unknown }
+    if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(id)) continue
+    if (typeof name !== 'string' || name.trim() === '') continue
+    const clean: Record<string, string> = {}
+    if (typeof env === 'object' && env !== null) {
+      for (const [key, entry] of Object.entries(env as Record<string, unknown>)) {
+        if (typeof entry !== 'string') continue
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue
+        clean[key] = entry
+      }
+    }
+    presets.push({ id, name: name.trim(), env: clean })
+  }
+  return presets
+}
+
+/**
+ * The presets a first run — or a settings file from before presets existed —
+ * starts with. The GLM bundle snapshots whatever provider environment this
+ * process itself inherited, so on a machine already pointed at a gateway the
+ * preset works on first click; the account bundle is everything else stripped
+ * back to just the proxy, which is what 账号直连 means on such a machine.
+ * @returns the two seeded presets.
+ */
+function seedPresets(): EnvPreset[] {
+  const proxy: Record<string, string> = {
+    HTTP_PROXY: process.env.HTTP_PROXY ?? process.env.http_proxy ?? 'http://127.0.0.1:7890',
+    HTTPS_PROXY: process.env.HTTPS_PROXY ?? process.env.https_proxy ?? 'http://127.0.0.1:7890',
+    NO_PROXY: process.env.NO_PROXY ?? process.env.no_proxy ?? 'localhost,127.0.0.1',
+  }
+  const glm: Record<string, string> = {
+    ...proxy,
+    ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL ?? 'https://open.bigmodel.cn/api/anthropic',
+  }
+  // Snapshot every other provider-scope variable this process carries: the
+  // tier-alias mapping (opus/sonnet/haiku) and a relay's long timeout ride
+  // along with the endpoint and credential instead of silently falling back
+  // to CLI defaults on first switch.
+  for (const key of PROVIDER_ENV_NAMES) {
+    if (key in glm) continue
+    const value = process.env[key]
+    if (value !== undefined && value !== '') glm[key] = value
+  }
+  return [
+    { id: 'account', name: '账号直连', env: proxy },
+    { id: 'glm', name: 'GLM 中转', env: glm },
+  ]
+}
 
 /**
  * Load the page-editable settings file from the data directory.
@@ -1462,7 +1612,9 @@ const EMPTY_SETTINGS: CcSettings = { model: '', permissionMode: '', env: {}, acc
 function loadSettings(dataDir: string): CcSettings {
   try {
     const file = join(dataDir, 'settings.json')
-    if (!existsSync(file)) return { ...EMPTY_SETTINGS, env: {}, accounts: [] }
+    if (!existsSync(file)) {
+      return { ...EMPTY_SETTINGS, env: {}, accounts: [], presets: seedPresets(), activePresetId: '' }
+    }
     const raw = JSON.parse(readFileSync(file, 'utf8')) as Partial<CcSettings>
     const env: Record<string, string> = {}
     if (typeof raw.env === 'object' && raw.env !== null) {
@@ -1478,15 +1630,25 @@ function loadSettings(dataDir: string): CcSettings {
       && accounts.some(account => account.id === raw.activeAccountId)
       ? raw.activeAccountId
       : ''
+    // A file from before presets existed seeds them rather than loading an
+    // empty list; the seed never activates anything, so behavior is
+    // unchanged until a preset is clicked.
+    const presets = raw.presets === undefined ? seedPresets() : normalizePresets(raw.presets)
+    const activePresetId = typeof raw.activePresetId === 'string'
+      && presets.some(preset => preset.id === raw.activePresetId)
+      ? raw.activePresetId
+      : ''
     return {
       model: typeof raw.model === 'string' ? raw.model : '',
       permissionMode: typeof raw.permissionMode === 'string' ? raw.permissionMode : '',
       env,
+      presets,
+      activePresetId,
       accounts,
       activeAccountId,
     }
   } catch {
-    return { ...EMPTY_SETTINGS, env: {}, accounts: [] }
+    return { ...EMPTY_SETTINGS, env: {}, accounts: [], presets: seedPresets(), activePresetId: '' }
   }
 }
 

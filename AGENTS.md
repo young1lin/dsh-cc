@@ -59,6 +59,9 @@ node 半区各模块（读懂 catalog 这一层是理解全局的关键）：
 
 ## 硬性约束
 
+- **测试只允许走 GLM 中转**（用户配额保护；GLM env 全量见 memory）。账号直连预设只属于用户本人操作。
+- **预设键域语义**：`activePresetId` 激活时 `PROVIDER_ENV_KEYS` 键域由预设独占——预设之内的键替换一切层、之外的键从生效环境**删除**（`ResolvedConfig.envDeletes` → engine spawn 剥离，含大小写变体）。这是逐键覆盖表达不了的删除语义，别绕开它去改 spawn env。
+- **`/cc/api` 前缀必须校验 Host 为回环**（`localhost`/`127.0.0.1`/`::1`）：`fs/file`、`fs/list` 能读全盘，宿主 webserver 不校验前缀路由的 Host，没有这道闸 DNS rebinding 就能跨站读文件。动 handle() 入口时保住它。
 - `~/.claude/sessions/` 只读观察：不写不删，不连 `messagingSocketPath`，不碰 `*.key`（PAKE 私有协议，无稳定性承诺）。
 - 不跨进程打断：终端持有的会话在页面上只读，这就是全部控制模型（Windows 无法向别的控制台进程发 Ctrl+C）。
 - SDK 固定 `@anthropic-ai/claude-agent-sdk@0.3.220`（自带 CLI 载荷，与本机 claude 版本无关）。

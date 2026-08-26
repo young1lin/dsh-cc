@@ -222,6 +222,13 @@ export function Composer(props: {
     element.style.height = `${element.scrollHeight}px`
   }, [value])
 
+  // A session a terminal process just adopted turns the box read-only under
+  // whatever was open; a stale popup must not stay keyboard-armed against a
+  // draft the UI simultaneously declares a read-only mirror.
+  useEffect(() => {
+    if (props.readOnly === true) setMenu(undefined)
+  }, [props.readOnly])
+
   // The mention picker's directory follows the typed segment; picking `..`
   // (handled in activateMentionRow) retargets it directly.
   useEffect(() => {
@@ -335,6 +342,10 @@ export function Composer(props: {
     const rest = value.includes(' ') ? value.slice(value.indexOf(' ')) : ''
     setValue(`/${name} ${rest.trimStart()}`)
     setMenu(undefined)
+    // A mouse pick lands with focus on the row's mousedown already prevented,
+    // but a programmatic activation must not strand the caret on an unfocused
+    // box either — typing continues here right after the insert.
+    element?.focus()
     requestAnimationFrame(() => element?.setSelectionRange(name.length + 2, name.length + 2))
   }
 
@@ -351,6 +362,7 @@ export function Composer(props: {
     const next = `${element.value.slice(0, start)}@${token} ${element.value.slice(caret)}`
     setValue(next)
     setMenu(undefined)
+    element.focus()
     const at = start + token.length + 2
     requestAnimationFrame(() => element.setSelectionRange(at, at))
   }
@@ -486,7 +498,15 @@ export function Composer(props: {
             }}
             onPaste={onPaste}
             onFocus={() => setFocused(true)}
-            onBlur={() => setFocused(false)}
+            onBlur={() => {
+              setFocused(false)
+              // A popup that outlives its textarea breaks the Escape
+              // contract: with the composer deregistered, one Escape would
+              // close the whole surface under a still-open menu. Row clicks
+              // are safe here — their mousedown is prevented, so focus never
+              // leaves the textarea on the way to a pick.
+              setMenu(undefined)
+            }}
             onKeyDown={event => {
               // The Enter that confirms an IME candidate is not a submit; some
               // browsers report it only through keyCode 229. A whole-Chinese
@@ -495,8 +515,9 @@ export function Composer(props: {
               if (event.nativeEvent.isComposing || event.keyCode === 229) return
               // An open popup owns the navigation keys first: arrows move the
               // selection, Escape closes the menu (not the input), and
-              // Enter/Tab complete the row instead of submitting.
-              if (!composing && menu !== undefined) {
+              // Enter/Tab complete the row instead of submitting. The readOnly
+              // guard keeps a menu that raced the flip inert.
+              if (!composing && menu !== undefined && props.readOnly !== true) {
                 if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
                   event.preventDefault()
                   const count = menu.kind === 'command' ? filteredCommands.length : mentionRows.length
@@ -512,6 +533,10 @@ export function Composer(props: {
                 }
                 if (event.key === 'Enter' || event.key === 'Tab') {
                   event.preventDefault()
+                  // The mention picker's loading window is not an answer —
+                  // rows may still land, and Enter must not send a half-typed
+                  // `@token` past them.
+                  if (menu.kind === 'mention' && mentionListing === undefined) return
                   const count = menu.kind === 'command' ? filteredCommands.length : mentionRows.length
                   if (count === 0) {
                     // Nothing to complete — the menu is advisory, like the

@@ -20,6 +20,7 @@ dsh-cc 是一个 DSH 外挂双面插件：在 DSH Web GUI 右缘加入一个 **C
 - **用量与上下文读数**：状态栏显示模型 / 档位选择、上下文窗口占用与账户用量
 - 会话持久化：JSONL 转录存放在数据目录，重启 DSH 后会话列表与记录仍在；继续对话自动通过 Claude 原生 session resume
 - 环境变量可配置：`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL`、`HTTPS_PROXY` 等任意变量，通过 profile 的 cordis.patch.yml、结构化 provider 字段或页内设置面板注入
+- **环境预设一键切换**：设置面板顶部预设条（首启自动播种「账号直连」＝只剩代理、「GLM 中转」＝快照本机 GLM 网关配置）。激活的预设整体接管服务商键域——没列出的变量一律从生效环境里移除，**包括 dsh 进程继承的用户级环境变量**（逐键覆盖做不到的删除语义）；可另存 / 删除预设，激活时保存会把表单同步进该预设
 
 ## 安装
 
@@ -92,6 +93,8 @@ Claude Code 把一个账号的全部家当放在同一个根目录下：凭证�
 ### 页面内设置
 
 聊天页面内建的设置面板（SettingsModal）读写 `GET/PUT /cc/api/settings`，持久化到 `dataDir/settings.json`，可改默认模型、`permissionMode` 与环境变量。保存即时生效：空闲引擎被回收、下一条消息用新配置起进程，无需重启 dsh（忙碌回合先跑完）。非空字段覆盖 cordis 配置的同名字段，留空则回落到 cordis 层；`env` 按键合并而非整块替换。
+
+预设（presets）是命名的服务商环境包：`activePresetId` 指向其一时，`PROVIDER_ENV_KEYS` 键域内预设即全部真相——预设里的键替换各层、没列的键从生效环境删除（spawn 时逐键剥离，含大小写变体），这样「账号直连」才能在 shell 里导出了网关凭证的机器上真正回到账号登录。`/cc/api` 前缀整体校验 Host 必须为本机回环，堵住 DNS rebinding 经由 `fs/file`、`fs/list` 读任意文件的通路。
 
 常用环境变量参考：
 
