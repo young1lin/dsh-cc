@@ -15,12 +15,13 @@
 
 import { memo, useMemo, useState, type ReactElement } from 'react'
 import { DisclosureRow, IconThinkOutline14, MarkdownText, type MarkdownFileMentions } from '@deepseek-ai/dsh-client-ui-primitives'
+import { commandToken, matchCommand } from './command-mentions.ts'
 import { registerCss } from './css.ts'
 import { FileViewer } from './FileViewer.tsx'
 import { fileMentionsFor } from './file-mentions.ts'
 import { ToolRow } from './tool/ToolRow.tsx'
 import { stringField } from './tool/wire.ts'
-import { MEDIA_TYPE_EXTENSIONS, type CcEvent } from '../types.ts'
+import { MEDIA_TYPE_EXTENSIONS, type CcEvent, type SlashCommand } from '../types.ts'
 
 registerCss('transcript', `
 /* The user's own turn, drawn from the host's own bubble token and geometry
@@ -65,6 +66,11 @@ registerCss('transcript', `
   color: var(--dsw-alias-label-tertiary);
 }
 
+/* A notice banner's level tint: warnings carry the error color, suggestions
+   step up one shade; plain notices keep the quiet default above. */
+.cc-note-warning { color: var(--dsw-alias-state-error-primary); }
+.cc-note-suggestion { color: var(--dsw-alias-label-secondary); }
+
 .cc-fail {
   align-self: stretch;
   padding: 8px 14px;
@@ -73,6 +79,21 @@ registerCss('transcript', `
   background: var(--dsw-alias-state-error-secondary);
   color: var(--dsw-alias-state-error-primary);
   font: var(--dsw-font-xs-13);
+}
+
+/* Local slash-command output: assistant-style markdown set off by a quiet
+   rail and titled, so it reads as the command's answer, not a model turn. */
+.cc-command-output {
+  align-self: stretch;
+  border-left: 2px solid var(--dsw-alias-border-l3);
+  padding-left: 10px;
+  font: var(--dsw-font-markdown-base);
+}
+.cc-command-output :where(p) { margin: 0.4em 0; }
+.cc-command-output-title {
+  margin-bottom: 2px;
+  font: var(--dsw-font-xxs-12);
+  color: var(--dsw-alias-label-tertiary);
 }
 
 /* Turn tail: the same quiet stats strip the host closes a turn with. */
@@ -262,14 +283,34 @@ function compact(tokens: number): string {
 
 /**
  * Render one non-tool transcript event.
- * @param props - the event, plus the file-mentions resolver its markdown
- * renders with.
+ * @param props - the event, the file-mentions resolver its markdown renders
+ *   with, and the session's cached slash commands for the user row's blue
+ *   command token.
  * @returns the node, or null for an entry with nothing to show.
  */
-function EventItem(props: { event: CcEvent; mentions: MarkdownFileMentions }): ReactElement | null {
+function EventItem(props: {
+  event: CcEvent
+  mentions: MarkdownFileMentions
+  commands: readonly SlashCommand[]
+}): ReactElement | null {
   const { event } = props
   switch (event.kind) {
-    case 'user':
+    case 'user': {
+      // The leading token of a slash command, recognized against the
+      // session's catalog, keeps the composer's blue recognition span in the
+      // settled row too — the same "this will invoke that command" feedback.
+      // The .cc-cmd-token rule itself lives in the composer's sheet, which
+      // co-mounts with the transcript in every session view.
+      const lead = commandToken(event.text)
+      const hit = lead !== undefined ? matchCommand(lead, props.commands) : undefined
+      const body = hit !== undefined && lead !== undefined
+        ? (
+          <>
+            <span className="cc-cmd-token">{lead}</span>
+            {event.text.slice(lead.length)}
+          </>
+        )
+        : event.text
       return (
         <div className="cc-user">
           {event.images !== undefined && event.images.length > 0 && (
@@ -289,9 +330,10 @@ function EventItem(props: { event: CcEvent; mentions: MarkdownFileMentions }): R
               ))}
             </div>
           )}
-          {event.text}
+          {body}
         </div>
       )
+    }
     case 'assistant':
       return (
         <div className="cc-assistant">
@@ -325,6 +367,15 @@ function EventItem(props: { event: CcEvent; mentions: MarkdownFileMentions }): R
     }
     case 'error':
       return <div className="cc-fail">{event.message}</div>
+    case 'commandOutput':
+      return (
+        <div className="cc-command-output">
+          <div className="cc-command-output-title">命令输出</div>
+          <MarkdownText text={event.text} fileMentions={props.mentions} />
+        </div>
+      )
+    case 'notice':
+      return <div className={`cc-note cc-note-${event.level}`}>{event.text}</div>
     default:
       return null
   }
@@ -356,14 +407,20 @@ function ToolItem(props: { item: Extract<Item, { k: 'tool' }>; cwd: string | und
 /**
  * Render a whole transcript.
  *
- * Memo'd on its one prop: the parent re-renders on every stream delta, but
- * the current session's events array keeps its identity until an event
- * actually commits, so the O(n) projection and every ToolRow's card parse
- * run only when the transcript really changed.
- * @param props - the ordered events.
+ * Memo'd on its props: the parent re-renders on every stream delta, but the
+ * current session's events array keeps its identity until an event actually
+ * commits, and the commands array only changes when the session's cached
+ * catalog does, so the O(n) projection and every ToolRow's card parse run
+ * only when the transcript really changed.
+ * @param props - the ordered events, plus the session's cached slash
+ *   commands (the user row's blue command token is best-effort: no cache,
+ *   no blue).
  * @returns the transcript nodes.
  */
-export const Transcript = memo(function Transcript(props: { events: CcEvent[] }): ReactElement {
+export const Transcript = memo(function Transcript(props: {
+  events: CcEvent[]
+  commands: readonly SlashCommand[]
+}): ReactElement {
   const items = useMemo(() => projectTranscript(props.events), [props.events])
   const cwd = useMemo(() => sessionCwd(props.events), [props.events])
   // The state setter is identity-stable, so the resolver changes only when
@@ -374,7 +431,12 @@ export const Transcript = memo(function Transcript(props: { events: CcEvent[] })
     <>
       {items.map((item, index) => item.k === 'tool'
         ? <ToolItem key={`tool:${item.id}`} item={item} cwd={cwd} />
-        : <EventItem key={`event:${item.event.seq}:${index}`} event={item.event} mentions={mentions} />)}
+        : <EventItem
+            key={`event:${item.event.seq}:${index}`}
+            event={item.event}
+            mentions={mentions}
+            commands={props.commands}
+          />)}
       {viewPath !== undefined && <FileViewer path={viewPath} onClose={() => setViewPath(undefined)} />}
     </>
   )

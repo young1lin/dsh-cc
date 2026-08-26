@@ -23,6 +23,7 @@ import {
   type UserDialogResult,
 } from '@anthropic-ai/claude-agent-sdk'
 import type { ResolvedConfig } from './config.ts'
+import { mentionBlocks } from './mentions.ts'
 import type {
   AccountSummary,
   CcEventInput,
@@ -148,6 +149,12 @@ export class SessionEngine {
   private readonly openBlocks = new Set<number>()
   /** Whether the running turn already published its turn-stop. */
   private turnStopped = false
+  /**
+   * Whether the main stream has opened at least one block this turn. A turn
+   * that ends without any is one the model never ran — a local slash command
+   * answering straight from the CLI — and its final text is command output.
+   */
+  private streamedThisTurn = false
   /** The session's live task table in start order; display state only. */
   private readonly taskTable = new Map<string, TaskRow>()
   /** Trailing CLI stderr, capped at STDERR_TAIL_LIMIT characters. */
@@ -273,14 +280,18 @@ export class SessionEngine {
     this.lastSend = { text, images }
     this.ensureStarted()
     this.busy = true
+    this.streamedThisTurn = false
     // Images lead the content list: the model reads the attachment before the
     // sentence about it, which is the order the CLI's own client uses.
+    // @-mentions follow the text: the sentence names the reference first, the
+    // payload sits behind it.
     const content = [
       ...images.map(image => ({
         type: 'image',
         source: { type: 'base64', media_type: image.mediaType, data: image.data },
       })),
       ...(text.length > 0 ? [{ type: 'text', text }] : []),
+      ...await mentionBlocks(text, this.startSpec.cwd),
     ]
     const message = {
       type: 'user',
@@ -703,6 +714,22 @@ export class SessionEngine {
           })
           return
         }
+        if (message.subtype === 'local_command_output') {
+          // A local slash command answered without a model turn; its output is
+          // the transcript row the turn produced.
+          this.publish({ kind: 'commandOutput', text: message.content })
+          return
+        }
+        if (message.subtype === 'informational') {
+          this.publish({
+            kind: 'notice',
+            text: message.content,
+            // 'info' is transcript-mode-only in the CLI; the page folds it
+            // into the quietest level it does render.
+            level: message.level === 'info' ? 'notice' : message.level,
+          })
+          return
+        }
         this.onTaskMessage(message)
         return
       }
@@ -711,11 +738,21 @@ export class SessionEngine {
           ...(message.error !== undefined ? { error: message.error } : {}),
           ...(message.aborted === true ? { aborted: true } : {}),
         }
+        // A main-thread turn whose stream never opened a block is a local
+        // slash command answering without the model (replayed history carries
+        // isReplay and stays out). The CLI displays such output but never
+        // records it, so it publishes under the sidecar-owned kind — the
+        // transcript row survives reloads instead of living one SSE broadcast.
+        const localCommand = !('isReplay' in message)
+          && message.parent_tool_use_id === null
+          && !this.streamedThisTurn
         let emittedText = false
         for (const block of message.message.content) {
           if (block.type === 'text' && block.text.trim().length > 0) {
             emittedText = true
-            this.publish({ kind: 'assistant', text: block.text, ...outcome })
+            this.publish(localCommand
+              ? { kind: 'commandOutput', text: block.text }
+              : { kind: 'assistant', text: block.text, ...outcome })
           } else if (block.type === 'thinking' && block.thinking.trim().length > 0) {
             this.publish({ kind: 'thinking', text: block.thinking })
           } else if (block.type === 'tool_use') {
@@ -892,6 +929,7 @@ export class SessionEngine {
       case 'message_start': {
         this.openBlocks.clear()
         this.turnStopped = false
+        this.streamedThisTurn = true
         // The next main turn clears the settled rows the previous turn left
         // for review; running rows (a backgrounded task) survive.
         this.pruneSettledTasks()
@@ -970,6 +1008,7 @@ export class SessionEngine {
   private async finish(error: Error | undefined): Promise<void> {
     this.busy = false
     this.queryEnded = true
+    this.streamedThisTurn = false
     // Tasks are bound to the CLI process; the transcript cards survive it.
     this.taskTable.clear()
     this.publishTasks()

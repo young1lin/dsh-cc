@@ -42,6 +42,10 @@ import type { CcEvent, SessionMeta } from './types.ts'
  */
 function sidecarOnly(kind: string, subtype: string | undefined): boolean {
   if (kind === 'error') return true
+  // Local-command output and loop banners are display-only in the CLI — it
+  // never writes them to its transcript — so the sidecar is their only
+  // durable home.
+  if (kind === 'commandOutput' || kind === 'notice') return true
   return kind === 'system' && subtype !== 'init'
 }
 

@@ -30,7 +30,7 @@ import { SettingsModal } from './settings/SettingsModal.tsx'
 import { SessionEnvModal } from './settings/SessionEnvModal.tsx'
 import { OverlayContext, useOverlay, type OverlaySignal } from './overlay.ts'
 import { connectEvents } from './api/http.ts'
-import { answerDialog, answerPermission } from './api/interaction.ts'
+import { answerDialog, answerPermission, fetchCommands } from './api/interaction.ts'
 import {
   backgroundTask, createSession, deleteSession, fetchSession, fetchSessions, renameSession, sendMessage,
   stopSession, stopTask,
@@ -38,7 +38,8 @@ import {
 import { fetchConfig } from './api/settings.ts'
 import { fetchContext, fetchUsage, type ContextUsage, type UsageInfo } from './api/telemetry.ts'
 import type {
-  CcEvent, ConfigSummary, LiveTurnSnapshot, PermissionAnswer, PermissionRequest, SessionMeta, TaskRow,
+  CcEvent, ConfigSummary, LiveTurnSnapshot, PermissionAnswer, PermissionRequest, SessionMeta, SlashCommand,
+  TaskRow,
 } from '../types.ts'
 
 /** One pending permission request, tagged with the session it belongs to. */
@@ -62,6 +63,9 @@ interface LiveEntry {
 
 /** Shared empty transcript, so a session with no events keeps one stable identity. */
 const NO_EVENTS: CcEvent[] = []
+
+/** Shared empty command list, so an uncached session keeps one stable identity. */
+const NO_COMMANDS: SlashCommand[] = []
 
 /**
  * Union two views of one session's transcript by `seq`. The SSE stream and a
@@ -123,6 +127,13 @@ export function CcApp(props: { onClose(): void }): ReactElement {
    * restore from the last snapshot when the user switches back.
    */
   const [tasksBySession, setTasksBySession] = useState<Record<string, TaskRow[]>>({})
+  /**
+   * The cached slash-command catalog of EVERY session, keyed by session id:
+   * the composer's menu and the blue recognition token (draft and transcript
+   * rows) read it, and it fills on selection, on menu open, and when a turn
+   * ends — a catalog is readable only while the engine is live.
+   */
+  const [commandsBySession, setCommandsBySession] = useState<Record<string, SlashCommand[]>>({})
   const [connected, setConnected] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [envSessionId, setEnvSessionId] = useState<string | undefined>()
@@ -270,6 +281,21 @@ export function CcApp(props: { onClose(): void }): ReactElement {
       })
   }
 
+  /**
+   * Refetch one session's slash-command catalog into the cache — the
+   * composer's menu-open refresh and the turn-end warm both route here.
+   * @param id - the session whose catalog to read.
+   */
+  const refreshCommands = (id: string): void => {
+    fetchCommands(id)
+      .then(result => {
+        if (result.available) setCommandsBySession(previous => ({ ...previous, [id]: result.commands }))
+      })
+      .catch(() => {
+        // Best effort; the next menu open retries.
+      })
+  }
+
   useEffect(() => {
     let disposed = false
     fetchConfig()
@@ -337,6 +363,19 @@ export function CcApp(props: { onClose(): void }): ReactElement {
             }
             return changed ? next : previous
           })
+          // And their cached slash commands.
+          setCommandsBySession(previous => {
+            const alive = new Set(message.sessions.map(session => session.id))
+            let changed = false
+            const next = { ...previous }
+            for (const id of Object.keys(next)) {
+              if (!alive.has(id)) {
+                delete next[id]
+                changed = true
+              }
+            }
+            return changed ? next : previous
+          })
           // A session a terminal CLI holds open advances its transcript with
           // no engine of ours involved, so nothing streams into the page for
           // it; re-reading is the only way to mirror it.
@@ -383,8 +422,11 @@ export function CcApp(props: { onClose(): void }): ReactElement {
             const existing = previous[message.sessionId] ?? []
             return { ...previous, [message.sessionId]: [...existing, message.event] }
           })
-          if (message.sessionId === currentIdRef.current && message.event.kind === 'result') {
-            refreshTelemetry(currentIdRef.current)
+          if (message.event.kind === 'result') {
+            // A finished turn proves its engine is live, so its command
+            // catalog reads now; warm the cache, watched session or not.
+            refreshCommands(message.sessionId)
+            if (message.sessionId === currentIdRef.current) refreshTelemetry(currentIdRef.current)
           }
           break
         case 'delta': {
@@ -472,6 +514,18 @@ export function CcApp(props: { onClose(): void }): ReactElement {
     setContext(undefined)
     setUsage(undefined)
     refreshTelemetry(currentId)
+    // The command cache loads on selection when the engine is already live
+    // (a returning visit); a cold session reads available:false and stays
+    // empty until its first turn ends or the composer's menu opens.
+    fetchCommands(currentId)
+      .then(result => {
+        if (currentIdRef.current === currentId && result.available) {
+          setCommandsBySession(previous => ({ ...previous, [currentId]: result.commands }))
+        }
+      })
+      .catch(() => {
+        // Best effort; the next menu open retries.
+      })
     return () => {
       stale = true
     }
@@ -615,7 +669,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                     pinnedRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80
                   }}
                 >
-                  <Transcript events={events} />
+                  <Transcript events={events} commands={commandsBySession[current.id] ?? NO_COMMANDS} />
                   <LiveTurnView turn={live} />
                   {events.length === 0 && live === undefined
                     && <div className="cc-empty">发送第一条消息，开始与 Claude Code 对话</div>}
@@ -651,6 +705,10 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                 />
                 <TodoPin key={current.id} events={events} />
                 <Composer
+                  sessionId={current.id}
+                  cwd={current.cwd}
+                  commands={commandsBySession[current.id] ?? NO_COMMANDS}
+                  onRefreshCommands={() => refreshCommands(current.id)}
                   busy={current.status === 'busy'}
                   readOnly={current.terminalOwned === true}
                   // Returned, not caught here: the composer restores the

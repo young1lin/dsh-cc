@@ -249,6 +249,10 @@ export type CcEvent =
   | { kind: 'tool_use'; seq: number; ts: string; toolUseId: string; name: string; input: unknown }
   | { kind: 'tool_result'; seq: number; ts: string; toolUseId: string; text: string; isError: boolean }
   | { kind: 'system'; seq: number; ts: string; subtype: string; data: Record<string, unknown> }
+  /** Output of a local slash command (`/compact`, `/usage`, …) — no model turn ran. */
+  | { kind: 'commandOutput'; seq: number; ts: string; text: string }
+  /** A loop banner: hook feedback, slash-command notices; level picks the styling. */
+  | { kind: 'notice'; seq: number; ts: string; text: string; level: 'notice' | 'suggestion' | 'warning' }
   | {
     kind: 'result'
     seq: number

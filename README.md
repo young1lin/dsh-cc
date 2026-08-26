@@ -13,6 +13,8 @@ dsh-cc 是一个 DSH 外挂双面插件：在 DSH Web GUI 右缘加入一个 **C
 - **权限模式会话级热切换**：状态栏菜单切换六种权限姿态（默认 / 接受编辑 / 计划 / 免打扰 / 跳过全部确认 / 自动），忙碌回合就地切换，持久化为会话默认
 - **底部任务面板**：会话进程正在跑的子代理 / 命令 / 监视 / 工作流的实时进度（token · 时长 · 最近工具），每行「结束」「转后台」控制；随下一回合开始清理已结束行
 - **输入框上方固定当前任务清单**：从转录的清单工具调用推导的 TODO 面板（兼容旧版 TodoWrite 与新版 TaskCreate/TaskUpdate），计划常驻眼前不用翻历史
+- **斜杠命令菜单**：输入框打 `/` 弹出 CLI 的命令目录（内置命令、用户技能、项目命令），↑↓ 选择、Tab/Enter 补全；识别为可调用的命令（含技能）在输入框与转录里显示蓝色识别态；`/compact` 等本地命令的输出以「命令输出」行进转录
+- **@ 文件/文件夹提及**：打 `@` 弹出目录选择器（可向上出工作目录选绝对路径）；手打的 `@相对路径` / `@绝对路径` 同样生效 —— 文件内容与文件夹目录树随消息注入上下文（总量上限 1MB）
 - **文件路径点击查看**：对话文本里反引号包裹的文本文件路径（带分隔符或绝对路径 + 已知文本扩展名）可点击打开查看器，显示磁盘最新内容（行号 + 语法高亮，> 2MB 截断）
 - **图片输入**：粘贴或拖入图片（每张 ≤ 5MB）随消息发送，转录回读同一份内容寻址存储
 - **用量与上下文读数**：状态栏显示模型 / 档位选择、上下文窗口占用与账户用量
@@ -118,6 +120,7 @@ C:/PythonProject/dev/dsh-cc
    ├─ peer-sessions.ts   只读观察 ~/.claude/sessions/<pid>.json 活进程注册表 → terminalOwned
    ├─ engine.ts          每会话一个 SDK query：流式多轮、canUseTool 权限桥、resume
    ├─ live-turn.ts       流式帧折叠 reducer（两半共用，中途加入拿到一致的进行中回合）
+   ├─ mentions.ts        @ 提及展开：文件内容 / 文件夹目录树作为文本块随消息注入
    ├─ blobs.ts           图片字节 SHA-256 内容寻址存储
    ├─ runtime.ts         REST + SSE 路由（/cc/api/*）
    └─ client/            浏览器半区：右缘 dock + 全屏聊天 overlay
@@ -125,6 +128,7 @@ C:/PythonProject/dev/dsh-cc
         App.tsx            会话列表 / 聊天 / 权限与提问卡片 / 设置入口
         SessionRail.tsx    会话侧栏    Transcript.tsx  消息流
         Composer.tsx       输入框      LiveTurnView.tsx  进行中回合
+        CommandMenu.tsx    斜杠命令弹窗 MentionPicker.tsx  @ 文件选择弹窗
         StatusBar.tsx      模型 / 档位 / 上下文 / 用量状态条
         Interaction.tsx    权限审批卡片 + AskUserQuestion 卡片
         api/               fetch + EventSource 封装（http / sessions / settings / telemetry / interaction）
@@ -181,4 +185,6 @@ C:/PythonProject/dev/dsh-cc
 - 每个活跃会话是一个真实 claude 进程，受 `maxLiveSessions`（默认 4）约束；被挤出的进程下次发消息时自动 resume。
 - 转录读取对页面按尾部 800 条截断；完整记录在数据目录的 JSONL 里。
 - 对话文本里的文件路径链接只作用于已完成回合的文本：流式中的文本保持普通代码样式，回合结束落定后才变成可点击链接。
+- 斜杠命令菜单需要活跃引擎（新会话发出第一条消息后可用）；输入框与转录里的蓝色识别态依赖该会话的命令列表缓存，拿不到列表时保持普通文本。
+- `@` 提及只在 `@` 位于行首或空白之后时触发（`user@host` 这类词中 @ 永不触发）；文件夹提及注入的是目录树而非文件内容；二进制或不可读的路径静默保持普通文本；一条消息全部提及的注入总量上限 1MB，超出部分打省略标记。
 - SDK 固定为 `@anthropic-ai/claude-agent-sdk@0.3.220`（自带对应版本 CLI 载荷，与本机安装的 claude 版本无关）。

@@ -1,4 +1,5 @@
 node_modules/
 lib/
-.lab-home/
+.lab-home*/
+.claude/
 *.log

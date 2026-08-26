@@ -47,6 +47,7 @@ node 半区各模块（读懂 catalog 这一层是理解全局的关键）：
 | `accounts.ts` | **账号根目录的唯一所有者**：解析生效的 `CLAUDE_CONFIG_DIR` 并写到 dsh 进程自己的 env 上 |
 | `store.ts` | sidecar 持久化：index.json + 每会话 JSONL |
 | `live-turn.ts` | 流式帧折叠 reducer，**两半共用同一份**，页面中途加入/切回拿到的进行中回合才一致 |
+| `mentions.ts` | 发消息时的 @ 提及展开：文件内容 / 文件夹目录树作为文本块追加（触发规则：行首或空白后的 `@`；总量 1MB 上限） |
 | `blobs.ts` | 图片字节按 SHA-256 内容寻址存储（页面粘贴与转录回读同源同 id） |
 | `config.ts` | schemastery schema；结构化 provider 字段解析成 env 叠加，显式 `env` 永远赢 |
 
