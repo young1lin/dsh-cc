@@ -355,6 +355,17 @@ export const Composer = memo(function Composer(props: {
     element.style.height = `${element.scrollHeight}px`
   }, [value])
 
+  // Mount sizing: an untouched draft never fires the value effect above, so a
+  // fresh session opened at the CSS floor (24px) - shorter than the font's own
+  // line box, which cropped the placeholder's lower half (a CJK row read as
+  // vertically cut). Size once from the element's real metrics on the way in.
+  useEffect(() => {
+    const element = inputRef.current
+    if (element === null) return
+    element.style.height = 'auto'
+    element.style.height = `${element.scrollHeight}px`
+  }, [])
+
   // A session a terminal process just adopted turns the box read-only under
   // whatever was open; a stale popup must not stay keyboard-armed against a
   // draft the UI simultaneously declares a read-only mirror.

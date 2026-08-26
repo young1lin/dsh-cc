@@ -84,6 +84,21 @@ interface Catalog {
 
 const EMPTY_CATALOG: Catalog = { rows: [], current: '', effort: '' }
 
+/** The CLI's stock English display names, localized for the strip; wire values stay untouched. */
+const DISPLAY_NAME_ZH: Record<string, string> = {
+  'Default (recommended)': '默认（推荐）',
+}
+
+/**
+ * Localize a catalog display name when it is one of the CLI's stock rows;
+ * gateway-provided names pass through untouched.
+ * @param name - the displayName from the model catalog.
+ * @returns the label to show in the picker.
+ */
+function localizedDisplayName(name: string): string {
+  return DISPLAY_NAME_ZH[name] ?? name
+}
+
 /**
  * Build one model row's menu label: the alias/value first (bold), then what
  * it actually resolves to only when that is not already obvious from the
@@ -197,7 +212,7 @@ export function ModelMenu(props: { sessionId: string; busy: boolean; openSignal?
     ...effortLevels.map(level => ({ id: level, label: level })),
   ], [effortLevels])
 
-  const modelLabelText = selectedRow?.displayName ?? (catalog.current !== '' ? catalog.current : '默认模型')
+  const modelLabelText = localizedDisplayName(selectedRow?.displayName ?? (catalog.current !== '' ? catalog.current : '默认模型'))
   const effortLabelText = !loaded ? '…' : supportsEffort ? (catalog.effort !== '' ? catalog.effort : '默认思考档位') : '不支持思考档位'
   // Highlight the row matching the live selection; '' highlights the reset
   // entry when the session is genuinely on the plugin default rather than an

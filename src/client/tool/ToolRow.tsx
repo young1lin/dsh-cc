@@ -104,6 +104,19 @@ function safeJson(value: unknown): string {
   }
 }
 
+/** The CLI wraps some tool failures in this pseudo-tag before they cross the wire. */
+const TOOL_ERROR_TAG = /<tool_use_error>([\s\S]*?)<\/tool_use_error>/g
+
+/**
+ * Strip the pseudo-tag wrapper off an error result's text so the raw marker
+ * never reaches the page; unwrapped text passes through unchanged.
+ * @param text - the raw result text as it crossed the wire.
+ * @returns the inner message when the tag is present, else the input.
+ */
+function unwrapToolErrorText(text: string): string {
+  return text.replace(TOOL_ERROR_TAG, '$1')
+}
+
 /**
  * The generic IN/OUT card: structured arguments through the JSON inspector,
  * anything else as text, over the result's own text.
@@ -131,7 +144,7 @@ function GenericCard(props: { input: unknown; result: ToolResult | undefined }):
       {result !== undefined && (
         <div className="cc-io-section">
           <span className="cc-io-label">OUT</span>
-          <span className="cc-io-text" data-error={result.isError}>{result.text}</span>
+          <span className="cc-io-text" data-error={result.isError}>{unwrapToolErrorText(result.text)}</span>
         </div>
       )}
     </div>
