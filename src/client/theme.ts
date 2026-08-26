@@ -387,6 +387,15 @@ body.cc-resizing { cursor: col-resize; user-select: none; }
   font: var(--dsw-font-xs-13);
 }
 
+/* One-line notice under the status strip while the CLI holds messages queued
+   for the next model call (mid-turn sends waiting for the current turn). */
+.cc-queued-note {
+  padding: 5px 20px;
+  border-bottom: 1px solid var(--dsw-alias-border-l2);
+  color: var(--dsw-alias-state-warn-primary);
+  font: var(--dsw-font-xs-13);
+}
+
 .cc-field {
   display: flex;
   flex-direction: column;

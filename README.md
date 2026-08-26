@@ -165,9 +165,9 @@ C:/PythonProject/dev/dsh-cc
 | POST | /cc/api/sessions | 新建会话（可带名称 / cwd / 模型） |
 | GET | /cc/api/sessions/:id | 会话详情 + 转录（尾部 800 条）+ 进行中回合快照 + 任务表快照 |
 | DELETE | /cc/api/sessions/:id | 删除会话（连同 CLI 原生转录）；原生存储删除失败（如 Windows 下文件被终端进程占用）时返回 409 + error，会话保留 |
-| PUT | /cc/api/sessions/:id/name | 重命名（同步改 CLI 记录，`claude --resume` 列表同名） |
+| PUT | /cc/api/sessions/:id/name | 重命名（同步改 CLI 记录，`claude --resume` 列表同名；手动命名后永不被自动命名覆盖） |
 | PUT | /cc/api/sessions/:id/env | 会话级环境层；空闲引擎即时回收，下一条消息用新环境起进程 |
-| POST | /cc/api/sessions/:id/messages | 发送消息（可带图片引用）；终端持有（terminalOwned）的会话返回 409 |
+| POST | /cc/api/sessions/:id/messages | 发送消息（可带图片引用）；回合运行中发送的入队等待，在下一回合边界进入真实对话（`queued` 计数随 sessions 帧下发）；终端持有（terminalOwned）的会话返回 409 |
 | GET | /cc/api/sessions/:id/context | 当前回合上下文占用（需活跃引擎） |
 | GET | /cc/api/sessions/:id/models | 会话视角的模型目录、当前选择与 effort 档位 |
 | POST | /cc/api/sessions/:id/model | 切换模型；持久化为该会话默认，忙碌引擎就地热切换 |

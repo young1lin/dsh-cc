@@ -112,6 +112,23 @@ function withEffortDefaults(rows: readonly unknown[]): unknown[] {
   })
 }
 
+/** Longest auto-derived title; keeps the rename endpoint's 1-80 range intact. */
+const AUTO_TITLE_MAX = 80
+
+/**
+ * Derive the CLI-parity auto title from a session's first user message: its
+ * first line, trimmed and truncated. A slash command is an operation, not
+ * conversation, and an image-only message has no line to take — neither titles
+ * a session, so the timestamp label stands.
+ * @param text - the message body about to be submitted.
+ * @returns the title candidate, or undefined when the message cannot name the session.
+ */
+function deriveAutoTitle(text: string): string | undefined {
+  const firstLine = text.trim().split('\n')[0]?.trim() ?? ''
+  if (firstLine.length === 0 || firstLine.startsWith('/')) return undefined
+  return firstLine.length > AUTO_TITLE_MAX ? `${firstLine.slice(0, AUTO_TITLE_MAX - 1)}…` : firstLine
+}
+
 /**
  * The dsh-cc host runtime. One instance per mounted plugin; disposal closes
  * every live engine and SSE client.
@@ -739,8 +756,15 @@ export class CcRuntime {
             }
           }
           if (sidecar !== undefined) await this.store.remove(key)
-          await this.catalog.refresh()
+          // The response does not wait on the full CLI-store sweep: a cold
+          // sweep (or an event loop stalled by a spawn) stretches it to
+          // seconds while the delete itself already took effect in the store.
+          // Broadcast the cached list now; the native half's disappearance is
+          // picked up by the rescan's signature change and re-broadcast there.
           this.broadcastSessions()
+          void this.catalog.refresh().then(changed => {
+            if (changed) this.broadcastSessions()
+          })
           return json(res, { ok: true })
         }
         if (parts.length === 3 && parts[2] === 'name' && method === 'PUT') {
@@ -751,7 +775,8 @@ export class CcRuntime {
           if (name.length === 0 || name.length > 80) {
             return json(res, { error: '名称需为 1-80 个字符' }, 400)
           }
-          await this.patchMeta(session.id, { name })
+          // A hand-set title is final: no later auto-derivation may replace it.
+          await this.patchMeta(session.id, { name, titleSource: 'user' })
           // Title the CLI's record too, so `claude --resume` lists the same
           // name — but never the record another process is appending to: the
           // page-side rename alone carries a terminal-owned row.
@@ -1056,6 +1081,17 @@ export class CcRuntime {
       engine = this.liveEngine(key)
     }
     if (engine === undefined) engine = this.startEngine(session, session.model)
+    // CLI-parity titling: a page-created draft's first user message becomes
+    // its name, unless the user titled the session by hand first. The
+    // `claudeSessionId === undefined` guard keeps adopted CLI sessions out:
+    // their sidecar rows adopt with messageCount 0 however long the real
+    // conversation is, and their names already carry the CLI's own derivation
+    // (customTitle → summary → firstPrompt).
+    const autoTitle = deriveAutoTitle(text)
+    if (autoTitle !== undefined && session.titleSource !== 'user'
+      && session.messageCount === 0 && session.claudeSessionId === undefined) {
+      await this.patchMeta(key, { name: autoTitle, titleSource: 'auto' })
+    }
     await this.emitEvent(key, { kind: 'user', text, ...(images.length > 0 ? { images } : {}) })
     await engine.send(text, attachments)
     // An engine that died during the send already wrote its terminal status

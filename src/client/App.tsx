@@ -15,7 +15,7 @@
  * @module dsh-cc/client/App
  */
 
-import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react'
 import { Button } from '@deepseek-ai/dsh-client-ui-primitives'
 import { Composer } from './Composer.tsx'
 import { PermissionCard, QuestionCard } from './Interaction.tsx'
@@ -66,6 +66,29 @@ const NO_EVENTS: CcEvent[] = []
 
 /** Shared empty command list, so an uncached session keeps one stable identity. */
 const NO_COMMANDS: SlashCommand[] = []
+
+/** Shared empty task list, so a task-less session keeps one stable identity. */
+const NO_TASKS: TaskRow[] = []
+
+/**
+ * Field fingerprint of one sessions frame: the node half re-serializes the
+ * whole catalog per rescan, so a broadcast carries fresh object identities
+ * even when nothing visible moved (a busy turn bumps the CLI transcript's
+ * mtime → the catalog signature → a frame every 2s for the whole list).
+ * Returning `previous` from the state updater bails the re-render that would
+ * otherwise rebuild the entire rail.
+ * @param list - one sessions frame.
+ * @returns the joined per-row rendered fields.
+ */
+function sessionFingerprint(list: SessionMeta[]): string {
+  return list.map(session => [
+    session.id, session.name, session.cwd, session.status, session.updatedAt,
+    session.model, session.effort ?? '', session.permissionMode ?? '',
+    session.gitBranch ?? '', session.lastGoodModel ?? '', session.lastError ?? '',
+    session.messageCount, session.totalCostUsd, session.queued ?? 0,
+    session.terminalOwned === true,
+  ].join('')).join('')
+}
 
 /** localStorage key holding the last live slash-command catalog (see CcApp). */
 const COMMAND_CACHE_KEY = 'dsh-cc:commands-v2'
@@ -220,9 +243,9 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   const events = currentId !== undefined ? eventsBySession[currentId] ?? NO_EVENTS : NO_EVENTS
   const live = currentId !== undefined ? liveBySession[currentId]?.turn : undefined
 
-  const fail = (cause: unknown): void => {
+  const fail = useCallback((cause: unknown): void => {
     setError(cause instanceof Error ? cause.message : String(cause))
-  }
+  }, [])
 
   useEffect(() => {
     currentIdRef.current = currentId
@@ -336,6 +359,15 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   }
 
   /**
+   * The sessions list mirrored into a ref, so stable callbacks can read the
+   * current rows without depending on the state (and re-created per frame).
+   */
+  const sessionsRef = useRef(sessions)
+  useEffect(() => {
+    sessionsRef.current = sessions
+  })
+
+  /**
    * Adopt a freshly read catalog: per-session for freshness, and into the
    * persistent cache (stamped with this session's environment) so cold
    * sessions in the SAME project and account can open the menu after a
@@ -343,10 +375,10 @@ export function CcApp(props: { onClose(): void }): ReactElement {
    * @param id - the session the catalog was read from.
    * @param commands - the live catalog.
    */
-  const adoptCommands = (id: string, commands: SlashCommand[]): void => {
+  const adoptCommands = useCallback((id: string, commands: SlashCommand[]): void => {
     setCommandsBySession(previous => ({ ...previous, [id]: commands }))
     if (commands.length === 0) return
-    const session = sessions.find(item => item.id === id)
+    const session = sessionsRef.current.find(item => item.id === id)
     if (session === undefined) return
     const entry: CommandCache = { cwd: session.cwd, configDir: session.configDir ?? '', commands }
     setCommandCache(entry)
@@ -355,7 +387,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
     } catch {
       // Private mode or quota: the in-memory copy still serves this page.
     }
-  }
+  }, [])
 
   /**
    * The command catalog a session should read right now: its live fetch when
@@ -378,7 +410,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
    * composer's menu-open refresh and the turn-end warm both route here.
    * @param id - the session whose catalog to read.
    */
-  const refreshCommands = (id: string): void => {
+  const refreshCommands = useCallback((id: string): void => {
     fetchCommands(id)
       .then(result => {
         if (result.available) adoptCommands(id, result.commands)
@@ -386,7 +418,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
       .catch(() => {
         // Best effort; the next menu open retries.
       })
-  }
+  }, [adoptCommands])
 
   useEffect(() => {
     let disposed = false
@@ -410,7 +442,12 @@ export function CcApp(props: { onClose(): void }): ReactElement {
           catchUpCurrent()
           break
         case 'sessions': {
-          setSessions(message.sessions)
+          // Same-fields frame → same render: keep the previous array identity
+          // and skip the rail rebuild (see sessionFingerprint).
+          setSessions(previous =>
+            sessionFingerprint(previous) === sessionFingerprint(message.sessions)
+              ? previous
+              : message.sessions)
           // A live entry whose session is no longer busy belongs to a turn
           // that finished while its result frame was missed (an SSE
           // reconnect); the committed transcript carries the content now.
@@ -517,8 +554,9 @@ export function CcApp(props: { onClose(): void }): ReactElement {
           if (message.event.kind === 'result') {
             // A finished turn proves its engine is live, so its command
             // catalog reads now; warm the cache, watched session or not.
+            // Telemetry needs no fetch here: the node half pushes its own
+            // per-response `telemetry` frame with fresher numbers.
             refreshCommands(message.sessionId)
-            if (message.sessionId === currentIdRef.current) refreshTelemetry(currentIdRef.current)
           }
           break
         case 'delta': {
@@ -636,11 +674,18 @@ export function CcApp(props: { onClose(): void }): ReactElement {
 
   // Follow the stream only while the user is at the bottom: scrolling up to
   // read must not be fought by the stream appending below. Coming back within
-  // the threshold resumes following.
+  // the threshold resumes following. Deltas land many per painted frame; a
+  // synchronous scrollHeight read + scrollTop write per delta would force a
+  // full-transcript layout each time, so the follow coalesces to one per
+  // painted frame.
   useEffect(() => {
     const element = scrollRef.current
     if (element === null) return
-    if (pinnedRef.current) element.scrollTop = element.scrollHeight
+    if (!pinnedRef.current) return
+    const frame = requestAnimationFrame(() => {
+      if (pinnedRef.current && element.isConnected) element.scrollTop = element.scrollHeight
+    })
+    return () => cancelAnimationFrame(frame)
   }, [events.length, live, currentId])
 
   const currentPermissions = permissions.filter(item => item.sessionId === currentId)
@@ -687,6 +732,85 @@ export function CcApp(props: { onClose(): void }): ReactElement {
     answerPermission(current.id, requestId, answer).catch(fail)
   }
 
+  /**
+   * Sessions deleted from this page whose create response may still be in
+   * flight. The create handler re-adds its row when that response lands; a
+   * delete that beat it must veto the re-add, or the row resurrects with no
+   * server twin and no later sessions frame ever comes to correct it (a
+   * sidecar-only delete changes no native signature, so the rescan stays
+   * silent).
+   */
+  const deletedIdsRef = useRef<Set<string>>(new Set())
+
+  // The rail/composer/status callbacks below are stable across delta frames:
+  // every streaming frame re-renders this root, and inline closures would
+  // defeat the child memoization that keeps a 268-row rail from reconciling
+  // on each stream chunk. `currentIdRef`/`sessionsRef` carry the current
+  // selection instead of closing over per-render state.
+  const openSettings = useCallback(() => setShowSettings(true), [])
+  const create = useCallback((form: { cwd?: string; model?: string }) => {
+    createSession(form)
+      .then(result => {
+        // Deleted while this response was in flight (frozen page or stalled
+        // connection): the row must stay gone.
+        if (deletedIdsRef.current.has(result.session.id)) return
+        setSessions(previous => [
+          result.session,
+          ...previous.filter(session => session.id !== result.session.id),
+        ])
+        setCurrentId(result.session.id)
+      })
+      .catch(fail)
+  }, [fail])
+  const remove = useCallback((id: string) => {
+    if (!window.confirm('删除该会话及全部聊天记录？')) return
+    // Optimistic: the row leaves NOW, so a slow or stalled request can never
+    // read as "the delete never completes" — the report behind this fix.
+    deletedIdsRef.current.add(id)
+    setSessions(previous => previous.filter(session => session.id !== id))
+    setCurrentId(previous => (previous === id ? undefined : previous))
+    deleteSession(id)
+      .catch(error => {
+        // 404 = already gone server-side (deleted here or in another tab);
+        // the optimistic removal is the correct end state.
+        if (error instanceof Error && error.message.includes('会话不存在')) return
+        fail(error)
+        // A real refusal (e.g. 409 terminal-owned) restores the row from
+        // server truth rather than leaving a silent gap.
+        fetchSessions()
+          .then(result => setSessions(result.sessions))
+          .catch(() => {
+            // The next sessions frame lands the same truth.
+          })
+      })
+  }, [fail])
+  const rename = useCallback((id: string, name: string) => {
+    renameSession(id, name).catch(fail)
+  }, [fail])
+  const refreshCommandsForCurrent = useCallback(() => {
+    const id = currentIdRef.current
+    if (id !== undefined) refreshCommands(id)
+  }, [refreshCommands])
+  const send = useCallback((text: string, images: Parameters<typeof sendMessage>[2]) => {
+    const id = currentIdRef.current
+    if (id === undefined) return Promise.reject(new Error('没有选中的会话'))
+    // Returned, not caught here: the composer restores the draft it
+    // optimistically cleared when a send never lands.
+    return sendMessage(id, text, images)
+  }, [])
+  const stop = useCallback(() => {
+    const id = currentIdRef.current
+    if (id !== undefined) stopSession(id).catch(fail)
+  }, [fail])
+  const stopTaskForCurrent = useCallback((taskId: string) => {
+    const id = currentIdRef.current
+    if (id !== undefined) stopTask(id, taskId).catch(fail)
+  }, [fail])
+  const backgroundTaskForCurrent = useCallback((taskId: string) => {
+    const id = currentIdRef.current
+    if (id !== undefined) backgroundTask(id, taskId).catch(fail)
+  }, [fail])
+
   return (
     <OverlayContext.Provider value={overlaySignal}>
       <div className="cc-overlay">
@@ -697,30 +821,10 @@ export function CcApp(props: { onClose(): void }): ReactElement {
           connected={connected}
           pending={pendingBySession}
           onSelect={setCurrentId}
-          onCreate={form => {
-            createSession(form)
-              .then(result => {
-                setSessions(previous => [
-                  result.session,
-                  ...previous.filter(session => session.id !== result.session.id),
-                ])
-                setCurrentId(result.session.id)
-              })
-              .catch(fail)
-          }}
-          onDelete={id => {
-            if (!window.confirm('删除该会话及全部聊天记录？')) return
-            deleteSession(id)
-              .then(() => {
-                setSessions(previous => previous.filter(session => session.id !== id))
-                setCurrentId(previous => (previous === id ? undefined : previous))
-              })
-              .catch(fail)
-          }}
-          onRename={(id, name) => {
-            renameSession(id, name).catch(fail)
-          }}
-          onOpenSettings={() => setShowSettings(true)}
+          onCreate={create}
+          onDelete={remove}
+          onRename={rename}
+          onOpenSettings={openSettings}
         />
 
         <main className="cc-main">
@@ -751,6 +855,12 @@ export function CcApp(props: { onClose(): void }): ReactElement {
               usage={usage}
               fallbackCostUsd={current.totalCostUsd}
             />
+          )}
+
+          {current !== undefined && (current.queued ?? 0) > 0 && (
+            <div className="cc-queued-note">
+              已排队 {current.queued} 条消息，将在本轮结束后发出
+            </div>
           )}
 
           {error !== undefined && (
@@ -798,28 +908,20 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                   <div ref={attentionRef} aria-hidden />
                 </div>
                 <TaskPanel
-                  tasks={tasksBySession[current.id] ?? []}
-                  onStop={taskId => {
-                    stopTask(current.id, taskId).catch(fail)
-                  }}
-                  onBackground={taskId => {
-                    backgroundTask(current.id, taskId).catch(fail)
-                  }}
+                  tasks={tasksBySession[current.id] ?? NO_TASKS}
+                  onStop={stopTaskForCurrent}
+                  onBackground={backgroundTaskForCurrent}
                 />
                 <TodoPin key={current.id} events={events} />
                 <Composer
                   sessionId={current.id}
                   cwd={current.cwd}
                   commands={commandsFor(current)}
-                  onRefreshCommands={() => refreshCommands(current.id)}
+                  onRefreshCommands={refreshCommandsForCurrent}
                   busy={current.status === 'busy'}
                   readOnly={current.terminalOwned === true}
-                  // Returned, not caught here: the composer restores the
-                  // draft it optimistically cleared when a send never lands.
-                  onSend={(text, images) => sendMessage(current.id, text, images)}
-                  onStop={() => {
-                    stopSession(current.id).catch(fail)
-                  }}
+                  onSend={send}
+                  onStop={stop}
                 />
               </>
             )}

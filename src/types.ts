@@ -118,6 +118,13 @@ export interface SessionMeta {
   id: string
   /** Display name; defaults to the CLI's own summary, else a timestamp label. */
   name: string
+  /**
+   * Where `name` came from. `user` marks a hand-set title nothing may
+   * auto-replace; `auto` — and absent, on rows written before this flag
+   * existed — marks a derived placeholder the runtime may overwrite with the
+   * session's first user message, mirroring the CLI's own title behavior.
+   */
+  titleSource?: 'auto' | 'user'
   /** Working directory every CLI query of this session runs in. */
   cwd: string
   /** Model override for this session; empty string = Claude Code default. */
@@ -158,6 +165,12 @@ export interface SessionMeta {
   terminalOwned?: boolean
   /** The CLI's own one-line summary of the conversation. */
   summary?: string
+  /**
+   * Messages the live CLI process holds queued for this session — sent while a
+   * turn was already running, waiting to drain into the next model call. Live
+   * state only: cleared when the engine dies.
+   */
+  queued?: number
   /** Per-session environment layered over the plugin settings; e.g. relay endpoints. */
   env?: Record<string, string>
   /**

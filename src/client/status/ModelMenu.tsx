@@ -13,7 +13,7 @@
  * @module dsh-cc/client/status/ModelMenu
  */
 
-import { useEffect, useRef, useState, type ReactElement } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react'
 import { IconChevronDownOutline14, Menu, type MenuEntry } from '@deepseek-ai/dsh-client-ui-primitives'
 import { fetchModels, setEffort, setModel, type ModelRow } from '../api/telemetry.ts'
 import { DEFAULT_EFFORT_LEVELS } from '../../types.ts'
@@ -178,14 +178,17 @@ export function ModelMenu(props: { sessionId: string; busy: boolean }): ReactEle
     ? selectedRow.supportedEffortLevels
     : [...DEFAULT_EFFORT_LEVELS]
 
-  const modelItems: MenuEntry[] = [
+  // Item arrays memoized on their inputs: this menu renders inside the status
+  // strip, and rebuilding label elements per render showed up as stream-rate
+  // churn before the strip was memoized.
+  const modelItems = useMemo<MenuEntry[]>(() => [
     { id: '', label: '默认模型' },
     ...catalog.rows.map(row => ({ id: row.value, label: modelLabel(row) })),
-  ]
-  const effortItems: MenuEntry[] = [
+  ], [catalog.rows])
+  const effortItems = useMemo<MenuEntry[]>(() => [
     { id: '', label: '默认思考档位' },
     ...effortLevels.map(level => ({ id: level, label: level })),
-  ]
+  ], [effortLevels])
 
   const modelLabelText = selectedRow?.displayName ?? (catalog.current !== '' ? catalog.current : '默认模型')
   const effortLabelText = !loaded ? '…' : supportsEffort ? (catalog.effort !== '' ? catalog.effort : '默认思考档位') : '不支持思考档位'

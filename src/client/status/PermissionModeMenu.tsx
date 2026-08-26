@@ -6,7 +6,7 @@
  * @module dsh-cc/client/status/PermissionModeMenu
  */
 
-import { useState, type ReactElement } from 'react'
+import { useMemo, useState, type ReactElement } from 'react'
 import { IconChevronDownOutline14, Menu, type MenuEntry } from '@deepseek-ai/dsh-client-ui-primitives'
 import { setPermissionMode } from '../api/telemetry.ts'
 import { PERMISSION_MODE_VALUES, type PermissionModeValue } from '../../types.ts'
@@ -65,10 +65,11 @@ export function PermissionModeMenu(props: { sessionId: string; sessionMode: stri
   }
   const current = mode !== '' ? mode : props.configMode
   const labelText = `权限：${MODE_META[current as PermissionModeValue]?.label ?? current}`
-  const items: MenuEntry[] = [
+  // The list is constant; memoize so a re-rendered strip cannot rebuild it.
+  const items = useMemo<MenuEntry[]>(() => [
     { id: '', label: '跟随全局默认' },
     ...PERMISSION_MODE_VALUES.map(value => ({ id: value, label: modeLabel(value) })),
-  ]
+  ], [])
   return (
     <>
       <Menu

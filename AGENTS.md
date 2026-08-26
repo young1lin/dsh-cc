@@ -40,7 +40,7 @@ node 半区各模块（读懂 catalog 这一层是理解全局的关键）：
 | 模块 | 职责 |
 |---|---|
 | `runtime.ts` | `/cc/api` HTTP 面：REST 变更 + SSE 推送；重扫 catalog（有页面接入 2s / 无人接入 30s），有变化才广播 `sessions` 帧 |
-| `engine.ts` | 每会话一个 SDK query：流式多轮、`canUseTool` 权限桥；每个成功完成的主线模型响应后探测一次遥测（context/usage）并经 SSE `telemetry` 帧推送 —— 按响应计频，探测在途时丢弃新触发而不排队；关掉的引擎下次发消息按原生 id resume；`maxLiveSessions` LRU 挤出 |
+| `engine.ts` | 每会话一个 SDK query：流式多轮、`canUseTool` 权限桥；回合中发送的消息**宿主侧排队**（CLI 会丢弃流中途插入的用户消息），在该回合 result 的模型调用边界投递，`queued` 计数随 sessions 帧下发；每个成功完成的主线模型响应后探测一次遥测（context/usage）并经 SSE `telemetry` 帧推送 —— 按响应计频，探测在途时丢弃新触发而不排队；关掉的引擎下次发消息按原生 id resume；`maxLiveSessions` LRU 挤出 |
 | `catalog.ts` | **统一会话目录**：CLI 自己的磁盘存储 + dsh-cc sidecar 合并成一张列表 |
 | `native-sessions.ts` / `native-transcript.ts` | 适配 CLI 原生存储（`~/.claude/projects/<encoded-cwd>/<id>.jsonl`）到 `SessionMeta` |
 | `peer-sessions.ts` | 只读观察 `~/.claude/sessions/<pid>.json` 活进程注册表，得出 `terminalOwned` |
@@ -52,7 +52,7 @@ node 半区各模块（读懂 catalog 这一层是理解全局的关键）：
 | `blobs.ts` | 图片字节按 SHA-256 内容寻址存储（页面粘贴与转录回读同源同 id） |
 | `config.ts` | schemastery schema；结构化 provider 字段解析成 env 叠加，显式 `env` 永远赢 |
 
-**核心不变量**：CLI 的存储是会话身份 / 标题 / 转录的唯一权威；sidecar 只存 CLI 表达不了的字段（模型覆盖、env 层、live 状态、计量成本、草稿转录）。两边按原生 id（sidecar 的 `claudeSessionId`）对齐；native 记录上的字段不得泄漏进合并后的 sidecar 行。
+**核心不变量**：CLI 的存储是会话身份 / 标题 / 转录的唯一权威；sidecar 只存 CLI 表达不了的字段（模型覆盖、env 层、live 状态、计量成本、草稿转录、标题来源标记）。两边按原生 id（sidecar 的 `claudeSessionId`）对齐；native 记录上的字段不得泄漏进合并后的 sidecar 行。标题规则对齐 CLI：页面建的草稿在首次发消息时以消息首行自动命名（`titleSource: 'auto'`），手动命名（`titleSource: 'user'`）永不被自动覆盖；收养的 CLI 会话本来就带着 CLI 自己的派生标题，不参与自动命名。
 
 **账号根目录的不变量**：任一时刻只有一个 `CLAUDE_CONFIG_DIR` 生效，由 `accounts.ts` 独家拥有 —— SDK 的 `listSessions` 之流和 `peer-sessions` 都只认 `process.env.CLAUDE_CONFIG_DIR`（无 per-call 选项），所以切账号 = 改写 dsh 进程自己的这个变量。因此 `CLAUDE_CONFIG_DIR` 在两个 env 编辑器里都被拒（写进 env 只会搬动被 spawn 的进程、搬不动插件自己的读，正是要防的分叉），cordis 配置里的则在 `resolveConfig` 提升成 `configDir`。切换时必须把一切从旧根目录读来的缓存一起作废：`account`、`modelCatalog`、catalog signature、所有引擎；有 busy 引擎则拒绝切换（409）。sidecar 行创建时盖 `configDir` 章，`catalog.list()` 按此过滤。
 

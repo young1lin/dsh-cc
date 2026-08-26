@@ -10,7 +10,7 @@
  * @module dsh-cc/client/TodoPin
  */
 
-import { useMemo, useState, type ReactElement } from 'react'
+import { useMemo, useState, memo, type ReactElement } from 'react'
 import { DisclosureRow, IconChecklistOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { registerCss } from './css.ts'
 import { TodoList, todoCard, type TodoItem } from './tool/TodoList.tsx'
@@ -85,7 +85,7 @@ export function currentTodos(events: readonly CcEvent[]): TodoItem[] | undefined
  * @param props.events - the session's transcript.
  * @returns the pin, or null.
  */
-export function TodoPin(props: { events: CcEvent[] }): ReactElement | null {
+export const TodoPin = memo(function TodoPin(props: { events: CcEvent[] }): ReactElement | null {
   const items = useMemo(() => currentTodos(props.events), [props.events])
   const [open, setOpen] = useState(true)
   if (items === undefined) return null
@@ -105,4 +105,4 @@ export function TodoPin(props: { events: CcEvent[] }): ReactElement | null {
       </DisclosureRow>
     </div>
   )
-}
+})

@@ -6,7 +6,7 @@
  * @module dsh-cc/client/StatusBar
  */
 
-import type { ReactElement } from 'react'
+import { memo, type ReactElement } from 'react'
 import type { ContextUsage, UsageInfo } from './api/telemetry.ts'
 import { registerCss } from './css.ts'
 import { ContextMeter } from './status/ContextMeter.tsx'
@@ -44,7 +44,7 @@ registerCss('status-bar', `
  * channel has no running process to ask, but its historical cost is still known).
  * @returns the strip node.
  */
-export function StatusBar(props: {
+export const StatusBar = memo(function StatusBar(props: {
   sessionId: string
   busy: boolean
   sessionMode: string
@@ -61,4 +61,4 @@ export function StatusBar(props: {
       <UsageReadout info={props.usage} fallbackCostUsd={props.fallbackCostUsd} />
     </div>
   )
-}
+})

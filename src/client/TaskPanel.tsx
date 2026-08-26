@@ -6,7 +6,7 @@
  * @module dsh-cc/client/TaskPanel
  */
 
-import { useState, type ReactElement } from 'react'
+import { useState, memo, type ReactElement } from 'react'
 import { Button, DisclosureRow, IconCheckOutline14, IconQueueOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { registerCss } from './css.ts'
 import { compact } from './status/format.ts'
@@ -81,7 +81,7 @@ function duration(ms: number): string {
  * @param props.onBackground - background one task by id.
  * @returns the panel, or null.
  */
-export function TaskPanel(props: { tasks: TaskRow[]; onStop(id: string): void; onBackground(id: string): void }): ReactElement | null {
+export const TaskPanel = memo(function TaskPanel(props: { tasks: TaskRow[]; onStop(id: string): void; onBackground(id: string): void }): ReactElement | null {
   const [open, setOpen] = useState(true)
   const [expanded, setExpanded] = useState<string | undefined>()
   if (props.tasks.length === 0) return null
@@ -153,4 +153,4 @@ export function TaskPanel(props: { tasks: TaskRow[]; onStop(id: string): void; o
       </DisclosureRow>
     </div>
   )
-}
+})

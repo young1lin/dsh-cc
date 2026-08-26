@@ -6,7 +6,7 @@
  * @module dsh-cc/client/SessionRail
  */
 
-import { useEffect, useRef, useState, type ReactElement } from 'react'
+import { useEffect, useMemo, useRef, useState, memo, type ReactElement } from 'react'
 import {
   Button,
   IconChevronLeftOutline14,
@@ -353,7 +353,7 @@ function ProjectGroup(props: {
  *   counts per session, and rail callbacks.
  * @returns the rail node.
  */
-export function SessionRail(props: {
+export const SessionRail = memo(function SessionRail(props: {
   sessions: SessionMeta[]
   currentId: string | undefined
   config: ConfigSummary | undefined
@@ -384,6 +384,9 @@ export function SessionRail(props: {
   const needle = query.trim().toLowerCase()
   const searching = needle.length > 0
   const matched = searching ? filterSessions(props.sessions, needle) : []
+  // Grouped once per sessions identity: the parent memoizes on props, and a
+  // fresh array per render would reconcile every project group anyway.
+  const groups = useMemo(() => groupByProject(props.sessions), [props.sessions])
   /** Total pending interactions across every session, for the thin strip. */
   const totalPending = Object.values(props.pending).reduce((sum, count) => sum + count, 0)
 
@@ -531,7 +534,7 @@ export function SessionRail(props: {
               </>
             )
         ) : (
-          groupByProject(props.sessions).map((group, index) => (
+          groups.map((group, index) => (
             <ProjectGroup
               key={group.cwd}
               group={group}
@@ -573,4 +576,4 @@ export function SessionRail(props: {
       {newCard}
     </aside>
   )
-}
+})

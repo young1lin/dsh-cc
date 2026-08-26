@@ -182,6 +182,14 @@ export class SessionEngine {
    * NOT command output (an interrupt acknowledgement) out of the bucket.
    */
   private turnWasCommand = false
+  /**
+   * Messages sent while a turn was already running, held host-side. The CLI
+   * DROPS a user message pushed onto the stream mid-turn (verified against
+   * the 0.3.220 payload: no queue-operation, no echo, the message vanishes),
+   * so the queue lives here and drains into the input stream only at the
+   * model-call boundary — the moment a turn's result leaves the CLI idle.
+   */
+  private readonly pendingQueue: { message: SDKUserMessage; wasCommand: boolean }[] = []
   /** The session's live task table in start order; display state only. */
   private readonly taskTable = new Map<string, TaskRow>()
   /** Trailing CLI stderr, capped at STDERR_TAIL_LIMIT characters. */
@@ -299,6 +307,11 @@ export class SessionEngine {
 
   /**
    * Submit one user text message, starting the CLI query on first use.
+   *
+   * A send while a turn is still running is HELD, not pushed: the CLI drops a
+   * user message that arrives mid-turn, so it joins {@link pendingQueue} and
+   * enters the real conversation only at the next model-call boundary (the
+   * running turn's result).
    * @param text - the message body.
    */
   async send(text: string, images: SendImage[] = []): Promise<void> {
@@ -306,15 +319,6 @@ export class SessionEngine {
     this.lastUsed = Date.now()
     this.lastSend = { text, images }
     this.ensureStarted()
-    // A locally-dispatched command turn NEVER echoes a user message (verified
-    // against the payload: init → synthetic assistant → result, no echo), so
-    // the turn's command-ness is seeded here and only refined by a later
-    // echo. The stream flag resets only when no turn is in flight: a message
-    // QUEUED under a streaming turn must not flip the flag under the envelope
-    // still in flight — that envelope's own message_start already armed it.
-    if (!this.busy) this.streamedThisTurn = false
-    this.turnWasCommand = text.trimStart().startsWith('/')
-    this.busy = true
     // Images lead the content list: the model reads the attachment before the
     // sentence about it, which is the order the CLI's own client uses.
     // @-mentions follow the text: the sentence names the reference first, the
@@ -327,13 +331,40 @@ export class SessionEngine {
       ...(text.length > 0 ? [{ type: 'text', text }] : []),
       ...await mentionBlocks(text, this.startSpec.cwd),
     ]
-    const message = {
-      type: 'user',
-      message: { role: 'user', content },
-      session_id: this.claudeSessionId ?? '',
-      parent_tool_use_id: null,
-    } as SDKUserMessage
-    this.input.push(message)
+    const entry = {
+      message: {
+        type: 'user',
+        message: { role: 'user', content },
+        session_id: this.claudeSessionId ?? '',
+        parent_tool_use_id: null,
+        // Future per-message cancellation key (query.cancelAsyncMessage);
+        // nothing reads it yet.
+        uuid: randomUUID(),
+      } as SDKUserMessage,
+      // A locally-dispatched command turn NEVER echoes a user message (verified
+      // against the payload: init → synthetic assistant → result, no echo), so
+      // its command-ness seeds at delivery and only a later echo refines it.
+      wasCommand: text.trimStart().startsWith('/'),
+    }
+    if (this.busy) {
+      this.pendingQueue.push(entry)
+      this.patch({ queued: this.pendingQueue.length })
+      return
+    }
+    this.deliver(entry)
+  }
+
+  /**
+   * Hand one built message to the CLI at a moment it can actually accept it:
+   * no turn in flight. Seeding the turn-shape flags here — not in send() — is
+   * what keeps a queued `/cmd` from reclassifying the envelope still running.
+   * @param entry - the queued-built message with its command-ness seed.
+   */
+  private deliver(entry: { message: SDKUserMessage; wasCommand: boolean }): void {
+    this.streamedThisTurn = false
+    this.turnWasCommand = entry.wasCommand
+    this.busy = true
+    this.input.push(entry.message)
   }
 
   /**
@@ -892,9 +923,17 @@ export class SessionEngine {
         return
       }
       case 'result': {
-        this.busy = false
+        // A result is the one model-call boundary: the CLI is idle for exactly
+        // this instant, so a held message enters the real conversation NOW.
+        // Flipping fully idle while the queue is non-empty would strand the
+        // queued turn — the page would lose its stop control and the runtime's
+        // busy guards (settings save, account switch, env recycle) would
+        // close the live engine mid-turn.
+        const next = this.pendingQueue.shift()
         this.streamedThisTurn = false
         this.turnWasCommand = false
+        if (next !== undefined) this.deliver(next)
+        else this.busy = false
         const isError = message.subtype !== 'success' || message.is_error === true
         this.publish({
           kind: 'result',
@@ -910,7 +949,8 @@ export class SessionEngine {
           ...(message.terminal_reason !== undefined ? { terminalReason: message.terminal_reason } : {}),
         })
         this.patch({
-          status: 'idle',
+          status: this.busy ? 'busy' : 'idle',
+          queued: this.pendingQueue.length,
           ...(this.liveModel !== undefined ? { lastGoodModel: this.liveModel } : {}),
           ...(message.total_cost_usd !== undefined ? { totalCostUsd: message.total_cost_usd } : {}),
         })
@@ -1113,6 +1153,9 @@ export class SessionEngine {
     this.busy = false
     this.queryEnded = true
     this.streamedThisTurn = false
+    // The held queue dies with the process: its messages never reached the
+    // CLI, and the host's replay path (lastSend) is the recovery.
+    this.pendingQueue.length = 0
     // Tasks are bound to the CLI process; the transcript cards survive it.
     this.taskTable.clear()
     this.publishTasks()
@@ -1120,11 +1163,11 @@ export class SessionEngine {
     try {
       if (error !== undefined) {
         await this.hooks.emit({ kind: 'error', message: this.describeFailure(error) })
-        await this.hooks.updateMeta({ status: 'error', lastError: error.message })
+        await this.hooks.updateMeta({ status: 'error', lastError: error.message, queued: 0 })
         await this.hooks.onEngineFailure?.(error)
         return
       }
-      await this.hooks.updateMeta({ status: 'idle' })
+      await this.hooks.updateMeta({ status: 'idle', queued: 0 })
     } finally {
       this.onEnd?.()
     }

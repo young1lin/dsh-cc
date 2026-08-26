@@ -10,7 +10,7 @@
  * @module dsh-cc/client/Composer
  */
 
-import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type ReactElement } from 'react'
+import { useEffect, useMemo, useRef, useState, memo, type ClipboardEvent, type DragEvent, type ReactElement } from 'react'
 import { Button, IconSendOutline16, IconStopFill16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { uploadImage } from './api/sessions.ts'
 import { fetchFileIndex, listDir } from './api/settings.ts'
@@ -179,7 +179,7 @@ const MENU_KEYS = new Set(['ArrowDown', 'ArrowUp', 'PageDown', 'PageUp', 'Home',
  *   the recognition token; `onRefreshCommands` refetches on menu open.
  * @returns the composer node.
  */
-export function Composer(props: {
+export const Composer = memo(function Composer(props: {
   sessionId: string
   /** Session working directory — the mention browser's root and the trigger gate. */
   cwd?: string
@@ -244,9 +244,17 @@ export function Composer(props: {
   // absolute path (the reference is the typed path itself, plus the live
   // children of the directory it names) or rides the project index.
   const mentionQuery = menu?.kind === 'mention' ? menu.query : null
-  const exactRow = mentionQuery === null ? null : absoluteReferenceRow(mentionQuery)
+  // The absolute-path derivation returns fresh objects per call, so computing
+  // it bare in render would give the mention-rows memo unstable deps and
+  // re-filter the roster on every parent re-render (every delta frame while
+  // typing a mention during a running turn).
+  const nav = useMemo(() => mentionQuery === null
+    ? { exactRow: null, dirTarget: null }
+    : { exactRow: absoluteReferenceRow(mentionQuery), dirTarget: absoluteDirTarget(mentionQuery) },
+  [mentionQuery])
+  const exactRow = nav.exactRow
+  const dirTarget = nav.dirTarget
   const mentionAbsolute = exactRow !== null
-  const dirTarget = mentionQuery === null ? null : absoluteDirTarget(mentionQuery)
 
   // Warm fetch: one project index per cwd for the composer's lifetime. The
   // attempt nonce is the retry — a fetch that failed once must not blind
@@ -684,4 +692,4 @@ export function Composer(props: {
       </div>
     </div>
   )
-}
+})
