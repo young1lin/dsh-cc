@@ -49,6 +49,19 @@ export function firstLine(text: string, cap = 120): string {
   return line.length > cap ? `${line.slice(0, cap)}…` : line
 }
 
+/** The CLI wraps some tool failures in this pseudo-tag before they cross the wire. */
+const TOOL_ERROR_TAG = /<tool_use_error>([\s\S]*?)<\/tool_use_error>/g
+
+/**
+ * Strip the pseudo-tag wrapper off an error result's text so the raw marker
+ * never reaches the page; unwrapped text passes through unchanged.
+ * @param text - the raw result text as it crossed the wire.
+ * @returns the inner message when the tag is present, else the input.
+ */
+export function unwrapToolErrorText(text: string): string {
+  return text.replace(TOOL_ERROR_TAG, '$1')
+}
+
 /**
  * Shorten an absolute path for display by dropping the session workspace
  * prefix. Both separators are accepted because the CLI reports POSIX paths on a

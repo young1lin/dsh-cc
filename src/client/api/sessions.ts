@@ -8,7 +8,10 @@
 import type { CcEvent, ImageRef, LiveTurnSnapshot, QueuedMessageView, SessionMeta, TaskRow } from '../../types.ts'
 import { api } from './http.ts'
 
-/** GET /sessions — every session the store knows, newest first. */
+/**
+ * GET /sessions — every session the store knows, newest first.
+ * @returns the full merged session list, newest first.
+ */
 export function fetchSessions(): Promise<{ sessions: SessionMeta[] }> {
   return api<{ sessions: SessionMeta[] }>('/sessions')
 }

@@ -57,6 +57,7 @@ function webServerOf(ctx: Context): WebServerLike {
  * Mount the Claude Code bridge.
  * @param ctx - host context (webServer available through inject).
  * @param config - validated plugin config.
+ * @returns nothing; unmounting happens through the effect registered inside.
  */
 export function apply(ctx: Context, config: ClaudeCodeConfig): void {
   const resolved = resolveConfig(config)

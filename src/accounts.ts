@@ -110,6 +110,7 @@ export function resolveAccountDir(
  * Point this process — and therefore the SDK's session reads, the peer
  * registry read, and every process spawned from it — at one account root.
  * @param dir - the absolute root to activate.
+ * @returns nothing; the root takes effect on this process immediately.
  */
 export function applyConfigDir(dir: string): void {
   process.env[CONFIG_DIR_ENV] = dir
@@ -118,6 +119,7 @@ export function applyConfigDir(dir: string): void {
 /**
  * Put the variable back the way dsh was launched, so unloading the plugin
  * leaves no trace of an account switch on the host process.
+ * @returns nothing; the launch-time value is written back in place.
  */
 export function restoreConfigDir(): void {
   if (LAUNCH_CONFIG_DIR === undefined) delete process.env[CONFIG_DIR_ENV]

@@ -150,6 +150,7 @@ function deriveName(info: SDKSessionInfo): string {
  * @param sessionId - native session UUID.
  * @param title - new display title.
  * @param options - project directory to narrow the search.
+ * @returns a promise that resolves once the native store carries the new title.
  */
 export async function renameNativeSession(
   sessionId: string,
@@ -169,6 +170,8 @@ export async function renameNativeSession(
  * file is found.
  * @param sessionId - native session UUID.
  * @param options - project directory to narrow the search.
+ * @returns a promise that resolves once the transcript file and its
+ *   subagent directory are removed.
  */
 export async function deleteNativeSession(sessionId: string, options: NativeSessionOptions = {}): Promise<void> {
   try {

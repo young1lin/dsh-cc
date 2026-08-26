@@ -74,6 +74,7 @@ function ClaudeCodeLayer(): ReactElement {
 /**
  * Client plugin body: contribute one entry to the frame-wide overlay layer.
  * @param ctx - client root context.
+ * @returns nothing; the injected slot entry is disposed by the host.
  */
 export function apply(ctx: ApplyContext): void {
   ctx.slots.inject('shell.overlay', () => ctx.slots.register(

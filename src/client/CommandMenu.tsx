@@ -80,7 +80,6 @@ function commandChip(command: SlashCommand): ReactElement | null {
  * @param props.onPick - a row was activated.
  * @returns the popup node.
  */
-
 export function CommandMenu(props: {
   commands: SlashCommand[]
   filter: string

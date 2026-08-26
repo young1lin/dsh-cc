@@ -12,7 +12,7 @@
  */
 
 import type { TerminalBlockLabels, TerminalBlockProps } from '@deepseek-ai/dsh-client-ui-primitives'
-import { stringField, type ToolResult } from './wire.ts'
+import { stringField, unwrapToolErrorText, type ToolResult } from './wire.ts'
 
 /**
  * Stand-in exit code for a failure the CLI reported without a number. It is
@@ -72,6 +72,6 @@ export function terminalCard(input: unknown, result: ToolResult | undefined, cwd
   return {
     description,
     labels: exitCode === UNKNOWN_EXIT_CODE ? UNKNOWN_EXIT_LABEL : undefined,
-    card: { command, cwd, output: result.text, exitCode, running: false },
+    card: { command, cwd, output: unwrapToolErrorText(result.text), exitCode, running: false },
   }
 }

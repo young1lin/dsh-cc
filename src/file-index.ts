@@ -129,6 +129,13 @@ interface CacheEntry {
  * walk once.
  */
 const CACHE_TTL_MS = 30_000
+
+/**
+ * Cache capacity in project roots. The TTL only refuses stale hits — without
+ * a cap an entry would live forever, so the oldest root is evicted before an
+ * insert once the cache is full.
+ */
+const MAX_CACHE_ROOTS = 16
 const cache = new Map<string, CacheEntry>()
 const inFlight = new Map<string, Promise<FileIndex>>()
 
@@ -144,6 +151,12 @@ export function fileIndexFor(root: string): Promise<FileIndex> {
   if (running !== undefined) return running
   const walk = collectFileIndex(root)
     .then(index => {
+      // Map keeps insertion order: evicting the first key drops the oldest
+      // root, and a delete-then-set on an existing key refreshes recency.
+      if (!cache.has(root) && cache.size >= MAX_CACHE_ROOTS) {
+        const oldest = cache.keys().next().value
+        if (oldest !== undefined) cache.delete(oldest)
+      }
       cache.set(root, { index, at: Date.now() })
       return index
     })

@@ -24,6 +24,7 @@ const STYLE_ELEMENT_ID = 'dsh-cc-styles'
  * sheet, which is what a hot reload needs.
  * @param id - unique owner id, e.g. `transcript`; also the emit sort key.
  * @param css - the module's complete stylesheet text.
+ * @returns nothing; a live style element is rewritten in place.
  */
 export function registerCss(id: string, css: string): void {
   sheets.set(id, css)
@@ -33,6 +34,7 @@ export function registerCss(id: string, css: string): void {
 /**
  * Mount the registry into the document. Safe to call from every component's
  * mount effect: the element is created once and reused.
+ * @returns nothing; the element is created or reused in the document head.
  */
 export function mountCss(): void {
   if (typeof document === 'undefined') return

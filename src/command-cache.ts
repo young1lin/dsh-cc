@@ -82,6 +82,7 @@ function saveCache(dataDir: string, cache: CacheFile): void {
  * @param configDir - the account root the catalog came from.
  * @param cwd - the session working directory it came from.
  * @param commands - the live catalog, in the CLI's own order.
+ * @returns nothing; the refreshed cache is persisted synchronously.
  */
 export function rememberCommands(dataDir: string, configDir: string, cwd: string, commands: SlashCommand[]): void {
   const cache = loadCache(dataDir)

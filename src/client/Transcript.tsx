@@ -19,6 +19,7 @@ import { commandToken, matchCommand } from './command-mentions.ts'
 import { registerCss } from './css.ts'
 import { FileViewer } from './FileViewer.tsx'
 import { fileMentionsFor } from './file-mentions.ts'
+import { compact } from './status/format.ts'
 import { ToolRow } from './tool/ToolRow.tsx'
 import { stringField } from './tool/wire.ts'
 import { MEDIA_TYPE_EXTENSIONS, type CcEvent, type SlashCommand } from '../types.ts'
@@ -339,15 +340,6 @@ function tailParts(event: Extract<CcEvent, { kind: 'result' }>): string[] {
   }
   if (event.totalCostUsd > 0) parts.push(`$${event.totalCostUsd.toFixed(4)}`)
   return parts
-}
-
-/**
- * Abbreviate a token count.
- * @param tokens - the count.
- * @returns e.g. `35.9K`.
- */
-function compact(tokens: number): string {
-  return tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}K` : String(tokens)
 }
 
 /**

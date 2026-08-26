@@ -35,7 +35,7 @@ import {
 import { registerCss } from '../css.ts'
 import { cardSummary, toolCard, type ToolCard } from './card-model.ts'
 import { TodoList } from './TodoList.tsx'
-import { asRecord, firstLine, type ToolResult } from './wire.ts'
+import { asRecord, firstLine, unwrapToolErrorText, type ToolResult } from './wire.ts'
 import { TOOL_ROW_CSS } from './tool-row-css.ts'
 
 registerCss('tool-row', TOOL_ROW_CSS)
@@ -104,18 +104,6 @@ function safeJson(value: unknown): string {
   }
 }
 
-/** The CLI wraps some tool failures in this pseudo-tag before they cross the wire. */
-const TOOL_ERROR_TAG = /<tool_use_error>([\s\S]*?)<\/tool_use_error>/g
-
-/**
- * Strip the pseudo-tag wrapper off an error result's text so the raw marker
- * never reaches the page; unwrapped text passes through unchanged.
- * @param text - the raw result text as it crossed the wire.
- * @returns the inner message when the tag is present, else the input.
- */
-function unwrapToolErrorText(text: string): string {
-  return text.replace(TOOL_ERROR_TAG, '$1')
-}
 
 /**
  * The generic IN/OUT card: structured arguments through the JSON inspector,
@@ -236,7 +224,7 @@ export const ToolRow = memo(function ToolRow(props: ToolRowProps): ReactElement 
   const expandable = body !== null
   // A failed call's summary IS the failure: the first line of the error text
   // outranks both the arguments and anything the card would have said.
-  const failure = state === 'error' && result !== undefined ? firstLine(result.text) : null
+  const failure = state === 'error' && result !== undefined ? firstLine(unwrapToolErrorText(result.text)) : null
   const override = failure === null ? cardSummary(card) : null
   const summary = failure ?? override?.text ?? props.summary
   const suffix = failure === null ? override?.suffix ?? null : null

@@ -108,7 +108,10 @@ export async function readTextFile(pathname: string): Promise<FileContent> {
   }
 }
 
-/** The pinned Agent SDK version, read from the installed package for diagnostics. */
+/**
+ * The pinned Agent SDK version, read from the installed package for diagnostics.
+ * @returns the installed SDK's version string, or '' when it cannot be resolved.
+ */
 export function readSdkVersion(): string {
   try {
     const require = createRequire(import.meta.url)

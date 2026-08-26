@@ -11,7 +11,8 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import {
-  applyConfigDir, CONFIG_DIR_ENV, normalizeAccounts, resolveAccountDir, restoreConfigDir, sameDir,
+  applyConfigDir, baselineConfigDir, CONFIG_DIR_ENV, normalizeAccounts, resolveAccountDir,
+  restoreConfigDir, sameDir,
 } from './accounts.ts'
 import type { ResolvedConfig } from './config.ts'
 import { SessionEngine, resolveSessionModel, resolveSessionPermissionMode, type EngineHooks, type QueuedMessage, type SendImage } from './engine.ts'
@@ -130,6 +131,16 @@ function deriveAutoTitle(text: string): string | undefined {
   if (firstLine.length === 0 || firstLine.startsWith('/')) return undefined
   return firstLine.length > AUTO_TITLE_MAX ? `${firstLine.slice(0, AUTO_TITLE_MAX - 1)}…` : firstLine
 }
+
+/** The 409 body for a send whose session belongs to another account root. */
+const SCOPE_CONFLICT_MESSAGE = '会话属于另一个账号根目录，请重新选择'
+
+/**
+ * Thrown by the pre-spawn scope check ({@link CcRuntime.assertInScope}) so
+ * the send route can answer a 409 instead of letting the refusal surface as
+ * a generic spawn failure.
+ */
+class ScopeConflictError extends Error {}
 
 /**
  * The dsh-cc host runtime. One instance per mounted plugin; disposal closes
@@ -1087,6 +1098,26 @@ export class CcRuntime {
   }
 
   /**
+   * Refuse a session whose sidecar row was stamped under an account root
+   * other than the one in force right now.
+   *
+   * The catalog filters such rows out of the merged list; this is the same
+   * test applied where it must also gate writes. A row's `claudeSessionId`
+   * only resolves inside the root it was created under, so spawning it under
+   * today's root would resume nothing while the row stays invisible to the
+   * page — an engine running a session nobody can see. Rows written before
+   * accounts existed carry no stamp and belong to the baseline root, exactly
+   * as the catalog reads them.
+   * @param session - the sidecar row a send or spawn targets.
+   * @throws {ScopeConflictError} when the row belongs to another account root.
+   */
+  private assertInScope(session: SessionMeta): void {
+    if (!sameDir(session.configDir ?? baselineConfigDir(), this.activeConfigDir())) {
+      throw new ScopeConflictError(SCOPE_CONFLICT_MESSAGE)
+    }
+  }
+
+  /**
    * Create an engine for a session, claim its table slot synchronously, and
    * arm the end-of-life callback that drops it again the moment its query
    * terminates — the C1 guarantee: no path can hand a spent engine back to a
@@ -1094,8 +1125,12 @@ export class CcRuntime {
    * @param session - the session the engine drives.
    * @param model - the model override this engine runs with.
    * @returns the registered engine.
+   * @throws {ScopeConflictError} when the row belongs to another account root —
+   *   the check runs here, at the last sync moment before the spawn, because
+   *   an account switch can land across the send route's earlier awaits.
    */
   private startEngine(session: SessionMeta, model: string): SessionEngine {
+    this.assertInScope(session)
     const engine = new SessionEngine(
       { sessionId: session.id, cwd: session.cwd, model, permissionMode: session.permissionMode ?? '', claudeSessionId: session.claudeSessionId },
       this.configFor(session),
@@ -1135,6 +1170,15 @@ export class CcRuntime {
     // the other process's turn. The page keeps it read-only.
     if (this.catalog.terminalOwned(session.id)) {
       return json(res, { error: '该会话正由终端中的 Claude 进程使用，页面端已设为只读' }, 409)
+    }
+    // A row stamped with another account's root is filtered out of the merged
+    // list for a reason: its transcript cannot be read under the root in
+    // force. Fail the send before parsing anything, and again — inside
+    // startEngine — when a switch lands across the awaits below.
+    try {
+      this.assertInScope(session)
+    } catch {
+      return json(res, { error: SCOPE_CONFLICT_MESSAGE }, 409)
     }
     const body = await readJson(req)
     const text = typeof body?.text === 'string' ? body.text : ''
@@ -1191,7 +1235,16 @@ export class CcRuntime {
       // a fresh engine — starting another would orphan that one mid-turn.
       engine = this.liveEngine(key)
     }
-    if (engine === undefined) engine = this.startEngine(session, session.model)
+    if (engine === undefined) {
+      try {
+        engine = this.startEngine(session, session.model)
+      } catch (error) {
+        // Only the scope refusal answers 409; anything else a spawn fails
+        // with keeps flowing to the route's generic 500 path.
+        if (error instanceof ScopeConflictError) return json(res, { error: SCOPE_CONFLICT_MESSAGE }, 409)
+        throw error
+      }
+    }
     // A previous engine may have died holding undelivered messages — they
     // never reached the CLI, so they re-enter ahead of this send, original
     // order first. A live engine that already holds a queue keeps them ahead
