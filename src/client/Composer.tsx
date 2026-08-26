@@ -13,13 +13,17 @@
 import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type ReactElement } from 'react'
 import { Button, IconSendOutline16, IconStopFill16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { uploadImage } from './api/sessions.ts'
-import { listDir } from './api/settings.ts'
+import { fetchFileIndex, listDir } from './api/settings.ts'
 import { registerCss } from './css.ts'
 import { useOverlay } from './overlay.ts'
 import { CommandMenu, filterCommands } from './CommandMenu.tsx'
-import { MentionPicker, dirForSegment, tokenFor } from './MentionPicker.tsx'
+import { MentionPicker, type MentionState } from './MentionPicker.tsx'
+import {
+  MAX_MENU_ROWS, PAGE_ROWS, absoluteDirTarget, absoluteReferenceRow, filterRows, insertionFor,
+  isAbsoluteQuery, rankDirChildren, tokenAtCaret, type MenuRow,
+} from './mention-core.ts'
 import { commandToken, matchCommand } from './command-mentions.ts'
-import { MEDIA_TYPE_EXTENSIONS, type DirListing, type ImageRef, type SlashCommand } from '../types.ts'
+import { MEDIA_TYPE_EXTENSIONS, SKIPPED_DIR, type DirListing, type FileIndex, type ImageRef, type SlashCommand } from '../types.ts'
 
 registerCss('composer', `
 .cc-input-shell {
@@ -162,7 +166,7 @@ const EXTENSIONS = MEDIA_TYPE_EXTENSIONS
  * an insert's caret move lands one rAF later — recomputing off a not-yet-
  * moved caret would reopen what the keydown just resolved.
  */
-const MENU_KEYS = new Set(['ArrowDown', 'ArrowUp', 'Escape', 'Enter', 'Tab'])
+const MENU_KEYS = new Set(['ArrowDown', 'ArrowUp', 'PageDown', 'PageUp', 'Home', 'End', 'Escape', 'Enter', 'Tab'])
 
 /**
  * Render the composer.
@@ -199,13 +203,20 @@ export function Composer(props: {
   const [failure, setFailure] = useState<string | undefined>()
   const [focused, setFocused] = useState(false)
   /** The open popup, with the text that drives it. */
-  const [menu, setMenu] = useState<{ kind: 'command'; filter: string } | { kind: 'mention'; segment: string } | undefined>()
+  const [menu, setMenu] = useState<{ kind: 'command'; filter: string } | { kind: 'mention'; query: string } | undefined>()
   /** The popup's selected row, owned here because the keyboard lives here. */
   const [menuIndex, setMenuIndex] = useState(0)
   /** Native IME composition in flight — the mirror hides and menus go inert. */
   const [composing, setComposing] = useState(false)
-  const [mentionDir, setMentionDir] = useState<string | undefined>()
-  const [mentionListing, setMentionListing] = useState<DirListing | undefined>()
+  // The mention menu's settled project index (warm: fetched once per cwd,
+  // retried by nonce), and the live listing behind an absolute-path query.
+  const [mentionIndex, setMentionIndex] = useState<FileIndex | undefined>()
+  const [mentionFailed, setMentionFailed] = useState(false)
+  const [mentionAttempt, setMentionAttempt] = useState(0)
+  const [dirListing, setDirListing] = useState<DirListing | undefined>()
+  // Escape dismisses the mention menu for the CURRENT query only; typing on
+  // (a different query) reopens it.
+  const dismissedQuery = useRef<string | null>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const mirrorRef = useRef<HTMLDivElement>(null)
   // The composer holds drafts: while it is focused, Escape is not the
@@ -229,50 +240,109 @@ export function Composer(props: {
     if (props.readOnly === true) setMenu(undefined)
   }, [props.readOnly])
 
-  // The mention picker's directory follows the typed segment; picking `..`
-  // (handled in activateMentionRow) retargets it directly.
+  // The mention query's derived navigation facts: whether it spells an
+  // absolute path (the reference is the typed path itself, plus the live
+  // children of the directory it names) or rides the project index.
+  const mentionQuery = menu?.kind === 'mention' ? menu.query : null
+  const exactRow = mentionQuery === null ? null : absoluteReferenceRow(mentionQuery)
+  const mentionAbsolute = exactRow !== null
+  const dirTarget = mentionQuery === null ? null : absoluteDirTarget(mentionQuery)
+
+  // Warm fetch: one project index per cwd for the composer's lifetime. The
+  // attempt nonce is the retry — a fetch that failed once must not blind
+  // the session forever. A failed index still leaves absolute-path queries
+  // fully usable (their synthetic row needs no index at all).
   useEffect(() => {
-    if (menu?.kind !== 'mention' || props.cwd === undefined) {
-      setMentionListing(undefined)
-      return
-    }
-    const wanted = dirForSegment(props.cwd, menu.segment)
-    setMentionDir(previous => previous === wanted ? previous : wanted)
-  }, [menu, props.cwd])
-  useEffect(() => {
-    if (menu?.kind !== 'mention' || mentionDir === undefined) return
+    if (props.cwd === undefined) return
     let stale = false
-    setMentionListing(undefined)
-    listDir(mentionDir)
+    setMentionIndex(undefined)
+    setMentionFailed(false)
+    fetchFileIndex(props.cwd)
       .then(result => {
-        if (!stale) setMentionListing(result)
+        if (!stale) setMentionIndex(result.index)
       })
       .catch(() => {
-        if (!stale) setMentionListing(undefined)
+        if (!stale) setMentionFailed(true)
       })
     return () => {
       stale = true
     }
-  }, [menu?.kind, mentionDir])
+  }, [props.cwd, mentionAttempt])
+
+  // A failed index retries at BOTH gesture edges: when a live gesture ends
+  // (query non-null -> null) and when a fresh one starts (null ->
+  // non-null). The start edge covers the cold start where the warm fetch
+  // raced the HTTP surface and died before the first '@' ever worked.
+  // Mount-time null -> null never bumps (that would loop refetches).
+  const prevQueryRef = useRef<string | null>(null)
+  useEffect(() => {
+    const previous = prevQueryRef.current
+    if (mentionFailed && ((previous !== null && mentionQuery === null) || (previous === null && mentionQuery !== null))) {
+      setMentionAttempt(attempt => attempt + 1)
+    }
+    prevQueryRef.current = mentionQuery
+  }, [mentionQuery, mentionFailed])
+
+  // The listing of the directory an absolute query navigates: one fetch per
+  // directory per gesture. Fragment keystrokes share the fetch (same
+  // directory); a target change or the gesture's end resets, so the next
+  // '@' sees the live filesystem. A failed listing leaves the typed
+  // reference row alone in the menu.
+  useEffect(() => {
+    const dir = menu?.kind === 'mention' ? dirTarget?.dir : undefined
+    if (dir === undefined) {
+      setDirListing(undefined)
+      return
+    }
+    let stale = false
+    setDirListing(undefined)
+    listDir(dir)
+      .then(result => {
+        if (!stale) setDirListing(result)
+      })
+      .catch(() => {
+        if (!stale) setDirListing(undefined)
+      })
+    return () => {
+      stale = true
+    }
+  }, [menu?.kind, dirTarget?.dir])
 
   /** The command rows for the open filter; empty unless the menu is that kind. */
   const filteredCommands = useMemo(
     () => menu?.kind === 'command' ? filterCommands(props.commands, menu.filter) : [],
     [menu, props.commands],
   )
-  const mentionFilter = menu?.kind === 'mention'
-    ? menu.segment.slice(menu.segment.lastIndexOf('/') + 1).toLowerCase()
-    : ''
   const mentionRows = useMemo(() => {
-    if (menu?.kind !== 'mention' || mentionListing === undefined) return []
-    const entries = mentionListing.entries
-      .filter(entry => entry.name.toLowerCase().includes(mentionFilter))
-      .map(entry => ({ name: entry.name, directory: entry.directory, climb: false }))
-    return [
-      ...(mentionListing.parent !== null ? [{ name: '..', directory: true, climb: true }] : []),
-      ...entries,
-    ]
-  }, [menu?.kind, mentionListing, mentionFilter])
+    if (mentionQuery === null) return []
+    // A relative query ranks the whole project index — the '@' gesture is a
+    // search, not a one-directory browse.
+    if (exactRow === null || dirTarget === null) {
+      return filterRows(mentionIndex?.rows ?? [], mentionQuery)
+    }
+    // An absolute query offers the live children of the directory it names,
+    // ranked by the fragment still being typed.
+    const prefix = dirTarget.dir.endsWith('/') ? dirTarget.dir : `${dirTarget.dir}/`
+    const children = (dirListing?.entries ?? [])
+      .filter(entry => !entry.directory || !SKIPPED_DIR.test(entry.name))
+      .map(entry => entry.directory
+        ? { path: prefix + entry.name, directory: true as const }
+        : { path: prefix + entry.name })
+    const ranked = rankDirChildren(children, dirTarget.fragment).slice(0, MAX_MENU_ROWS)
+    // A completed folder spelling leads with the folder itself — the
+    // listing reference is the primary pick. A mid-typing fragment leads
+    // with the matching children. An empty roster — failed listing or
+    // genuinely empty directory — falls back to the typed reference, so an
+    // absolute path stays pickable no matter what.
+    if (ranked.length === 0) return [exactRow]
+    return dirTarget.fragment === '' ? [exactRow, ...ranked] : ranked
+  }, [mentionQuery, exactRow, dirTarget, dirListing, mentionIndex])
+  /** The mention menu's settling state, for the roster's loading/failed rows. */
+  const mentionState: MentionState = mentionAbsolute ? 'ready'
+    : mentionIndex === undefined ? (mentionFailed ? 'failed' : 'loading')
+    : 'ready'
+  /** A failed index hides the menu for relative queries; absolute ones need no index. */
+  const mentionVisible = menu?.kind === 'mention' && (mentionAbsolute || !mentionFailed)
 
   // Filters shrink the row list under a stationary index; pull the selection
   // back inside it. Render-phase correction, guarded so it settles.
@@ -324,11 +394,10 @@ export function Composer(props: {
       }
       return
     }
-    const openToken = /(?:^|\s)@([^@\s]*)$/.exec(before)
-    if (openToken !== null && props.cwd !== undefined) {
-      const segment = openToken[1]
-      if (menu?.kind !== 'mention' || menu.segment !== segment) {
-        setMenu({ kind: 'mention', segment })
+    const token = tokenAtCaret(element.value, caret)
+    if (token !== null && props.cwd !== undefined && dismissedQuery.current !== token.query) {
+      if (menu?.kind !== 'mention' || menu.query !== token.query) {
+        setMenu({ kind: 'mention', query: token.query })
         setMenuIndex(0)
       }
       return
@@ -349,37 +418,25 @@ export function Composer(props: {
     requestAnimationFrame(() => element?.setSelectionRange(name.length + 2, name.length + 2))
   }
 
-  /** Insert one picked mention token over the open `@segment` before the caret. */
-  const insertMention = (name: string): void => {
+  /**
+   * Insert one picked mention row over the open token: the whole half-typed
+   * run to the next whitespace is replaced (the caret may sit inside it), a
+   * closing space terminates the reference, and a folder pick appends its
+   * separating slash.
+   * @param row - the picked menu row.
+   */
+  const insertMention = (row: MenuRow): void => {
     const element = inputRef.current
     if (element === null || menu?.kind !== 'mention') return
     const caret = element.selectionStart ?? element.value.length
-    const start = caret - menu.segment.length - 1
-    if (start < 0 || element.value[start] !== '@') return
-    const token = mentionDir !== undefined && props.cwd !== undefined
-      ? tokenFor(props.cwd, `${mentionDir.replace(/\/+$/, '')}/${name}`)
-      : name
-    const next = `${element.value.slice(0, start)}@${token} ${element.value.slice(caret)}`
-    setValue(next)
+    const token = tokenAtCaret(element.value, caret)
+    if (token === null) return
+    const plan = insertionFor(element.value, token, caret, row)
+    dismissedQuery.current = null
+    setValue(plan.next)
     setMenu(undefined)
     element.focus()
-    const at = start + token.length + 2
-    requestAnimationFrame(() => element.setSelectionRange(at, at))
-  }
-
-  /**
-   * Activate one mention row: the `..` row climbs the browser one level up,
-   * any other inserts itself as the mention.
-   * @param index - the row index into `mentionRows`.
-   */
-  const activateMentionRow = (index: number): void => {
-    const row = mentionRows[index]
-    if (row === undefined) return
-    if (row.climb) {
-      if (mentionListing?.parent != null) setMentionDir(mentionListing.parent)
-      return
-    }
-    insertMention(row.name)
+    requestAnimationFrame(() => element.setSelectionRange(plan.caret, plan.caret))
   }
 
   /**
@@ -518,25 +575,41 @@ export function Composer(props: {
               // Enter/Tab complete the row instead of submitting. The readOnly
               // guard keeps a menu that raced the flip inert.
               if (!composing && menu !== undefined && props.readOnly !== true) {
-                if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                if (['ArrowDown', 'ArrowUp', 'PageDown', 'PageUp', 'Home', 'End'].includes(event.key)) {
                   event.preventDefault()
                   const count = menu.kind === 'command' ? filteredCommands.length : mentionRows.length
                   if (count > 0) {
-                    setMenuIndex(previous => (previous + (event.key === 'ArrowDown' ? 1 : count - 1)) % count)
+                    setMenuIndex(previous => {
+                      const last = count - 1
+                      if (event.key === 'ArrowDown') return (previous + 1) % count
+                      if (event.key === 'ArrowUp') return (previous - 1 + count) % count
+                      if (event.key === 'Home') return 0
+                      if (event.key === 'End') return last
+                      // Paging clamps at the ends instead of wrapping: a
+                      // page is a jump, not a rotation.
+                      if (event.key === 'PageDown') return Math.min(last, previous + PAGE_ROWS)
+                      return Math.max(0, previous - PAGE_ROWS)
+                    })
                   }
                   return
                 }
                 if (event.key === 'Escape') {
                   event.preventDefault()
+                  if (menu.kind === 'mention') {
+                    // Dismissed for the current query only; typing on
+                    // (a different query) reopens the menu.
+                    dismissedQuery.current = menu.query
+                  }
                   setMenu(undefined)
                   return
                 }
                 if (event.key === 'Enter' || event.key === 'Tab') {
                   event.preventDefault()
-                  // The mention picker's loading window is not an answer —
+                  // The mention menu's loading window is not an answer —
                   // rows may still land, and Enter must not send a half-typed
-                  // `@token` past them.
-                  if (menu.kind === 'mention' && mentionListing === undefined) return
+                  // `@token` past them. (An absolute query is never loading:
+                  // its typed-reference row is available immediately.)
+                  if (menu.kind === 'mention' && mentionState === 'loading') return
                   const count = menu.kind === 'command' ? filteredCommands.length : mentionRows.length
                   if (count === 0) {
                     // Nothing to complete — the menu is advisory, like the
@@ -551,7 +624,8 @@ export function Composer(props: {
                     const command = filteredCommands[menuIndex]
                     if (command !== undefined) insertCommand(command.name)
                   } else {
-                    activateMentionRow(menuIndex)
+                    const row = mentionRows[menuIndex]
+                    if (row !== undefined) insertMention(row)
                   }
                   return
                 }
@@ -581,13 +655,15 @@ export function Composer(props: {
             onPick={command => insertCommand(command.name)}
           />
         )}
-        {!composing && menu?.kind === 'mention' && (
+        {!composing && mentionVisible && menu?.kind === 'mention' && (
           <MentionPicker
             rows={mentionRows}
-            loading={mentionListing === undefined}
+            state={mentionState}
+            truncated={mentionAbsolute ? dirListing?.truncated === true : mentionIndex?.truncated === true}
+            absolutePath={exactRow?.path}
             selected={menuIndex}
             onSelectedChange={setMenuIndex}
-            onActivate={activateMentionRow}
+            onPick={insertMention}
           />
         )}
         {props.busy && props.readOnly === true

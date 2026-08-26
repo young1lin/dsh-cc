@@ -12,6 +12,7 @@
 import { readdir, stat } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { readTextFile } from './http-support.ts'
+import { SKIPPED_DIR } from './types.ts'
 
 /** Total bytes one message's mentions may inject; later ones are elided. */
 const MAX_TOTAL_BYTES = 1024 * 1024
@@ -19,9 +20,6 @@ const MAX_TOTAL_BYTES = 1024 * 1024
 const MAX_TREE_ENTRIES = 500
 /** Depth cap for one folder's tree listing. */
 const MAX_TREE_DEPTH = 8
-
-/** Directory names the folder tree never descends into. */
-export const SKIPPED_DIR_NAMES = ['node_modules', '.git', 'dist', 'build', 'lib', 'out'] as const
 
 /**
  * Every @-mention path token in the text, first occurrence only, in order.
@@ -152,7 +150,7 @@ async function folderTree(root: string): Promise<string> {
     const dirents = await readdir(dir, { withFileTypes: true }).catch(() => [])
     const visible = dirents
       .filter(dirent => dirent.isDirectory() || dirent.isFile())
-      .filter(dirent => !(dirent.isDirectory() && (dirent.name.startsWith('.') || (SKIPPED_DIR_NAMES as readonly string[]).includes(dirent.name))))
+      .filter(dirent => !(dirent.isDirectory() && SKIPPED_DIR.test(dirent.name)))
       .sort((left, right) =>
         left.isDirectory() === right.isDirectory()
           ? left.name.localeCompare(right.name)

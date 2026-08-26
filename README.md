@@ -14,7 +14,7 @@ dsh-cc 是一个 DSH 外挂双面插件：在 DSH Web GUI 右缘加入一个 **C
 - **底部任务面板**：会话进程正在跑的子代理 / 命令 / 监视 / 工作流的实时进度（token · 时长 · 最近工具），每行「结束」「转后台」控制；随下一回合开始清理已结束行
 - **输入框上方固定当前任务清单**：从转录的清单工具调用推导的 TODO 面板（兼容旧版 TodoWrite 与新版 TaskCreate/TaskUpdate），计划常驻眼前不用翻历史
 - **斜杠命令菜单**：输入框打 `/` 弹出 CLI 的命令目录（内置命令、用户技能、项目命令），↑↓ 选择、Tab/Enter 补全；识别为可调用的命令（含技能）在输入框与转录里显示蓝色识别态；`/compact` 等本地命令的输出以「命令输出」行进转录
-- **@ 文件/文件夹提及**：打 `@` 弹出目录选择器（可向上出工作目录选绝对路径）；手打的 `@相对路径` / `@绝对路径` 同样生效 —— 文件内容与文件夹目录树随消息注入上下文（总量上限 1MB）
+- **@ 文件/文件夹提及**：打 `@` 即全项目模糊搜索 —— 一次有界索引（5000 行 / 层 2000 / 深 16，忽略 node_modules、`.git` 等重目录）覆盖整个工作目录，子序列匹配（`mc` 找 `mention-core`）按 basename 精确>前缀>连续>子序列排名；输入绝对路径则实时列出该目录子项导航盘上任何位置。↑↓/PageUp/PageDown/Home/End 选择，Enter/Tab 插入（整段替换半打的 token、自动补尾空格、文件夹补 `/`）；手打的 `@相对路径` / `@绝对路径` 同样生效 —— 文件内容与文件夹目录树随消息注入上下文（总量上限 1MB）
 - **文件路径点击查看**：对话文本里反引号包裹的文本文件路径（带分隔符或绝对路径 + 已知文本扩展名）可点击打开查看器，显示磁盘最新内容（行号 + 语法高亮，> 2MB 截断）
 - **图片输入**：粘贴或拖入图片（每张 ≤ 5MB）随消息发送，转录回读同一份内容寻址存储
 - **用量与上下文读数**：状态栏显示模型 / 档位选择、上下文窗口占用与账户用量
@@ -124,6 +124,7 @@ C:/PythonProject/dev/dsh-cc
    ├─ engine.ts          每会话一个 SDK query：流式多轮、canUseTool 权限桥、resume
    ├─ live-turn.ts       流式帧折叠 reducer（两半共用，中途加入拿到一致的进行中回合）
    ├─ mentions.ts        @ 提及展开：文件内容 / 文件夹目录树作为文本块随消息注入
+   ├─ file-index.ts      @ 菜单的项目文件索引：有界 BFS 遍历 + TTL 缓存
    ├─ blobs.ts           图片字节 SHA-256 内容寻址存储
    ├─ runtime.ts         REST + SSE 路由（/cc/api/*）
    └─ client/            浏览器半区：右缘 dock + 全屏聊天 overlay
@@ -131,7 +132,8 @@ C:/PythonProject/dev/dsh-cc
         App.tsx            会话列表 / 聊天 / 权限与提问卡片 / 设置入口
         SessionRail.tsx    会话侧栏    Transcript.tsx  消息流
         Composer.tsx       输入框      LiveTurnView.tsx  进行中回合
-        CommandMenu.tsx    斜杠命令弹窗 MentionPicker.tsx  @ 文件选择弹窗
+        CommandMenu.tsx    斜杠命令弹窗 MentionPicker.tsx  @ 文件菜单渲染
+        mention-core.ts    @ 菜单纯逻辑（token 语法 / 模糊排名 / 绝对路径导航 / 插入规划）
         StatusBar.tsx      模型 / 档位 / 上下文 / 用量状态条
         Interaction.tsx    权限审批卡片 + AskUserQuestion 卡片
         api/               fetch + EventSource 封装（http / sessions / settings / telemetry / interaction）
@@ -157,6 +159,7 @@ C:/PythonProject/dev/dsh-cc
 | POST | /cc/api/images | 上传一张图片（原始字节 + content-type，≤ 5MB），返回内容寻址引用 |
 | GET | /cc/api/blobs/:id.:ext | 回读已存图片（immutable 长缓存） |
 | GET | /cc/api/fs/list?path= | 工作目录选择器的目录列表（无 path 列盘符根） |
+| GET | /cc/api/fs/index?path= | @ 提及菜单的项目文件索引：path 下的一次有界遍历（5000 行 / 层 2000 / 深 16，忽略依赖与构建目录），工作目录相对路径 + 截断标记；宿主侧短暂缓存 |
 | GET | /cc/api/fs/file?path= | 读取文本文件最新内容（≤2MB，超出截断；二进制拒绝） |
 | GET | /cc/api/sessions | 会话列表（含 CLI 原生会话；`terminalOwned` 标注终端持有） |
 | POST | /cc/api/sessions | 新建会话（可带名称 / cwd / 模型） |

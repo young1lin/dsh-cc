@@ -1,84 +1,54 @@
 /**
- * The @-mention file popup: one directory page of the session cwd over GET
- * /fs/list, filtered by the typed segment. Presentational — the composer owns
- * the browsing directory, the fetch, the selection, and the insert. Row
- * semantics: Enter/Tab (or click) picks the row as the mention — folders are
- * mentionable, they inject a tree; the `..` row climbs one level up.
+ * The @-mention file menu roster: the presentational half of the host's
+ * ui-file-reference design. The composer owns the token, the index fetch,
+ * the ranking, and the selection — this component only renders the ranked
+ * rows (folder glyph in a fixed gutter so every path aligns, trailing type
+ * label), the loading / no-match states, and the truncation notice. Popups
+ * chrome (the .cc-menu-pop panel and row base) lives in the composer's
+ * sheet; only the roster-specific rules are registered here.
  *
  * @module dsh-cc/client/MentionPicker
  */
 
 import { useEffect, useRef, type ReactElement } from 'react'
+import { IconFolderClose16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { registerCss } from './css.ts'
+import { metaLabel, type MenuRow } from './mention-core.ts'
 
-// Only the folder marker is picker-specific: the popup chrome and row rules
-// are shared and live in the composer's sheet (registerCss replaces whole
-// sheets by id, so shared rules have exactly one owner — see Composer.tsx).
 registerCss('mention-picker', `
-.cc-menu-row-folder::after { content: '/'; color: var(--dsw-alias-label-tertiary); }
+/* The folder glyph rides in a fixed gutter so file paths align down the
+   column whether or not their neighbor is a folder. */
+.cc-mention-icon { flex: none; align-self: center; width: 18px; height: 16px; display: inline-flex; align-items: center; color: var(--dsw-alias-label-tertiary); }
+.cc-mention-path { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dsw-alias-label-primary); }
+.cc-mention-row-folder > .cc-mention-path::after { content: '/'; color: var(--dsw-alias-label-tertiary); }
+.cc-mention-label { flex: none; margin-left: auto; color: var(--dsw-alias-label-tertiary); }
+/* The one-line truncation notice rides above the roster as a group title:
+   the rows below are the head of the tree, not the whole of it. */
+.cc-mention-truncated { padding: 4px 8px; color: var(--dsw-alias-label-tertiary); }
 `)
 
-/** Normalize separators to forward slashes. */
-const posix = (path: string): string => path.split('\\').join('/')
+/** Which settling state the menu's data is in. */
+export type MentionState = 'loading' | 'failed' | 'ready'
 
 /**
- * The token a picked entry inserts: cwd-relative when it sits under the cwd,
- * else absolute; forward slashes throughout.
- * @param cwd - the session working directory.
- * @param absolute - the picked entry's absolute path.
- * @returns the token text (no `@`).
- */
-export function tokenFor(cwd: string, absolute: string): string {
-  const base = posix(cwd).replace(/\/+$/, '') + '/'
-  const target = posix(absolute)
-  return target.toLowerCase().startsWith(base.toLowerCase())
-    ? target.slice(base.length)
-    : target
-}
-
-/**
- * Derive the browsing directory from the typed segment: everything up to its
- * last slash, resolved against the cwd (`..` segments walk); a bare segment
- * browses the cwd itself.
- * @param cwd - the session working directory.
- * @param segment - the typed text after the `@` (may contain slashes).
- * @returns the absolute directory to list.
- */
-export function dirForSegment(cwd: string, segment: string): string {
-  const cut = segment.lastIndexOf('/')
-  const walked = cut === -1 ? '' : segment.slice(0, cut + 1)
-  const base = posix(cwd).replace(/\/+$/, '').split('/')
-  for (const part of walked.split('/')) {
-    if (part === '' || part === '.') continue
-    if (part === '..') base.pop()
-    else base.push(part)
-  }
-  return base.join('/') || '/'
-}
-
-/** One picker row: a directory entry, or the climb-up affordance. */
-export interface MentionRow {
-  name: string
-  directory: boolean
-  /** The `..` row: activation climbs instead of inserting. */
-  climb: boolean
-}
-
-/**
- * Render the mention popup; the composer only mounts it while open.
- * @param props.rows - the rows to show (`..` first when climbing is possible).
- * @param props.loading - the directory page is still being fetched.
+ * Render the mention roster; the composer only mounts it while a token is open.
+ * @param props.rows - the ranked rows (already capped at MAX_MENU_ROWS).
+ * @param props.state - whether the index/listing is still loading, failed, or settled.
+ * @param props.truncated - a bound cut the underlying index or listing.
+ * @param props.absolutePath - the absolute query's typed-reference row path, labeled as such.
  * @param props.selected - the selected row index.
  * @param props.onSelectedChange - hover/pointer moves the selection.
- * @param props.onActivate - a row was activated (Enter/Tab/click).
+ * @param props.onPick - a row was picked (Enter/Tab/click).
  * @returns the popup node.
  */
 export function MentionPicker(props: {
-  rows: readonly MentionRow[]
-  loading: boolean
+  rows: readonly MenuRow[]
+  state: MentionState
+  truncated: boolean
+  absolutePath: string | undefined
   selected: number
   onSelectedChange(index: number): void
-  onActivate(index: number): void
+  onPick(row: MenuRow): void
 }): ReactElement {
   // Same follow-the-selection scroll as the command menu (see the note
   // there): the highlighted row stays inside the popup's scroll box.
@@ -88,21 +58,31 @@ export function MentionPicker(props: {
   }, [props.selected])
   return (
     <div className="cc-menu-pop" ref={popRef} role="listbox">
-      {props.loading && <div className="cc-menu-empty">读取目录中…</div>}
-      {!props.loading && props.rows.length === 0 && <div className="cc-menu-empty">没有匹配的文件</div>}
-      {props.rows.map((row, index) => (
+      {props.truncated && <div className="cc-mention-truncated">结果已截断 —— 只显示了部分文件</div>}
+      {props.state === 'loading' && <div className="cc-menu-empty">正在建立项目索引…</div>}
+      {props.state === 'failed' && <div className="cc-menu-empty">项目索引不可用；绝对路径仍然可以输入引用</div>}
+      {props.state === 'ready' && props.rows.length === 0 && <div className="cc-menu-empty">没有匹配的文件</div>}
+      {props.state === 'ready' && props.rows.map((row, index) => (
         <div
-          key={`${row.name}-${index}`}
-          className="cc-menu-row"
+          key={row.path}
+          className={row.directory === true ? 'cc-menu-row cc-mention-row-folder' : 'cc-menu-row'}
           role="option"
           aria-selected={index === props.selected}
           data-selected={index === props.selected}
-          title={row.climb ? '上一级' : row.directory ? '提及整个文件夹（注入目录树）' : '提及此文件'}
+          title={row.path}
           onPointerEnter={() => props.onSelectedChange(index)}
+          // mousedown, not click: the textarea keeps focus and the pick runs
+          // before any blur-driven state change.
           onMouseDown={event => event.preventDefault()}
-          onClick={() => props.onActivate(index)}
+          onClick={() => props.onPick(row)}
         >
-          <span className={row.directory ? 'cc-menu-row-name cc-menu-row-folder' : 'cc-menu-row-name'}>{row.name}</span>
+          <span className="cc-mention-icon" aria-hidden>
+            {row.directory === true && <IconFolderClose16 />}
+          </span>
+          <span className="cc-mention-path">{row.path}</span>
+          <span className="cc-mention-label">
+            {props.absolutePath === row.path ? '绝对路径' : row.directory === true ? '文件夹' : metaLabel(row.path)}
+          </span>
         </div>
       ))}
     </div>

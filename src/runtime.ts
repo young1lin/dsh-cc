@@ -8,7 +8,7 @@
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import {
   applyConfigDir, CONFIG_DIR_ENV, normalizeAccounts, resolveAccountDir, restoreConfigDir, sameDir,
@@ -17,6 +17,7 @@ import type { ResolvedConfig } from './config.ts'
 import { SessionEngine, resolveSessionModel, resolveSessionPermissionMode, type EngineHooks, type SendImage } from './engine.ts'
 import { BlobStore, isImageMediaType } from './blobs.ts'
 import { SessionCatalog } from './catalog.ts'
+import { fileIndexFor } from './file-index.ts'
 import { effectiveEnvEntries, maskSecret, readDirListing, readSdkVersion, readTextFile } from './http-support.ts'
 import { reduceDelta, type LiveTurn } from './live-turn.ts'
 import { deleteNativeSession, renameNativeSession } from './native-sessions.ts'
@@ -648,6 +649,18 @@ export class CcRuntime {
       }
       if (parts[0] === 'fs' && parts[1] === 'list' && parts.length === 2 && method === 'GET') {
         return await this.listDir(url.searchParams.get('path') ?? undefined, res)
+      }
+      if (parts[0] === 'fs' && parts[1] === 'index' && parts.length === 2 && method === 'GET') {
+        // The mention menu's project-wide index: one bounded walk under the
+        // requested root (the session cwd), cached briefly host-side.
+        const path = url.searchParams.get('path')
+        if (path === null || path.trim() === '') return json(res, { error: '缺少 path 参数' }, 400)
+        try {
+          return json(res, { index: await fileIndexFor(resolve(path.trim())) })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          return json(res, { error: `无法建立项目索引：${message}` }, 400)
+        }
       }
       if (parts[0] === 'fs' && parts[1] === 'file' && parts.length === 2 && method === 'GET') {
         const path = url.searchParams.get('path')

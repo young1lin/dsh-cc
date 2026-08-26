@@ -414,6 +414,36 @@ export interface DirListing {
   /** Parent path; null at the root level. */
   parent: string | null
   entries: DirEntry[]
+  /** True when the page cap cut the level short of every entry. */
+  truncated: boolean
+}
+
+/**
+ * Directory names the mention menu's index walk, the menu's directory
+ * navigation, and the send-time folder tree never enter: VCS metadata,
+ * dependency/build caches, tool state, and dot-directories. This single
+ * regex is the ignore authority for everything @-mention — the menu never
+ * offers what an injection would skip, and no copy of the list drifts.
+ */
+export const SKIPPED_DIR = new RegExp([
+  '^(?:node_modules|\\.git|\\.hg|\\.svn|dist|build|out|coverage|venv|__pycache__|target)$',
+  '|^(?:\\.next|\\.nuxt|\\.turbo|\\.cache|\\.venv|\\.mypy_cache|\\.pytest_cache|\\.gradle|\\.idea|\\.vs)$',
+  '|^[.]',
+].join(''))
+
+/** One row of the project file index: a workspace-relative POSIX path. */
+export interface FileIndexRow {
+  /** Path relative to the walk root, forward slashes, no leading separator. */
+  path: string
+  /** Present on folder rows: the pick inserts a listing reference. */
+  directory?: true
+}
+
+/** One project's bounded menu index as GET /fs/index serves it. */
+export interface FileIndex {
+  rows: FileIndexRow[]
+  /** True when a bound (rows / width / depth) cut the walk short. */
+  truncated: boolean
 }
 
 /** One selectable slash command, mirrored from the CLI's own catalog. */

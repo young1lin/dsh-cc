@@ -53,7 +53,7 @@ export async function readDirListing(pathname: string | undefined): Promise<DirL
     } else {
       roots.push('/')
     }
-    return { path: '', parent: null, entries: roots.map(root => ({ name: root, directory: true })) }
+    return { path: '', parent: null, entries: roots.map(root => ({ name: root, directory: true })), truncated: false }
   }
   const dir = resolve(pathname.trim())
   const dirents = await readdir(dir, { withFileTypes: true })
@@ -66,7 +66,7 @@ export async function readDirListing(pathname: string | undefined): Promise<DirL
         : left.directory ? -1 : 1)
     .slice(0, DIR_PAGE_LIMIT)
   const parent = dirname(dir) !== dir ? dirname(dir) : null
-  return { path: dir, parent, entries }
+  return { path: dir, parent, entries, truncated: dirents.length > DIR_PAGE_LIMIT }
 }
 
 /** Largest file the viewer reads; bigger files deliver their head only. */

@@ -5,7 +5,7 @@
  * @module dsh-cc/client/api/settings
  */
 
-import type { CcSettings, ConfigSummary, DirListing } from '../../types.ts'
+import type { CcSettings, ConfigSummary, DirListing, FileIndex } from '../../types.ts'
 import { api } from './http.ts'
 import type { ModelRow } from './telemetry.ts'
 
@@ -66,4 +66,15 @@ export function switchAccount(id: string): Promise<{ ok: boolean; activeAccountI
 export function listDir(path: string | undefined): Promise<DirListing> {
   const query = path === undefined || path === '' ? '' : '?path=' + encodeURIComponent(path)
   return api<DirListing>(`/fs/list${query}`)
+}
+
+/**
+ * GET /fs/index — the mention menu's project-wide file index: one bounded
+ * walk under the given root, workspace-relative paths, cached briefly
+ * host-side. The menu filters and ranks client-side over this snapshot.
+ * @param path - the project root (the session cwd).
+ * @returns the bounded index.
+ */
+export function fetchFileIndex(path: string): Promise<{ index: FileIndex }> {
+  return api<{ index: FileIndex }>(`/fs/index?path=${encodeURIComponent(path)}`)
 }
