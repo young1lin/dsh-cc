@@ -369,6 +369,12 @@ export type StreamDelta =
   | { d: 'tool-input'; index: number; partialJson: string }
   | { d: 'block-stop'; index: number }
   | { d: 'turn-stop'; stopReason?: string }
+  /**
+   * A CLI status flip (SDKStatusMessage): most visibly `compacting` while a
+   * /compact or auto-compact runs, back to null when it settles. Transient
+   * display state — folded into the live turn, never persisted.
+   */
+  | { d: 'status'; phase: 'compacting' | 'requesting' | null }
 
 /** One environment variable as it will actually reach the claude process. */
 export interface EffectiveEnvEntry {
@@ -535,6 +541,8 @@ export interface LiveTurn {
   blocks: LiveBlock[]
   /** True once `turn-stop` arrived; the turn stays visible until it commits. */
   stopped: boolean
+  /** The CLI's last reported activity phase, e.g. compacting; absent when idle-normal. */
+  status?: 'compacting' | 'requesting'
 }
 
 /**

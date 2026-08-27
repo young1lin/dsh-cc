@@ -82,15 +82,22 @@ export function reduceDelta(
     }
     case 'text':
     case 'thinking':
-      return appendText(turn, delta.index, delta.text)
+      // Real content flowing means any previous activity phase is over.
+      return appendText(turn === undefined ? undefined : { ...turn, status: undefined }, delta.index, delta.text)
     case 'tool-input':
       // Argument fragments only parse once whole, so they are counted but not
       // shown; the collapsed row reads as the tool name until the call commits.
       return turn
     case 'block-stop':
       return mapBlock(turn, delta.index, block => ({ ...block, closed: true }))
+    case 'status':
+      // The CLI's own activity readout (compacting/requesting); null flips
+      // the view back to normal. Folded only while a turn exists — the phase
+      // belongs to whichever model call is parked on it.
+      if (turn === undefined) return undefined
+      return { ...turn, ...(delta.phase === null ? { status: undefined } : { status: delta.phase }) }
     case 'turn-stop':
-      return turn === undefined ? undefined : { ...turn, stopped: true }
+      return turn === undefined ? undefined : { ...turn, stopped: true, status: undefined }
     default:
       // A frame kind from a newer node half: ignored, never fatal to the view.
       return turn

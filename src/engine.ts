@@ -1044,6 +1044,31 @@ export class SessionEngine {
         return
       }
       case 'system': {
+        if (message.subtype === 'status') {
+          // The CLI's own activity readout. 'compacting' is the one phase the
+          // page has been blind to — a /compact can run for a long, silent
+          // minute, which reads as a dead session without this frame.
+          const raw = (message as { status?: unknown }).status
+          const phase = raw === 'compacting' || raw === 'requesting' ? raw : null
+          this.hooks.delta({ d: 'status', phase })
+          if ((message as { compact_result?: unknown }).compact_result === 'failed') {
+            const detail = (message as { compact_error?: unknown }).compact_error
+            this.publish({
+              kind: 'notice',
+              text: `压缩失败：${typeof detail === 'string' && detail !== '' ? detail : '未知原因'}`,
+              level: 'warning',
+            })
+          }
+          return
+        }
+        if (message.subtype === 'compact_boundary') {
+          // Compaction landed: drop the phase and say so right away — the
+          // token divider itself renders from the native transcript on the
+          // next re-read.
+          this.hooks.delta({ d: 'status', phase: null })
+          this.publish({ kind: 'notice', text: '对话已压缩：历史已重写为摘要', level: 'notice' })
+          return
+        }
         if (message.subtype === 'init') {
           this.claudeSessionId = message.session_id
           this.liveModel = message.model

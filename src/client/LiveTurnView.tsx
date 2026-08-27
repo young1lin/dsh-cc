@@ -70,6 +70,30 @@ registerCss('live-turn', `
   color: var(--dsw-alias-label-tertiary);
 }
 
+/* The CLI's own activity readout while it works on something that produces
+   no stream of its own — chiefly compaction. Pulses so the wait reads as
+   work, not as a dead surface. */
+.cc-live-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 999px;
+  background: var(--dsw-alias-bg-layer-2);
+  font: var(--dsw-font-xs-13);
+  color: var(--dsw-alias-label-secondary);
+}
+.cc-live-status::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--dsw-alias-brand-primary);
+  animation: cc-pulse 1.1s ease-in-out infinite;
+}
+@keyframes cc-pulse { 50% { opacity: 0.25; } }
+
 /* The turn clock beside the wait copy; tabular digits keep the readout from
    jittering as it ticks, and one shade quieter than the wait text reads as
    telemetry rather than prose. */
@@ -145,6 +169,18 @@ export function LiveTurnView(props: { turn: LiveTurnState | undefined }): ReactE
     // nothing to show yet. Once it has stopped there is nothing left to wait
     // for, and the committed events stand alone.
     if (turn.stopped) return null
+    if (turn.status === 'compacting') {
+      return (
+        <div className="cc-live">
+          <div className="cc-live-status">正在压缩对话，请稍候</div>
+          <div className="cc-live-wait">
+            <span>压缩中</span>
+            <span className="cc-live-dots" />
+            {elapsed !== undefined && <span className="cc-live-elapsed">{elapsed}</span>}
+          </div>
+        </div>
+      )
+    }
     return (
       <div className="cc-live-wait">
         <span>思考中</span>
@@ -156,6 +192,7 @@ export function LiveTurnView(props: { turn: LiveTurnState | undefined }): ReactE
 
   return (
     <div className="cc-live">
+      {turn.status === 'compacting' && <div className="cc-live-status">正在压缩对话，请稍候</div>}
       {visible.map(block => {
         // Every visible block is open by construction; the caret stops only
         // when the turn itself has stopped (`writing`, hoisted above the

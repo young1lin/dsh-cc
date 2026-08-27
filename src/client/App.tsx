@@ -1052,13 +1052,6 @@ export function CcApp(props: { onClose(): void }): ReactElement {
             />
           )}
 
-          {current !== undefined && (current.queued ?? 0) > 0 && (
-            <QueuedList
-              sessionId={current.id}
-              count={current.queued ?? 0}
-              onRecall={recallQueuedText}
-            />
-          )}
 
           {error !== undefined && (
             <div className="cc-error-bar">
@@ -1086,6 +1079,14 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                       <span>回合异常结束，可以直接重发：</span>
                       <Button size="sm" onClick={() => { void send(failedRetry, []).catch(() => { /* fail bar already reports */ }) }}>重试</Button>
                     </div>
+                  )}
+                  {/* Inline like the CLI: what you entered while busy reads as part of the flow. */}
+                  {current !== undefined && (current.queued ?? 0) > 0 && (
+                    <QueuedList
+                      sessionId={current.id}
+                      count={current.queued ?? 0}
+                      onRecall={recallQueuedText}
+                    />
                   )}
                   {events.length === 0 && live === undefined
                     && <div className="cc-empty">发送第一条消息，开始与 Claude Code 对话</div>}
