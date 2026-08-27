@@ -32,7 +32,7 @@ import { SettingsModal } from './settings/SettingsModal.tsx'
 import { SessionEnvModal } from './settings/SessionEnvModal.tsx'
 import { OverlayContext, useOverlay, type OverlaySignal } from './overlay.ts'
 import { connectEvents } from './api/http.ts'
-import { answerDialog, answerPermission, fetchCommands } from './api/interaction.ts'
+import { answerDialog, answerPermission, fetchCommands, reloadCommands } from './api/interaction.ts'
 import {
   backgroundTask, createSession, deleteSession, fetchSession, fetchSessions, forkSession, renameSession,
   rewindApply, rewindPreview, sendMessage, stopSession, stopTask, type RewindResult,
@@ -510,11 +510,50 @@ export function CcApp(props: { onClose(): void }): ReactElement {
         if (result.available && !(result.stale === true && commandsBySession[id] !== undefined)) {
           adoptCommands(id, result.commands)
         }
+        // A non-stale catalog is proof a process answered — the one thing that
+        // decides whether a reload has anything to reload.
+        setLiveCatalogs(previous => {
+          const live = result.available && result.stale !== true
+          if (previous.has(id) === live) return previous
+          const next = new Set(previous)
+          if (live) next.add(id)
+          else next.delete(id)
+          return next
+        })
       })
       .catch(() => {
         // Best effort; the next menu open retries.
       })
   }, [adoptCommands, commandsBySession])
+
+  /**
+   * Reload plugins and skills from disk for the current session, then adopt
+   * the re-discovered catalog. Unlike {@link refreshCommands} this changes what
+   * the CLI knows, not just what we asked it — a skill written since the
+   * process started only appears through here.
+   */
+  const [reloadingCommands, setReloadingCommands] = useState(false)
+  /**
+   * Sessions whose last command fetch came from a running process. This is the
+   * gate for offering a reload: `messageCount` cannot answer it (an adopted CLI
+   * session reports 0 however long its real conversation is) and `busy` only
+   * covers the moment a turn happens to be running.
+   */
+  const [liveCatalogs, setLiveCatalogs] = useState<Set<string>>(() => new Set())
+  const reloadCommandsForCurrent = useCallback((): void => {
+    const id = currentIdRef.current
+    if (id === undefined) return
+    setReloadingCommands(true)
+    reloadCommands(id)
+      .then(result => {
+        if (result.available) adoptCommands(id, result.commands)
+        // A refused reload is worth saying out loud: the user is standing in
+        // front of a menu that is about to look unchanged for a reason.
+        if (result.failures !== undefined && result.failures.length > 0) fail(new Error(result.failures.join('；')))
+      })
+      .catch(fail)
+      .finally(() => setReloadingCommands(false))
+  }, [adoptCommands, fail])
 
   useEffect(() => {
     let disposed = false
@@ -537,6 +576,32 @@ export function CcApp(props: { onClose(): void }): ReactElement {
           setConfig(message.config)
           catchUpCurrent()
           break
+        case 'session': {
+          // One row moved. This frame says nothing about the rest of the list,
+          // so unlike the full frame below it prunes nothing — it replaces the
+          // row in place (or prepends an unseen one) and re-sorts the way the
+          // server sorts, newest first.
+          const row = message.session
+          setSessions(previous => {
+            const at = previous.findIndex(session => session.id === row.id)
+            const next: SessionMeta[] = at < 0
+              ? [row, ...previous]
+              : previous.map((session, index) => (index === at ? row : session))
+            next.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+            return sessionFingerprint(previous) === sessionFingerprint(next) ? previous : next
+          })
+          // Same reasoning as the full frame: a session that is no longer busy
+          // has no in-progress turn to render.
+          if (row.status !== 'busy') {
+            setLiveBySession(previous => {
+              if (previous[row.id] === undefined) return previous
+              const next = { ...previous }
+              delete next[row.id]
+              return next
+            })
+          }
+          break
+        }
         case 'sessions': {
           // Same-fields frame → same render: keep the previous array identity
           // and skip the rail rebuild (see sessionFingerprint).
@@ -1124,6 +1189,8 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                   configDir={current.configDir}
                   commands={commandsFor(current)}
                   onRefreshCommands={refreshCommandsForCurrent}
+                  onReloadCommands={liveCatalogs.has(current.id) ? reloadCommandsForCurrent : undefined}
+                  reloadingCommands={reloadingCommands}
                   busy={current.status === 'busy'}
                   readOnly={current.terminalOwned === true}
                   onSend={send}

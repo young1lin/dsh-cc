@@ -290,7 +290,8 @@ function recordHistory(stamp: string, text: string): void {
  *   keys the persisted draft); `cwd` gates and roots the mention picker;
  *   `configDir` joins `cwd` in stamping the shared input history;
  *   `commands` drives both the menu and the recognition token;
- *   `onRefreshCommands` refetches on menu open.
+ *   `onRefreshCommands` refetches on menu open, `onReloadCommands` re-discovers
+ *   them from disk first.
  * @returns the composer node.
  */
 export const Composer = memo(function Composer(props: {
@@ -303,6 +304,14 @@ export const Composer = memo(function Composer(props: {
   commands: readonly SlashCommand[]
   /** Refetch the command list (menu just opened). */
   onRefreshCommands(): void
+  /**
+   * Reload plugins and skills from disk, then refetch. Undefined for a session
+   * with no process to ask — a cold session's catalog is a remembered one, and
+   * nothing can reload it in place.
+   */
+  onReloadCommands?: () => void
+  /** Whether such a reload is in flight. */
+  reloadingCommands?: boolean
   busy: boolean
   readOnly?: boolean
   /**
@@ -903,6 +912,8 @@ export const Composer = memo(function Composer(props: {
             selected={menuIndex}
             onSelectedChange={setMenuIndex}
             onPick={command => insertCommand(command.name)}
+            onReload={props.onReloadCommands}
+            reloading={props.reloadingCommands}
           />
         )}
         {!composing && mentionVisible && menu?.kind === 'mention' && (

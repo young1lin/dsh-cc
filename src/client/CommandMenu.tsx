@@ -17,6 +17,18 @@ import { isTerminalCommand, pageEquivalentFor } from './term-commands.ts'
 // chips below are this module's own rules under their own id, for the same
 // reason: one owning module per sheet.
 registerCss('command-menu', `
+.cc-cmd-reload {
+  display: flex; justify-content: flex-end;
+  padding: 3px 4px 1px; margin-top: 2px;
+  border-top: 1px solid var(--dsw-alias-border-l2);
+}
+.cc-cmd-reload button {
+  padding: 1px 7px; border: none; border-radius: 5px;
+  background: transparent; color: var(--dsw-alias-label-tertiary);
+  font: var(--dsw-font-xxs-12); cursor: pointer;
+}
+.cc-cmd-reload button:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-secondary); }
+.cc-cmd-reload button:disabled { cursor: default; }
 .cc-cmd-chip {
   flex: none;
   padding: 0 5px;
@@ -78,6 +90,10 @@ function commandChip(command: SlashCommand): ReactElement | null {
  * @param props.selected - the selected row index into `commands`.
  * @param props.onSelectedChange - hover/pointer moves the selection.
  * @param props.onPick - a row was activated.
+ * @param props.onReload - re-discover plugins and skills from disk. Absent
+ *   when the session has no running process to ask (a cold session's catalog
+ *   is a remembered one, and nothing can reload it in place).
+ * @param props.reloading - whether a reload is in flight.
  * @returns the popup node.
  */
 export function CommandMenu(props: {
@@ -87,6 +103,8 @@ export function CommandMenu(props: {
   selected: number
   onSelectedChange(index: number): void
   onPick(command: SlashCommand): void
+  onReload?: () => void
+  reloading?: boolean
 }): ReactElement {
   // Keyboard selection must stay on screen: the list scrolls inside its
   // 240px box, and without this the highlight walks out of view and the
@@ -95,10 +113,27 @@ export function CommandMenu(props: {
   useEffect(() => {
     popRef.current?.querySelector<HTMLElement>('[data-selected="true"]')?.scrollIntoView({ block: 'nearest' })
   }, [props.selected])
+  // Editing a skill on disk is the common reason a command is missing from
+  // this list, so the way out sits right where the user notices — including in
+  // the empty state, which is exactly where a just-written skill lands you.
+  const reloadRow = props.onReload === undefined ? null : (
+    <div className="cc-cmd-reload">
+      <button
+        type="button"
+        disabled={props.reloading === true}
+        onMouseDown={event => event.preventDefault()}
+        onClick={props.onReload}
+        title="重新从磁盘加载插件与技能（改完技能不必重开会话）"
+      >
+        {props.reloading === true ? '正在重新加载…' : '重新加载技能/插件'}
+      </button>
+    </div>
+  )
   if (props.commands.length === 0) {
     return (
       <div className="cc-menu-pop">
         <div className="cc-menu-empty">{props.emptyHint ?? '没有匹配的命令'}</div>
+        {reloadRow}
       </div>
     )
   }
@@ -121,6 +156,7 @@ export function CommandMenu(props: {
           {commandChip(command)}
         </div>
       ))}
+      {reloadRow}
     </div>
   )
 }

@@ -8,7 +8,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs'
-import { appendFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import type { CcEvent, SessionMeta } from './types.ts'
 
@@ -239,6 +239,56 @@ export class SessionStore {
     await this.persistIndex()
     await rm(join(this.dataDir, 'sessions', `${id}.jsonl`), { force: true })
     return true
+  }
+
+  /**
+   * Every blob id the sidecar transcripts still mention — the mark half of the
+   * blob sweep (see {@link BlobStore.sweep}).
+   *
+   * Scans the transcript files rather than the in-memory index, because the
+   * image references live on transcript events, not on session metadata. Every
+   * failure degrades to "referenced": a file that cannot be read must never
+   * cause its images to be swept, so an unreadable transcript aborts the whole
+   * sweep by returning undefined rather than returning a partial mark set.
+   * @returns the referenced ids, or undefined when the scan could not complete.
+   */
+  async referencedBlobIds(): Promise<Set<string> | undefined> {
+    const dir = join(this.dataDir, 'sessions')
+    let files: string[]
+    try {
+      files = await readdir(dir)
+    } catch {
+      return undefined
+    }
+    const referenced = new Set<string>()
+    for (const file of files) {
+      if (!file.endsWith('.jsonl')) continue
+      let text: string
+      try {
+        text = await readFile(join(dir, file), 'utf8')
+      } catch {
+        // A transcript we cannot read may hold the only reference to a blob.
+        return undefined
+      }
+      for (const line of text.split('\n')) {
+        // Cheap prefilter before the parse: image-bearing events are rare and
+        // transcripts run to megabytes.
+        if (!line.includes('"images"')) continue
+        let event: unknown
+        try {
+          event = JSON.parse(line)
+        } catch {
+          continue
+        }
+        const images = (event as { images?: unknown }).images
+        if (!Array.isArray(images)) continue
+        for (const image of images) {
+          const id = (image as { id?: unknown }).id
+          if (typeof id === 'string') referenced.add(id)
+        }
+      }
+    }
+    return referenced
   }
 
   /**

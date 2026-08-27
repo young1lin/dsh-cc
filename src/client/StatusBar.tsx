@@ -10,6 +10,7 @@ import { memo, type ReactElement } from 'react'
 import type { ContextUsage, UsageInfo } from './api/telemetry.ts'
 import { registerCss } from './css.ts'
 import { ContextMeter } from './status/ContextMeter.tsx'
+import { McpMenu } from './status/McpMenu.tsx'
 import { ModelMenu } from './status/ModelMenu.tsx'
 import { PermissionModeMenu } from './status/PermissionModeMenu.tsx'
 import { UsageReadout } from './status/UsageReadout.tsx'
@@ -60,6 +61,7 @@ export const StatusBar = memo(function StatusBar(props: {
     <div className="cc-status">
       <PermissionModeMenu sessionId={props.sessionId} sessionMode={props.sessionMode} configMode={props.configMode} />
       <ModelMenu sessionId={props.sessionId} busy={props.busy} openSignal={props.modelMenuSignal} />
+      <McpMenu sessionId={props.sessionId} busy={props.busy} />
       {props.context !== undefined && <ContextMeter context={props.context} />}
       <UsageReadout info={props.usage} fallbackCostUsd={props.fallbackCostUsd} />
     </div>

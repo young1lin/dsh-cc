@@ -354,7 +354,7 @@ function compactBoundaryInput(metadata: unknown): Extract<CcEventInput, { kind: 
  * @param cwd - the session's working directory.
  * @returns the directory name under `<configDir>/projects/`.
  */
-function encodeProjectDir(cwd: string): string {
+export function encodeProjectDir(cwd: string): string {
   const slug = cwd.replace(/[^a-zA-Z0-9]/g, '-')
   if (slug.length <= 200) return slug
   let hash = 0

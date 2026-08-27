@@ -20,12 +20,13 @@ import type { ResolvedConfig } from './config.ts'
 import { SessionEngine, resolveSessionModel, resolveSessionPermissionMode, type EngineHooks, type QueuedMessage, type SendImage } from './engine.ts'
 import { BlobStore, isImageMediaType } from './blobs.ts'
 import { cachedCommands, rememberCommands } from './command-cache.ts'
-import { SessionCatalog } from './catalog.ts'
+import { SessionCatalog, type CatalogRefresh } from './catalog.ts'
 import { fileIndexFor } from './file-index.ts'
 import { effectiveEnvEntries, maskSecret, readDirListing, readSdkVersion, readTextFile } from './http-support.ts'
 import { reduceDelta, type LiveTurn } from './live-turn.ts'
 import { deleteNativeSession, forkNativeSession, renameNativeSession } from './native-sessions.ts'
 import { SessionStore } from './store.ts'
+import { watchClaudeHome, type StoreChange, type StoreWatch } from './store-watch.ts'
 import type {
   AccountSummary, CcAccount, CcEvent, CcEventInput, CcSettings, ConfigSummary, EffortLevel, EnvPreset,
   ImageRef, LiveTurnSnapshot, PermissionDestination, PermissionModeValue, QueuedMessageView, SessionMeta, TaskRow,
@@ -66,6 +67,13 @@ const RESCAN_ACTIVE_MS = 2_000
  * full refresh, and `GET /sessions` refreshes before answering.
  */
 const RESCAN_IDLE_MS = 30_000
+
+/**
+ * How often unreferenced images are swept. Rare on purpose: the sweep reads
+ * every sidecar transcript, and blobs grow slowly enough that half a day of
+ * latency costs nothing.
+ */
+const BLOB_SWEEP_EVERY_MS = 12 * 60 * 60 * 1000
 
 /**
  * Hooks for an engine started to read the control channel and nothing else.
@@ -179,6 +187,14 @@ export class CcRuntime {
   private heartbeat: ReturnType<typeof setInterval> | undefined
   /** Periodic native-store rescan; picks up sessions running in a terminal. */
   private rescan: ReturnType<typeof setInterval> | undefined
+  /** Periodic unreferenced-image sweep. */
+  private blobSweep: ReturnType<typeof setInterval> | undefined
+  /** Filesystem watch over the CLI store; undefined when none could be established. */
+  private storeWatch: StoreWatch | undefined
+  /** The Claude Code home {@link storeWatch} was opened on; '' when there is none. */
+  private storeWatchDir = ''
+  /** Whether a coalesced `sessions` frame is already scheduled for this tick. */
+  private sessionsFramePending = false
   /** The cadence {@link rescan} is currently armed at; 0 when it is not armed. */
   private rescanEveryMs = 0
   /** Page-editable overrides layered over the cordis config. */
@@ -240,28 +256,116 @@ export class CcRuntime {
       }
     }, 20_000)
     this.armRescan()
+    // Blob housekeeping runs detached: it is disk work nobody waits on, and a
+    // mount must not be held up by it.
+    void this.sweepBlobs()
+    this.blobSweep = setInterval(() => void this.sweepBlobs(), BLOB_SWEEP_EVERY_MS)
   }
 
   /**
-   * (Re)arm the native-store rescan at the cadence the current audience earns.
+   * Drop stored images no transcript refers to any more. Aborts without
+   * deleting anything when the mark scan could not complete — a partial mark
+   * set would sweep live images.
+   */
+  private async sweepBlobs(): Promise<void> {
+    try {
+      const referenced = await this.store.referencedBlobIds()
+      if (referenced === undefined) return
+      const { deleted, bytes } = await this.blobs.sweep(referenced)
+      if (deleted > 0) {
+        this.ctx.logger?.info?.(`dsh-cc: 清理了 ${deleted} 张无引用图片，回收 ${Math.round(bytes / 1024)} KB`)
+      }
+    } catch (error) {
+      this.ctx.logger?.warn?.(`dsh-cc: 图片清理失败 ${String(error)}`)
+    }
+  }
+
+  /**
+   * Re-read the CLI store and publish only what actually moved.
+   *
+   * A terminal appending to one transcript moves one row. Broadcasting the
+   * whole catalog for it cost 135KB per write-burst on this machine — the
+   * dominant traffic on an otherwise idle page — so rows go out one frame each
+   * and the full list is reserved for a changed session SET, which no per-row
+   * frame can express.
+   */
+  private sweepCatalog(change?: StoreChange): void {
+    // A watch batch that named its project directories is re-read scoped to
+    // them; anything else — a timer tick, a change that could not be scoped —
+    // sweeps the store. The scoped read refuses rather than guesses, so an
+    // undefined answer falls through to the sweep.
+    const scoped = change !== undefined && !change.full
+      ? this.catalog.refreshProjects(change.projects)
+      : Promise.resolve(undefined)
+    void scoped
+      .then(async result => result ?? await this.catalog.refresh())
+      .then(result => this.publishCatalogChange(result))
+  }
+
+  /**
+   * Turn one refresh answer into the smallest frames that convey it.
+   * @param result - what the refresh found.
+   */
+  private publishCatalogChange(result: CatalogRefresh): void {
+    if (!result.changed) return
+    if (result.structural) {
+      this.broadcastSessions()
+      return
+    }
+    for (const id of result.moved) this.broadcastSession(id)
+  }
+
+  /**
+   * (Re)arm change detection over the CLI's session store.
    *
    * A session driven from a terminal CLI writes its transcript with no engine
-   * of ours involved, so rescanning is what keeps the rail — statuses included
-   * — in step with it. But the result only ever leaves over SSE, so the fast
-   * cadence is worth paying for exactly while somebody is attached to receive
-   * it. Idempotent: called on every client add and remove, and does nothing
-   * unless the cadence actually has to change.
+   * of ours involved, so noticing those writes is what keeps the rail —
+   * statuses included — in step with it.
+   *
+   * The store is watched, not polled: the sweep enumerates every project
+   * directory (see {@link watchClaudeHome} for the measurement), and running it
+   * on a timer spent that cost forever whether or not anything had changed. The
+   * watch carries the rate ceiling, so an actively-written store costs no more
+   * than the old fast cadence and a quiet one costs nothing.
+   *
+   * The timer survives as a backstop, at the idle cadence, for what a watch can
+   * miss: a network share that reports no events, a watcher the OS dropped, a
+   * platform without recursive watching at all. Where no watch could be
+   * established the timer keeps its original audience-scaled cadence, because
+   * it is then the only source of truth.
+   *
+   * Idempotent: called on every client add/remove and on every account switch.
    */
   private armRescan(): void {
-    const wanted = this.clients.size > 0 ? RESCAN_ACTIVE_MS : RESCAN_IDLE_MS
+    this.armStoreWatch()
+    const wanted = this.storeWatch !== undefined
+      ? RESCAN_IDLE_MS
+      : (this.clients.size > 0 ? RESCAN_ACTIVE_MS : RESCAN_IDLE_MS)
     if (this.rescan !== undefined && this.rescanEveryMs === wanted) return
     if (this.rescan !== undefined) clearInterval(this.rescan)
     this.rescanEveryMs = wanted
-    this.rescan = setInterval(() => {
-      void this.catalog.refresh().then(changed => {
-        if (changed) this.broadcastSessions()
-      })
-    }, wanted)
+    this.rescan = setInterval(() => this.sweepCatalog(), wanted)
+  }
+
+  /**
+   * Point the store watch at the Claude Code home currently in force, or leave
+   * it unestablished when this platform cannot watch recursively.
+   *
+   * An account switch moves the home, so the watch is rebuilt whenever the
+   * directory it was opened on is no longer the active one — a watch left on
+   * the previous root would report the wrong store's changes and miss the new
+   * one's entirely.
+   */
+  private armStoreWatch(): void {
+    const dir = this.activeConfigDir()
+    if (this.storeWatch !== undefined && sameDir(this.storeWatchDir, dir)) return
+    this.storeWatch?.close()
+    this.storeWatch = watchClaudeHome({
+      configDir: dir,
+      minIntervalMs: RESCAN_ACTIVE_MS,
+      onChange: change => this.sweepCatalog(change),
+    })
+    this.storeWatchDir = this.storeWatch === undefined ? '' : dir
   }
 
   /**
@@ -515,6 +619,8 @@ export class CcRuntime {
       applyConfigDir(after)
       this.account = undefined
       this.catalog.invalidate()
+      // The watched store moved with the root; re-point it (see armStoreWatch).
+      this.armRescan()
     }
     // The catalog is derived from the environment that just changed; a stale
     // negative cache must not suppress the re-probe the new settings deserve.
@@ -570,6 +676,9 @@ export class CcRuntime {
     this.modelCatalog = undefined
     this.modelsFailedAt = 0
     this.catalog.invalidate()
+    // The store being watched moved with the account; a watch left on the old
+    // root would report the wrong store and go blind to the new one.
+    this.armRescan()
     await this.catalog.refresh()
     this.broadcast({ t: 'hello', config: this.configSummary() })
     this.broadcastSessions()
@@ -779,8 +888,8 @@ export class CcRuntime {
           // Broadcast the cached list now; the native half's disappearance is
           // picked up by the rescan's signature change and re-broadcast there.
           this.broadcastSessions()
-          void this.catalog.refresh().then(changed => {
-            if (changed) this.broadcastSessions()
+          void this.catalog.refresh().then(result => {
+            if (result.changed) this.broadcastSessions()
           })
           return json(res, { ok: true })
         }
@@ -946,6 +1055,26 @@ export class CcRuntime {
           if (usage === undefined) return json(res, { available: false, reason: '查询失败或该账户类型无额度数据' })
           return json(res, { available: true, usage })
         }
+        if (parts.length === 3 && parts[2] === 'commands' && method === 'POST') {
+          // Re-discovery, not just a re-read: a skill or plugin edited on disk
+          // since the process started is invisible to `supportedCommands()`
+          // until the CLI reloads them, which used to mean restarting the
+          // session. Both reloads are attempted independently — a plugin tree
+          // that refuses to reload must not cost the user their skills.
+          const engine = this.liveEngine(id)
+          if (engine === undefined) return json(res, { error: '会话没有正在运行的进程' }, 404)
+          const failures = await engine.reloadExtensions()
+          const commands = await engine.supportedCommands()
+          const session = this.store.get(id)
+          if (session !== undefined && commands !== undefined && commands.length > 0) {
+            rememberCommands(this.baseConfig.dataDir, this.activeConfigDir(), session.cwd, commands)
+          }
+          return json(res, {
+            available: commands !== undefined,
+            commands: commands ?? [],
+            ...(failures.length > 0 ? { failures } : {}),
+          })
+        }
         if (parts.length === 3 && parts[2] === 'commands' && method === 'GET') {
           const engine = this.liveEngine(id)
           if (engine === undefined) {
@@ -973,6 +1102,38 @@ export class CcRuntime {
           await engine.interrupt()
           return json(res, { ok: true })
         }
+        if (parts.length === 3 && parts[2] === 'mcp' && method === 'GET') {
+          const engine = this.liveEngine(id)
+          if (engine === undefined) return json(res, { available: false, servers: [] })
+          const servers = await engine.mcpServers()
+          return json(res, { available: servers !== undefined, servers: servers ?? [] })
+        }
+        if (parts.length === 4 && parts[2] === 'mcp' && method === 'POST') {
+          const engine = this.liveEngine(id)
+          if (engine === undefined) return json(res, { error: '会话没有正在运行的进程' }, 404)
+          const name = decodeURIComponent(parts[3] ?? '')
+          if (name === '') return json(res, { error: '缺少服务器名' }, 400)
+          const body = await readJson(req)
+          const action = typeof body?.action === 'string' ? body.action : ''
+          try {
+            if (action === 'reconnect') await engine.reconnectMcpServer(name)
+            else if (action === 'enable') await engine.toggleMcpServer(name, true)
+            else if (action === 'disable') await engine.toggleMcpServer(name, false)
+            else return json(res, { error: '无效的操作' }, 400)
+          } catch (error) {
+            // The CLI throws with its own reason (unknown server, auth needed,
+            // transport refused); pass it through rather than flattening it.
+            return json(res, { error: error instanceof Error ? error.message : String(error) }, 409)
+          }
+          const servers = await engine.mcpServers()
+          return json(res, { ok: true, available: servers !== undefined, servers: servers ?? [] })
+        }
+        if (parts.length === 3 && parts[2] === 'agents' && method === 'GET') {
+          const engine = this.liveEngine(id)
+          if (engine === undefined) return json(res, { available: false, agents: [] })
+          const agents = await engine.supportedAgents()
+          return json(res, { available: agents !== undefined, agents: agents ?? [] })
+        }
         if (parts.length === 3 && parts[2] === 'fork' && method === 'POST') {
           const session = this.store.get(id) ?? await this.catalog.adopt(id)
           if (!session) return json(res, { error: '会话不存在' }, 404)
@@ -999,7 +1160,9 @@ export class CcRuntime {
           // through the regular rescan/adopt path. Refreshing once here puts
           // it in the broadcast frame immediately instead of up to one rescan
           // tick later.
-          if (await this.catalog.refresh()) this.broadcastSessions()
+          // A fork is a new session, so the refresh reports it as structural;
+          // either way the page needs the whole list to gain a row.
+          if ((await this.catalog.refresh()).changed) this.broadcastSessions()
           return json(res, { sessionId: forked.sessionId })
         }
         if (parts.length === 3 && parts[2] === 'rewind-preview' && method === 'POST') {
@@ -1063,6 +1226,9 @@ export class CcRuntime {
   async dispose(): Promise<void> {
     if (this.heartbeat !== undefined) clearInterval(this.heartbeat)
     if (this.rescan !== undefined) clearInterval(this.rescan)
+    if (this.blobSweep !== undefined) clearInterval(this.blobSweep)
+    this.storeWatch?.close()
+    this.storeWatch = undefined
     for (const id of [...this.engines.keys()]) await this.closeEngine(id)
     for (const res of this.clients) {
       try {
@@ -1592,14 +1758,48 @@ export class CcRuntime {
   private async patchMeta(sessionId: string, patch: Parameters<SessionStore['update']>[1]): Promise<void> {
     try {
       const meta = await this.store.update(sessionId, patch)
-      if (meta !== undefined) this.broadcastSessions()
+      if (meta !== undefined) this.broadcastSession(sessionId)
     } catch (error) {
       this.ctx.logger?.warn?.(`dsh-cc: 会话 ${sessionId} 的元数据未能落盘：${String(error)}`)
     }
   }
 
+  /**
+   * Push ONE session's row rather than the whole list.
+   *
+   * The full frame is ~142KB on a well-used machine (312 rows, measured), and
+   * almost everything that moves a session moves one field of one row: a queued
+   * count, a status flip, a metered cost, a resolved native id. Sending the
+   * catalog for each of those was three orders of magnitude of waste per
+   * change, on every attached page.
+   *
+   * Falls back to the full frame when the row cannot be resolved — a session
+   * that left the catalog, or one another account owns — because that is a
+   * structural change and the page's own list needs to shrink.
+   * @param id - the session whose row moved.
+   */
+  private broadcastSession(id: string): void {
+    const session = this.catalog.row(id)
+    if (session === undefined) {
+      this.broadcastSessions()
+      return
+    }
+    this.broadcast({ t: 'session', session })
+  }
+
   private broadcastSessions(): void {
-    this.broadcast({ t: 'sessions', sessions: this.catalog.list() })
+    // Coalesced to one frame per tick. The frame carries the WHOLE merged list
+    // — hundreds of rows on a well-used machine — while most of what triggers
+    // it is a single field moving (a queued count, a status flip, a cost
+    // update), and one logical change routinely fires several patches in a row:
+    // a turn's result alone patches status, queued, lastGoodModel and cost. One
+    // list build, one sort, one serialization, one frame.
+    if (this.sessionsFramePending) return
+    this.sessionsFramePending = true
+    setImmediate(() => {
+      this.sessionsFramePending = false
+      this.broadcast({ t: 'sessions', sessions: this.catalog.list() })
+    })
   }
 
   /**
@@ -1645,8 +1845,11 @@ export class CcRuntime {
     // most of RESCAN_IDLE_MS old. The page gets it immediately anyway — a list
     // that renders now beats a blank rail — and this forced sweep corrects it.
     this.armRescan()
-    void this.catalog.refresh().then(changed => {
-      if (changed) this.broadcastSessions()
+    // A page joining gets the corrected list whole: it has just been handed a
+    // possibly-stale cache, and reconciling that against per-row frames would
+    // be more fragile than one more full frame at the one moment it is cheap.
+    void this.catalog.refresh().then(result => {
+      if (result.changed) this.broadcastSessions()
     })
     const remove = (): void => {
       this.clients.delete(res)

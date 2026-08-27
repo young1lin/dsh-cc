@@ -174,3 +174,45 @@ export function setEffort(id: string, effort: string): Promise<{ ok: boolean }> 
 export function setPermissionMode(id: string, mode: string): Promise<{ ok: boolean }> {
   return api<{ ok: boolean }>(`/sessions/${id}/permission-mode`, { method: 'POST', body: JSON.stringify({ mode }) })
 }
+
+/** One MCP server as the live CLI resolved it. */
+export interface McpServerRow {
+  name: string
+  status: 'connected' | 'failed' | 'needs-auth' | 'pending' | 'disabled'
+  serverInfo?: { name: string; version: string }
+  error?: string
+  scope?: string
+  tools?: { name: string; description?: string }[]
+}
+
+/**
+ * GET /sessions/:id/mcp — the session's MCP servers with connection status.
+ *
+ * Which servers apply depends on the session's cwd, the account root, and
+ * enterprise policy, so this is read from the live process rather than from a
+ * config file; `available: false` means no process is running to ask.
+ * @param id - session id.
+ * @returns the servers, or an empty list for a cold session.
+ */
+export function fetchMcpServers(id: string): Promise<{ available: boolean; servers: McpServerRow[] }> {
+  return api<{ available: boolean; servers: McpServerRow[] }>(`/sessions/${id}/mcp`)
+}
+
+/**
+ * POST /sessions/:id/mcp/:name — act on one MCP server.
+ * @param id - session id.
+ * @param name - the server name as configured.
+ * @param action - `reconnect` retries a failed server; `enable`/`disable`
+ *   connect or disconnect it for the running process.
+ * @returns the refreshed server list.
+ */
+export function controlMcpServer(
+  id: string,
+  name: string,
+  action: 'reconnect' | 'enable' | 'disable',
+): Promise<{ ok: boolean; available: boolean; servers: McpServerRow[] }> {
+  return api<{ ok: boolean; available: boolean; servers: McpServerRow[] }>(
+    `/sessions/${id}/mcp/${encodeURIComponent(name)}`,
+    { method: 'POST', body: JSON.stringify({ action }) },
+  )
+}

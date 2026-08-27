@@ -19,7 +19,7 @@
 import { baselineConfigDir, sameDir } from './accounts.ts'
 import type { BlobStore } from './blobs.ts'
 import { listNativeSessions } from './native-sessions.ts'
-import { readNativeTranscript } from './native-transcript.ts'
+import { encodeProjectDir, readNativeTranscript } from './native-transcript.ts'
 import type { PeerSession } from './peer-sessions.ts'
 import { readPeerSessions } from './peer-sessions.ts'
 import type { SessionStore } from './store.ts'
@@ -49,6 +49,22 @@ function sidecarOnly(kind: string, subtype: string | undefined): boolean {
   return kind === 'system' && subtype !== 'init'
 }
 
+/** What one catalog refresh found. */
+export interface CatalogRefresh {
+  /** Whether anything moved at all; false means skip broadcasting entirely. */
+  changed: boolean
+  /**
+   * Whether the SET of sessions changed — one appeared or disappeared. No
+   * per-row frame can express that, so the caller must send the whole list.
+   */
+  structural: boolean
+  /** Native ids of rows that changed in place; broadcast one frame each. */
+  moved: string[]
+}
+
+/** The answer for a sweep that found nothing, or could not run at all. */
+const QUIET_REFRESH: CatalogRefresh = { changed: false, structural: false, moved: [] }
+
 /**
  * A merged view over the CLI's session store and the dsh-cc sidecar.
  *
@@ -60,15 +76,23 @@ function sidecarOnly(kind: string, subtype: string | undefined): boolean {
 export class SessionCatalog {
   /** Native sessions from the last {@link refresh}, most recent first. */
   private native: SessionMeta[] = []
-  /** Last-refresh fingerprint; equal strings mean nothing native moved. */
-  private signature = ''
+  /**
+   * Per-session fingerprint from the last {@link refresh}, keyed by native id.
+   *
+   * Per session rather than one string over the whole store, because "did
+   * anything change" is the wrong question to answer: a terminal appending to
+   * ONE transcript moved one row, and answering only "yes" forced a full
+   * session-list broadcast — 135KB on this machine — for a row that fits in
+   * under a kilobyte. The map answers "which rows moved".
+   */
+  private signatures = new Map<string, string>()
   /**
    * The refresh currently running, if any. The rescan timer and concurrent
    * requests all funnel through {@link refresh}; sharing one sweep keeps the
    * cache mutation (native array + signature) single-threaded and spares the
    * disk a second identical sweep per tick.
    */
-  private refreshInFlight: Promise<boolean> | undefined
+  private refreshInFlight: Promise<CatalogRefresh> | undefined
 
   /**
    * @param store - the dsh-cc sidecar.
@@ -100,7 +124,7 @@ export class SessionCatalog {
    */
   invalidate(): void {
     this.native = []
-    this.signature = ''
+    this.signatures.clear()
   }
 
   /**
@@ -129,18 +153,18 @@ export class SessionCatalog {
    * A failure here is not fatal: the CLI store may be absent on a machine
    * that has only ever run Claude Code through this page, and the sidecar
    * alone still serves a working list.
-   * @returns whether anything native changed — a moved `updatedAt`, a
-   *   flipped status, or a changed ownership — so a poller can skip
-   *   broadcasting a quiet store.
+   * @returns what moved: nothing, a set of rows, or the list itself. A caller
+   *   broadcasts per row when only `moved` is populated and the whole list only
+   *   when `structural` says the set of sessions itself changed.
    */
-  async refresh(): Promise<boolean> {
+  async refresh(): Promise<CatalogRefresh> {
     const running = this.refreshInFlight
     if (running !== undefined) return await running
     const run = this.refreshOnce()
       .catch((error: unknown) => {
         // The sweep must never reject: callers hang `void ...then(...)` off it.
         console.warn('dsh-cc: 会话目录刷新失败', error)
-        return false
+        return QUIET_REFRESH
       })
       .finally(() => {
         this.refreshInFlight = undefined
@@ -154,16 +178,86 @@ export class SessionCatalog {
    * {@link refresh}, so its await points never interleave with another
    * refresh writing the same cache.
    */
-  private async refreshOnce(): Promise<boolean> {
+  private async refreshOnce(): Promise<CatalogRefresh> {
     let fresh: SessionMeta[]
     let peers: Map<string, PeerSession>
     try {
       ;[fresh, peers] = await Promise.all([listNativeSessions(), readPeerSessions()])
     } catch {
       // No readable CLI store: the sidecar list stands on its own.
-      return false
+      return QUIET_REFRESH
     }
-    for (const meta of fresh) {
+    this.applyPeers(fresh, peers)
+    this.native = fresh
+    return this.commit(fresh)
+  }
+
+  /**
+   * Re-read ONLY the project directories that changed.
+   *
+   * This is why the store is watched rather than polled. A terminal appending
+   * to one transcript changes one directory; enumerating all of them to notice
+   * it costs 171ms on a well-used machine (52 directories / 2209 files), and
+   * paying that at the watch's rate ceiling is the same bill polling ran up. A
+   * scoped read touches one directory.
+   *
+   * Refuses — returns undefined — whenever the scoped path cannot be trusted to
+   * see everything: an empty cache to resolve directory names against, or a
+   * named directory this catalog has never seen (a project that appeared, whose
+   * cwd cannot be recovered from an encoded name, since the encoding is lossy).
+   * The caller then falls back to {@link refresh}. Refusing is always safe;
+   * guessing is not.
+   *
+   * @param encodedDirs - project-directory names under `projects/`, as the
+   *   watch reported them.
+   * @returns what moved, or undefined when the caller must sweep instead.
+   */
+  async refreshProjects(encodedDirs: readonly string[]): Promise<CatalogRefresh | undefined> {
+    if (encodedDirs.length === 0 || this.native.length === 0) return undefined
+    if (this.refreshInFlight !== undefined) return await this.refreshInFlight
+    // The encoding is one-way, so the only way back to a cwd is a session we
+    // already know about in that directory.
+    const cwdByDir = new Map<string, string>()
+    for (const meta of this.native) {
+      if (meta.cwd === '') continue
+      const encoded = encodeProjectDir(meta.cwd)
+      if (!cwdByDir.has(encoded)) cwdByDir.set(encoded, meta.cwd)
+    }
+    const targets: string[] = []
+    for (const dir of encodedDirs) {
+      const cwd = cwdByDir.get(dir)
+      if (cwd === undefined) return undefined
+      targets.push(cwd)
+    }
+    let scoped: SessionMeta[][]
+    let peers: Map<string, PeerSession>
+    try {
+      ;[scoped, peers] = await Promise.all([
+        Promise.all(targets.map(cwd => listNativeSessions({ cwd }))),
+        readPeerSessions(),
+      ])
+    } catch {
+      return undefined
+    }
+    const touched = new Set(encodedDirs)
+    // Everything outside the touched directories is carried over untouched;
+    // inside them the scoped read is authoritative, which is what lets a
+    // session deleted from one of those directories disappear.
+    const fresh = this.native.filter(meta => meta.cwd === '' || !touched.has(encodeProjectDir(meta.cwd)))
+    for (const rows of scoped) fresh.push(...rows)
+    this.applyPeers(fresh, peers)
+    fresh.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+    this.native = fresh
+    return this.commit(fresh)
+  }
+
+  /**
+   * Resolve live ownership over a freshly-read native list.
+   * @param rows - the native rows to stamp, mutated in place.
+   * @param peers - the live-process registry.
+   */
+  private applyPeers(rows: SessionMeta[], peers: Map<string, PeerSession>): void {
+    for (const meta of rows) {
       // A live peer holds the session open — unless that peer is one of the
       // host's own engines, which is this page driving the session rather than
       // a terminal holding it.
@@ -173,11 +267,38 @@ export class SessionCatalog {
       // busy for the full recency window after a `kill -9`.
       if (meta.status === 'busy' && !peers.has(meta.id)) meta.status = 'idle'
     }
-    this.native = fresh
-    const signature = JSON.stringify(fresh.map(meta => `${meta.id}\n${meta.updatedAt}\n${meta.status}\n${meta.terminalOwned === true}`))
-    if (signature === this.signature) return false
-    this.signature = signature
-    return true
+  }
+
+  /**
+   * Fingerprint the new native view against the previous one and adopt it.
+   * @param rows - the native rows now in force.
+   * @returns what moved, in the shape callers broadcast from.
+   */
+  private commit(rows: readonly SessionMeta[]): CatalogRefresh {
+    const next = new Map<string, string>()
+    for (const meta of rows) {
+      next.set(meta.id, `${meta.updatedAt}\n${meta.status}\n${meta.terminalOwned === true}\n${meta.name}`)
+    }
+    // A session appearing or disappearing changes the LIST, which no per-row
+    // frame can express — the page has to be handed the whole thing. A session
+    // whose fingerprint merely moved is one row.
+    let structural = false
+    const moved: string[] = []
+    for (const [id, fingerprint] of next) {
+      const before = this.signatures.get(id)
+      if (before === undefined) structural = true
+      else if (before !== fingerprint) moved.push(id)
+    }
+    if (!structural) {
+      for (const id of this.signatures.keys()) {
+        if (!next.has(id)) {
+          structural = true
+          break
+        }
+      }
+    }
+    this.signatures = next
+    return { changed: structural || moved.length > 0, structural, moved }
   }
 
   /**
@@ -216,6 +337,39 @@ export class SessionCatalog {
    */
   get(id: string): SessionMeta | undefined {
     return this.store.get(id) ?? this.native.find(meta => meta.id === id)
+  }
+
+  /**
+   * One session in exactly the shape {@link list} would emit for it: the
+   * sidecar row with the CLI's identity fields and live ownership merged in.
+   *
+   * {@link get} deliberately answers the raw stored row — the send and adopt
+   * paths want the record, not the view. This is the view, and it exists so a
+   * single-session wire frame cannot disagree with the full-list frame: a row
+   * built from `get` would be missing `terminalOwned` and the CLI's own
+   * summary/branch/updatedAt, and the page would render it differently
+   * depending on which frame happened to deliver it.
+   * @param id - the page id: a sidecar id, or a native session id.
+   * @returns the merged copy, or undefined when no in-scope session matches.
+   */
+  row(id: string): SessionMeta | undefined {
+    // A native id may name a session the page already adopted, which lives
+    // under its OWN sidecar id. Resolving to the native row instead would hand
+    // the page a second row for one conversation — the rescan path addresses
+    // rows by native id, so this is the common case there, not a corner.
+    const stored = this.store.get(id)
+      ?? this.store.list().find(meta => meta.claudeSessionId === id)
+    if (stored === undefined) {
+      const native = this.native.find(meta => meta.id === id)
+      return native === undefined ? undefined : { ...native }
+    }
+    if (!this.inScope(stored)) return undefined
+    const row = { ...stored }
+    const native = row.claudeSessionId === undefined
+      ? undefined
+      : this.native.find(meta => meta.id === row.claudeSessionId)
+    if (native !== undefined) mergeNativeInto(row, native)
+    return row
   }
 
   /**

@@ -21,6 +21,8 @@ dsh-cc 是一个 DSH 外挂双面插件：在 DSH Web GUI 右缘加入一个 **C
 - **Esc 中断回合**：回合进行中在输入框按 Esc 即中断（与「停止」按钮同路径）；Esc 分层保持「菜单 → 中断 → 离开输入框 → 关闭面板」
 - **每会话草稿与输入历史**：未发送的草稿（含已上传图片）按会话落盘，切换 / 刷新不丢；发送过的消息按「项目 + 账号」记入历史，输入框空态或回溯态下 ↑↓ 翻取、编辑即退出回溯
 - **排队交给 CLI 自己做**：回合进行中发送的消息立即推给 CLI，由 CLI 的命令队列排；它回的 `command_lifecycle` 帧就是页面「谁在等」的唯一真相。等待中的消息在转录流上方成条列出（时间 + 首行预览 + 「撤回」），撤回走 CLI 原生 dequeue，撤得掉才算撤掉；本轮结束时**整批合并成一个回合**发出（CLI 的 coalescing，模型一次看到用户的连续意图，也只计一次费）。转录行在消息真正被取进回合时才写 —— 排队中的消息不会伪装成已发出。引擎异常死亡时未开跑的队列整体移交下一个进程
+- **MCP 服务器面板**：状态条上的 `MCP n/m` 展开服务器列表 —— 连接状态、配置作用域、工具数、失败原因，可就地重连 / 停用 / 启用。哪些服务器生效取决于会话 cwd（项目作用域）、账号根目录（用户作用域）和企业策略，只有活进程解析全了这三层，所以这里读的是进程而不是配置文件；没配 MCP 的会话完全不显示这个控件
+- **技能/插件热重载**：CLI 只在启动时解析技能与插件，所以刚写完的技能原本要重开会话才能用。命令菜单底部的「重新加载技能/插件」就地重新发现（实测 77 → 78 条，新技能立即出现）
 - **压缩进度可见**：`/compact` 或自动压缩进行中，进行中回合区显示「正在压缩对话」脉冲指示（CLI 的 status 帧）；完成即提示，失败以警告条给出原因
 - **CLI 三手势**：Shift+Tab 轮换权限模式、Alt+P 打开模型菜单、Alt+T 切换思考档位（IME / 浮层守卫与 Esc 一致）
 - **会话时间旅行**：任意历史消息 hover「分叉」（原生 fork，新会话立刻进列表并切换）与「回滚文件」（基于 CLI 文件检查点，先预览将恢复的文件数与 ±行数，确认后回滚，symlink 跳过数警示）；压缩后的转录渲染「对话已压缩 · 前 N tokens → 后 M tokens」分隔线（含 /compact 与自动压缩两种触发来源）
@@ -186,7 +188,11 @@ C:/PythonProject/dev/dsh-cc
 | POST | /cc/api/sessions/:id/effort | 切换思考档位；per-session：持久化到该会话，只影响该会话 |
 | POST | /cc/api/sessions/:id/permission-mode | 切换权限模式；持久化为该会话默认，忙碌引擎就地热切换 |
 | GET | /cc/api/sessions/:id/usage | 账户用量（需活跃引擎） |
-| GET | /cc/api/sessions/:id/commands | CLI 支持的斜杠命令（需活跃引擎） |
+| GET | /cc/api/sessions/:id/commands | CLI 支持的斜杠命令（需活跃引擎；冷会话回退到该「账号+项目」上次记档的目录，带 `stale`） |
+| POST | /cc/api/sessions/:id/commands | 先重新加载插件与技能再返回目录（改完技能不必重开会话）；插件/技能各自失败各自报，走 `failures` |
+| GET | /cc/api/sessions/:id/mcp | 该会话的 MCP 服务器与连接状态、作用域、工具数（读自活进程；无进程返回 `available: false`） |
+| POST | /cc/api/sessions/:id/mcp/:name | 对一个 MCP 服务器执行 `reconnect` / `enable` / `disable`，返回刷新后的列表；CLI 拒绝时原样透传原因（409） |
+| GET | /cc/api/sessions/:id/agents | 该会话可用的子代理目录（需活跃引擎） |
 | POST | /cc/api/sessions/:id/stop | 中断当前回合 |
 | POST | /cc/api/sessions/:id/tasks/:taskId/stop | 结束一个运行中的任务（子代理/命令等） |
 | POST | /cc/api/sessions/:id/tasks/:taskId/background | 把前台任务转后台继续跑（CLI 的 Ctrl+B 等价物） |

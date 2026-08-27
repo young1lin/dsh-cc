@@ -915,6 +915,94 @@ export class SessionEngine {
   }
 
   /**
+   * The MCP servers this session's CLI resolved, with connection status, the
+   * tools each exposes, and the scope each was configured in.
+   *
+   * Read from the live process rather than from any config file: which servers
+   * apply depends on the session's cwd (project scope), the account root (user
+   * scope), and enterprise policy — the CLI is the only thing that has resolved
+   * all three.
+   * @returns the servers, or undefined without a live query.
+   */
+  async mcpServers(): Promise<readonly unknown[] | undefined> {
+    this.lastUsed = Date.now()
+    try {
+      return await this.query?.mcpServerStatus()
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Reconnect one MCP server — the retry for a `failed` or `needs-auth` row.
+   * @param name - the server name as configured.
+   * @returns true when the CLI accepted the request.
+   */
+  async reconnectMcpServer(name: string): Promise<boolean> {
+    this.lastUsed = Date.now()
+    const q = this.query
+    if (q === undefined) return false
+    await q.reconnectMcpServer(name)
+    return true
+  }
+
+  /**
+   * Enable or disable one MCP server for the running process.
+   * @param name - the server name as configured.
+   * @param enabled - whether the server should be connected.
+   * @returns true when the CLI accepted the change.
+   */
+  async toggleMcpServer(name: string, enabled: boolean): Promise<boolean> {
+    this.lastUsed = Date.now()
+    const q = this.query
+    if (q === undefined) return false
+    await q.toggleMcpServer(name, enabled)
+    return true
+  }
+
+  /**
+   * Re-discover plugins and skills from disk.
+   *
+   * The CLI resolves both at startup, so a skill written or edited after the
+   * process started stays invisible to `supportedCommands()` — until this, the
+   * only cure was ending the session. The two reloads are independent on
+   * purpose: a plugin tree that refuses to load must not also cost the user
+   * their skills, so each failure is reported rather than thrown.
+   * @returns the human-readable reasons that failed; empty when both reloaded.
+   */
+  async reloadExtensions(): Promise<string[]> {
+    this.lastUsed = Date.now()
+    const q = this.query
+    if (q === undefined) return ['会话没有正在运行的进程']
+    const failures: string[] = []
+    for (const [what, reload] of [
+      ['插件', async () => { await q.reloadPlugins() }],
+      ['技能', async () => { await q.reloadSkills() }],
+    ] as const) {
+      try {
+        await reload()
+      } catch (error) {
+        failures.push(`${what}重新加载失败：${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    return failures
+  }
+
+  /**
+   * The subagent catalog the live CLI resolved — built-ins plus whatever the
+   * user's own `agents/` directories and plugins contribute.
+   * @returns the agents, or undefined without a live query.
+   */
+  async supportedAgents(): Promise<readonly unknown[] | undefined> {
+    this.lastUsed = Date.now()
+    try {
+      return await this.query?.supportedAgents()
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
    * The slash-command catalog of the live CLI, including the user's own
    * skills. The CLI discovers commands lazily, so the list can grow between
    * calls within one session.

@@ -59,3 +59,23 @@ export function answerDialog(id: string, requestId: string, answers: unknown): P
 export function fetchCommands(id: string): Promise<{ available: boolean; commands: SlashCommand[]; stale?: boolean; savedAt?: number }> {
   return api<{ available: boolean; commands: SlashCommand[]; stale?: boolean; savedAt?: number }>(`/sessions/${id}/commands`)
 }
+
+/**
+ * POST /sessions/:id/commands — reload plugins and skills from disk, then
+ * return the re-discovered catalog.
+ *
+ * The CLI resolves both at startup, so a skill edited since is invisible to
+ * the GET above; this is what makes it appear without ending the session.
+ * @param id - session id; needs a running process.
+ * @returns the refreshed catalog, plus `failures` for whichever reload refused.
+ */
+export function reloadCommands(id: string): Promise<{
+  available: boolean
+  commands: SlashCommand[]
+  failures?: string[]
+}> {
+  return api<{ available: boolean; commands: SlashCommand[]; failures?: string[] }>(
+    `/sessions/${id}/commands`,
+    { method: 'POST' },
+  )
+}

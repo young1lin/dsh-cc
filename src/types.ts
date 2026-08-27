@@ -603,6 +603,13 @@ export const TERMINAL_TASK_STATUSES = ['completed', 'failed', 'killed', 'stopped
 export type WireMessage =
   | { t: 'hello'; config: ConfigSummary }
   | { t: 'sessions'; sessions: SessionMeta[] }
+  /**
+   * One session's row moved. Carries the same merged shape a `sessions` frame
+   * would give this row (see `SessionCatalog.row`), so the page can replace it
+   * in place; it says NOTHING about the rest of the list, so a receiver must
+   * not use it to prune sessions the way a full frame does.
+   */
+  | { t: 'session'; session: SessionMeta }
   | { t: 'event'; sessionId: string; event: CcEvent }
   | { t: 'delta'; sessionId: string; seq: number; delta: StreamDelta }
   | { t: 'permission'; sessionId: string; request: PermissionRequest }
