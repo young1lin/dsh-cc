@@ -14,6 +14,17 @@
 export const TOOL_ROW_CSS = `
 .cc-tool { align-self: stretch; display: flex; flex-direction: column; }
 
+/* Plan-mode exit's proposed plan, drawn as markdown inside the row body. */
+.cc-plan {
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-base);
+  font: var(--dsw-font-xs-13);
+}
+
 .cc-tool-row { position: relative; overflow: hidden; }
 
 /* Running sweep: a fixed-width glare band at 60% of the page ground glides

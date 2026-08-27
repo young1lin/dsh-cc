@@ -12,6 +12,8 @@
  */
 
 import { useEffect, useState, type ReactElement } from 'react'
+import { DiffBlock, MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
+import { pendingDiffHunks } from './tool/diff-card.ts'
 import { Button, Input } from '@deepseek-ai/dsh-client-ui-primitives'
 import { registerCss } from './css.ts'
 import { toolSummary } from './Transcript.tsx'
@@ -93,6 +95,18 @@ registerCss('interaction', `
   color: var(--dsw-alias-label-tertiary);
   font-variant-numeric: tabular-nums;
 }
+
+/* The change the call WOULD make (or the plan it proposes), shown before any
+   decision; capped so a big payload cannot push its own buttons off-screen. */
+.cc-ask-diff, .cc-ask-plan {
+  max-height: 260px;
+  overflow-y: auto;
+  margin-bottom: 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-base);
+}
+.cc-ask-plan { padding: 8px 10px; font: var(--dsw-font-xs-13); }
 `)
 
 /**
@@ -118,6 +132,8 @@ export function rememberDestination(toolName: string): PermissionAnswer['remembe
 export function PermissionCard(props: {
   request: PermissionRequest
   onAnswer(answer: PermissionAnswer): void
+  /** The session workspace, which shortens embedded-diff path headers. */
+  cwd?: string
 }): ReactElement {
   const [note, setNote] = useState('')
   const [waited, setWaited] = useState(0)
@@ -129,6 +145,7 @@ export function PermissionCard(props: {
     return () => clearInterval(timer)
   }, [])
   const target = toolSummary(request.toolName, request.input)
+  const hunks = pendingDiffHunks(request.toolName, request.input, props.cwd)
   const canRemember = (request.suggestions?.length ?? 0) > 0
   const destination = rememberDestination(request.toolName)
   const answer = (behavior: 'allow' | 'deny', remember?: PermissionAnswer['remember']): void => {
@@ -149,7 +166,19 @@ export function PermissionCard(props: {
       {request.blockedPath !== undefined && (
         <div className="cc-ask-sub">被规则拦截的路径：{request.blockedPath}</div>
       )}
-      <div className="cc-ask-target">{target !== '' ? target : JSON.stringify(request.input, null, 2)}</div>
+      {/* A file-mutation approval shows the change it WOULD make; a plan-mode
+          exit shows the plan itself. Both replace the raw JSON target box. */}
+      {request.toolName === 'ExitPlanMode' && typeof (request.input as { plan?: unknown })?.plan === 'string' ? (
+        <div className="cc-ask-plan">
+          <MarkdownText text={String((request.input as { plan: string }).plan)} />
+        </div>
+      ) : hunks !== null ? (
+        <div className="cc-ask-diff">
+          <DiffBlock diffs={hunks} />
+        </div>
+      ) : (
+        <div className="cc-ask-target">{target !== '' ? target : JSON.stringify(request.input, null, 2)}</div>
+      )}
       <Input
         value={note}
         placeholder="补充说明（可选，会转达给模型）"

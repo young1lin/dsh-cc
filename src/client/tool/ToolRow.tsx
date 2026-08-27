@@ -51,6 +51,7 @@ const CHAT_MAX_LINES = 8
 /** Leading icon per tool; an unknown tool falls back to the warning glyph. */
 const TOOL_ICONS: Record<string, ReactNode> = {
   Bash: <IconCodeOutline16 />,
+  ExitPlanMode: <IconListPenOutline16 />,
   BashOutput: <IconCodeOutline16 />,
   KillShell: <IconCodeOutline16 />,
   Read: <IconListPenOutline16 />,
@@ -182,6 +183,8 @@ function CardBody(props: { card: ToolCard; input: unknown; result: ToolResult | 
       return card.task.report === undefined
         ? null
         : <div className="cc-task"><MarkdownText text={card.task.report} /></div>
+    case 'plan':
+      return <div className="cc-plan"><MarkdownText text={card.plan} /></div>
     default:
       return <GenericCard input={input} result={result} />
   }

@@ -38,6 +38,7 @@ export type ToolCard =
   | { kind: 'web'; web: WebBlockProps }
   | { kind: 'todo'; todo: TodoCard }
   | { kind: 'task'; task: TaskCard }
+  | { kind: 'plan'; plan: string }
   | { kind: 'generic' }
 
 /** The generic IN/OUT card, shared by every derivation that declines a call. */
@@ -107,6 +108,11 @@ export function toolCard(
     case 'Task':
     case 'Agent':
       return { kind: 'task', task: taskCard(input, result) }
+    // Plan mode's exit proposes a plan for approval; markdown, not JSON.
+    case 'ExitPlanMode': {
+      const plan = typeof (input as { plan?: unknown })?.plan === 'string' ? (input as { plan: string }).plan : ''
+      return plan === '' ? GENERIC : { kind: 'plan', plan }
+    }
     default:
       return GENERIC
   }
@@ -134,7 +140,10 @@ export function cardSummary(card: ToolCard): CardSummary | null {
         ? null
         : { text: firstLine(card.terminal.description), suffix: null }
     case 'diff':
-      return { text: card.diff.card.diffs[0]?.path ?? '', suffix: `+${card.diff.added} -${card.diff.removed}` }
+      return {
+        text: card.diff.card.diffs[0]?.path ?? '',
+        suffix: `+${card.diff.added} -${card.diff.removed}${card.diff.replaceAll ? ' · 全部替换' : ''}`,
+      }
     case 'todo':
       return { text: card.todo.summary, suffix: card.todo.suffix }
     case 'task': {

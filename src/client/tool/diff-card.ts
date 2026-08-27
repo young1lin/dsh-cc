@@ -24,6 +24,8 @@ export interface DiffCard {
   added: number
   /** Removed lines across every hunk, counted the same way. */
   removed: number
+  /** The call asked to replace EVERY occurrence; the per-call hunk shows one. */
+  replaceAll: boolean
 }
 
 /**
@@ -71,6 +73,18 @@ function hunksFor(name: string, input: unknown, cwd: string | undefined): DiffHu
 }
 
 /**
+ * The change one file-mutation call WOULD make, derived for an approval
+ * surface: the same argument-side derivation as `diffCard` but without
+ * any result - the CLI asks before anything is applied.
+ * @param name - wire tool name (Edit, Write, or NotebookEdit).
+ * @param input - the pending call input.
+ * @param cwd - the session workspace, which shortens the hunk path header.
+ * @returns the hunks, or null when the arguments describe no file change.
+ */
+export function pendingDiffHunks(name: string, input: unknown, cwd: string | undefined): DiffHunk[] | null {
+  return hunksFor(name, input, cwd)
+}
+/**
  * Derive the diff-card material for a file-mutation call, or null when the
  * arguments do not describe a change and the call belongs on the generic card.
  * @param name - wire tool name (`Edit`, `Write`, or `NotebookEdit`).
@@ -94,5 +108,5 @@ export function diffCard(
     added += contentLines(hunk.newText).length
     removed += hunk.oldText === null ? 0 : contentLines(hunk.oldText).length
   }
-  return { card: { diffs }, added, removed }
+  return { card: { diffs }, added, removed, replaceAll: asRecord(input)?.replace_all === true }
 }

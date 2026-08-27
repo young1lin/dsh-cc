@@ -19,6 +19,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } 
 import { Button, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
 import { Composer } from './Composer.tsx'
 import { PermissionCard, QuestionCard } from './Interaction.tsx'
+import { registerCss } from './css.ts'
 import { SessionRail } from './SessionRail.tsx'
 import { StatusBar } from './StatusBar.tsx'
 import { LiveTurnView } from './LiveTurnView.tsx'
@@ -126,6 +127,46 @@ interface CommandCache {
  * wrong-shaped reads as absent (the first live fetch rewrites it).
  * @returns the stamped cache, or undefined.
  */
+registerCss('app-retry', `
+.cc-retry-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+  font: var(--dsw-font-xs-13);
+  color: var(--dsw-alias-label-secondary);
+}
+`)
+
+/**
+ * The session's last user text when the turn after it failed, as the retry
+ * bar re-sends it; undefined whenever nothing is retryable.
+ * @param events - the settled transcript tail, newest last.
+ * @returns the message text to resend, or undefined.
+ */
+export function failedRetryText(events: readonly CcEvent[]): string | undefined {
+  let failed = false
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index]
+    if (event === undefined) continue
+    if (event.kind === 'result') {
+      if (event.isError === true) failed = true
+      continue
+    }
+    if (event.kind === 'error') {
+      failed = true
+      continue
+    }
+    if (event.kind === 'user') break
+  }
+  if (!failed) return undefined
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index]
+    if (event?.kind === 'user') return event.text === '' ? undefined : event.text
+  }
+  return undefined
+}
+
 function readCommandCache(): CommandCache | undefined {
   try {
     const raw = localStorage.getItem(COMMAND_CACHE_KEY)
@@ -446,6 +487,14 @@ export function CcApp(props: { onClose(): void }): ReactElement {
       ? commandCache.commands
       : NO_COMMANDS
   }
+
+  // The text a retry bar would resend for the CURRENT session: the last user
+  // message when the turn after it ended in failure. Idle-only UI; the memo
+  // keeps the scan off the streaming path.
+  const failedRetry = useMemo(
+    () => (current === undefined ? undefined : failedRetryText(eventsBySession[current.id] ?? [])),
+    [eventsBySession, current],
+  )
 
   /**
    * Refetch one session's slash-command catalog into the cache — the
@@ -1032,12 +1081,19 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                 >
                   <Transcript events={events} commands={commandsFor(current)} onFork={forkFrom} onRewind={rewindFrom} />
                   <LiveTurnView turn={live} />
+                  {failedRetry !== undefined && current.status !== 'busy' && (
+                    <div className="cc-retry-bar">
+                      <span>回合异常结束，可以直接重发：</span>
+                      <Button size="sm" onClick={() => { void send(failedRetry, []).catch(() => { /* fail bar already reports */ }) }}>重试</Button>
+                    </div>
+                  )}
                   {events.length === 0 && live === undefined
                     && <div className="cc-empty">发送第一条消息，开始与 Claude Code 对话</div>}
                   {currentPermissions.map(item => (
                     <PermissionCard
                       key={item.request.id}
                       request={item.request}
+                      cwd={current.cwd}
                       onAnswer={answer => decide(item.request.id, answer)}
                     />
                   ))}
