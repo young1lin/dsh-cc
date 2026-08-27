@@ -1021,8 +1021,11 @@ export class CcRuntime {
           const session = this.store.get(id)
           if (!session) return json(res, { error: '会话不存在' }, 404)
           const uuid = parts[3] ?? ''
+          // The live half's recall goes through the CLI's own dequeue control,
+          // so it is the CLI that decides whether the message can still be
+          // taken back; the retained half never reached a CLI at all.
           const removed = this.removeRetainedQueued(session.id, uuid)
-            ?? this.liveEngine(session.id)?.removeQueued(uuid)
+            ?? await this.liveEngine(session.id)?.removeQueued(uuid)
           if (removed === undefined) return json(res, { error: '该消息已投递或不存在' }, 404)
           // The engine patch (when the live half served the recall) plus this
           // combined count agree in every single-half case; the belt-and-braces
@@ -1252,8 +1255,10 @@ export class CcRuntime {
       && session.messageCount === 0 && session.claudeSessionId === undefined) {
       await this.patchMeta(key, { name: autoTitle, titleSource: 'auto' })
     }
-    await this.emitEvent(key, { kind: 'user', text, ...(images.length > 0 ? { images } : {}) })
-    await engine.send(text, attachments)
+    // The transcript row is NOT written here: a message the CLI parks in its
+    // command queue must not read as already sent. The engine publishes it at
+    // the moment the CLI actually takes the message into a turn.
+    await engine.send(text, attachments, { imageRefs: images })
     // An engine that died during the send already wrote its terminal status
     // through finish(); flipping to busy now would strand the session busy
     // with nothing running. A death that lands after this line is corrected
@@ -1430,7 +1435,10 @@ export class CcRuntime {
         data: { from, to: fallback, reason: error.message },
       })
       this.ctx.logger?.warn?.(`dsh-cc: session ${sessionId} fell back to ${fallback}: ${error.message}`)
-      await engine.send(replay.text, replay.images)
+      // No transcript echo: this message already got its row when the dead
+      // engine took it into the turn that then failed. Only the carry-over
+      // below holds messages that never reached a CLI, and those still echo.
+      await engine.send(replay.text, replay.images, { echo: false })
       // The dead engine's undelivered queue rides behind the replayed turn,
       // original order intact; the replayed message itself is not in it.
       this.restoreRetainedQueue(sessionId, engine)

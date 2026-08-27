@@ -40,7 +40,7 @@ node 半区各模块（读懂 catalog 这一层是理解全局的关键）：
 | 模块 | 职责 |
 |---|---|
 | `runtime.ts` | `/cc/api` HTTP 面：REST 变更 + SSE 推送；重扫 catalog（有页面接入 2s / 无人接入 30s），有变化才广播 `sessions` 帧 |
-| `engine.ts` | 每会话一个 SDK query：流式多轮、`canUseTool` 权限桥；回合中发送的消息**宿主侧排队**（CLI 会丢弃流中途插入的用户消息），在该回合 result 的模型调用边界投递，`queued` 计数随 sessions 帧下发；每个成功完成的主线模型响应后探测一次遥测（context/usage）并经 SSE `telemetry` 帧推送 —— 按响应计频，探测在途时丢弃新触发而不排队；关掉的引擎下次发消息按原生 id resume；`maxLiveSessions` LRU 挤出 |
+| `engine.ts` | 每会话一个 SDK query：流式多轮、`canUseTool` 权限桥；消息一律**立即推流**，排队由 CLI 自己做（见下方「排队的不变量」），`queued` 计数随 sessions 帧下发；每个成功完成的主线模型响应后探测一次遥测（context/usage）并经 SSE `telemetry` 帧推送 —— 按响应计频，探测在途时丢弃新触发而不排队；关掉的引擎下次发消息按原生 id resume；`maxLiveSessions` LRU 挤出 |
 | `catalog.ts` | **统一会话目录**：CLI 自己的磁盘存储 + dsh-cc sidecar 合并成一张列表 |
 | `native-sessions.ts` / `native-transcript.ts` | 适配 CLI 原生存储（`~/.claude/projects/<encoded-cwd>/<id>.jsonl`）到 `SessionMeta` |
 | `peer-sessions.ts` | 只读观察 `~/.claude/sessions/<pid>.json` 活进程注册表，得出 `terminalOwned` |
@@ -55,6 +55,12 @@ node 半区各模块（读懂 catalog 这一层是理解全局的关键）：
 **核心不变量**：CLI 的存储是会话身份 / 标题 / 转录的唯一权威；sidecar 只存 CLI 表达不了的字段（模型覆盖、env 层、live 状态、计量成本、草稿转录、标题来源标记）。两边按原生 id（sidecar 的 `claudeSessionId`）对齐；native 记录上的字段不得泄漏进合并后的 sidecar 行。标题规则对齐 CLI：页面建的草稿在首次发消息时以消息首行自动命名（`titleSource: 'auto'`），手动命名（`titleSource: 'user'`）永不被自动覆盖；收养的 CLI 会话本来就带着 CLI 自己的派生标题，不参与自动命名。
 
 **账号根目录的不变量**：任一时刻只有一个 `CLAUDE_CONFIG_DIR` 生效，由 `accounts.ts` 独家拥有 —— SDK 的 `listSessions` 之流和 `peer-sessions` 都只认 `process.env.CLAUDE_CONFIG_DIR`（无 per-call 选项），所以切账号 = 改写 dsh 进程自己的这个变量。因此 `CLAUDE_CONFIG_DIR` 在两个 env 编辑器里都被拒（写进 env 只会搬动被 spawn 的进程、搬不动插件自己的读，正是要防的分叉），cordis 配置里的则在 `resolveConfig` 提升成 `configDir`。切换时必须把一切从旧根目录读来的缓存一起作废：`account`、`modelCatalog`、catalog signature、所有引擎；有 busy 引擎则拒绝切换（409）。sidecar 行创建时盖 `configDir` 章，`catalog.list()` 按此过滤。
+
+**排队的不变量**：**队列归 CLI 所有，宿主只做镜像。** CLI 自己有一条命令队列（能力位 `msg_lifecycle_v1`，2.1.220 载荷实测）：任何时候推进流的用户消息都会回一条 `command_lifecycle` 帧 —— `queued`（在跑的回合后面等）→ `started`（被取进某个回合）→ 终态。所以 `send()` **一律立即推流**，绝不宿主侧扣着；`engine.ts` 的 `outbox` 只是这些 uuid 的正文/时间/附件镜像，供页面列出「谁在等」。三条硬约束：
+
+- **转录行在 `started` 时才发**，不在 send 时发 —— 排队中的消息写进转录就等于谎称已发出（这正是宿主队列时代的 bug）。唯一例外是 outbox 为空的那一条：它不可能在等谁，立即回显，省掉冷会话起进程的 1~2 秒空白。
+- **不要自己复刻投递语义**：CLI 会把堆在一个回合后面的**整批**消息合并成**一个**回合（一条 user 记录、N 个 text block、一个 result；批次代表 uuid 是最后一条）。逐条投递会变成 N 个回合、N 份计费，且模型永远看不到用户的连续意图。
+- **撤回走 `query.cancelAsyncMessage(uuid)`**（该方法在 SDK 运行时里有、`sdk.d.ts` 里被抹掉了，要窄化类型去拿）；`interrupt()` 的回执带 `still_queued`，用它对账，别自己猜。CLI 进程死掉时它的队列跟着没，所以未 `started` 的条目仍由宿主 `takeQueued` / `restoreQueue` 搬进下一个引擎 —— 只搬没开跑的，开跑的那条归 `lastSend` 重放。
 
 浏览器半区：`index.tsx` 的 `apply()` 往 `shell.overlay` 槽注入右缘 dock 入口（`cc-dock` 按钮，点开全屏 overlay）；`App.tsx` 组合 `SessionRail` / `Transcript` / `Composer` / `LiveTurnView` / `StatusBar` / `Interaction`（权限审批卡片与 AskUserQuestion 桥）；`tool/*-card.ts` 渲染各类工具卡片；`settings/` 是 provider / 环境配置 UI（`SettingsModal` / `SessionEnvModal` 等）；`status/` 是用量与上下文读数。
 

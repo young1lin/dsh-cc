@@ -20,7 +20,7 @@ dsh-cc 是一个 DSH 外挂双面插件：在 DSH Web GUI 右缘加入一个 **C
 - **用量与上下文读数**：状态栏显示模型 / 档位选择、上下文窗口占用与账户用量；每次模型响应完成后经 SSE 自动刷新一次（CLI statusline 的节奏 —— 按响应计，不按流式增量计）
 - **Esc 中断回合**：回合进行中在输入框按 Esc 即中断（与「停止」按钮同路径）；Esc 分层保持「菜单 → 中断 → 离开输入框 → 关闭面板」
 - **每会话草稿与输入历史**：未发送的草稿（含已上传图片）按会话落盘，切换 / 刷新不丢；发送过的消息按「项目 + 账号」记入历史，输入框空态或回溯态下 ↑↓ 翻取、编辑即退出回溯
-- **排队消息可见可取回**：回合进行中发送的消息在转录流内联展示（对齐 CLI 的即时可见），每行带时间与首行预览，点「撤回」在投递前拉回输入框；新消息入队时条目自动展开；引擎异常死亡时未投递队列整体移交下一个进程
+- **排队交给 CLI 自己做**：回合进行中发送的消息立即推给 CLI，由 CLI 的命令队列排；它回的 `command_lifecycle` 帧就是页面「谁在等」的唯一真相。等待中的消息在转录流上方成条列出（时间 + 首行预览 + 「撤回」），撤回走 CLI 原生 dequeue，撤得掉才算撤掉；本轮结束时**整批合并成一个回合**发出（CLI 的 coalescing，模型一次看到用户的连续意图，也只计一次费）。转录行在消息真正被取进回合时才写 —— 排队中的消息不会伪装成已发出。引擎异常死亡时未开跑的队列整体移交下一个进程
 - **压缩进度可见**：`/compact` 或自动压缩进行中，进行中回合区显示「正在压缩对话」脉冲指示（CLI 的 status 帧）；完成即提示，失败以警告条给出原因
 - **CLI 三手势**：Shift+Tab 轮换权限模式、Alt+P 打开模型菜单、Alt+T 切换思考档位（IME / 浮层守卫与 Esc 一致）
 - **会话时间旅行**：任意历史消息 hover「分叉」（原生 fork，新会话立刻进列表并切换）与「回滚文件」（基于 CLI 文件检查点，先预览将恢复的文件数与 ±行数，确认后回滚，symlink 跳过数警示）；压缩后的转录渲染「对话已压缩 · 前 N tokens → 后 M tokens」分隔线（含 /compact 与自动压缩两种触发来源）
@@ -177,7 +177,9 @@ C:/PythonProject/dev/dsh-cc
 | DELETE | /cc/api/sessions/:id | 删除会话（连同 CLI 原生转录）；原生存储删除失败（如 Windows 下文件被终端进程占用）时返回 409 + error，会话保留 |
 | PUT | /cc/api/sessions/:id/name | 重命名（同步改 CLI 记录，`claude --resume` 列表同名；手动命名后永不被自动命名覆盖） |
 | PUT | /cc/api/sessions/:id/env | 会话级环境层；空闲引擎即时回收，下一条消息用新环境起进程 |
-| POST | /cc/api/sessions/:id/messages | 发送消息（可带图片引用）；回合运行中发送的入队等待，在下一回合边界进入真实对话（`queued` 计数随 sessions 帧下发）；终端持有（terminalOwned）的会话返回 409 |
+| POST | /cc/api/sessions/:id/messages | 发送消息（可带图片引用）；一律立即推给 CLI，回合运行中由 CLI 的命令队列排队、本轮结束时整批合并成一个回合发出（`queued` 计数随 sessions 帧下发）；终端持有（terminalOwned）的会话返回 409 |
+| GET | /cc/api/sessions/:id/queue | CLI 报告为「在等」的消息（uuid + 正文 + 入队时间 + 附件数），投递顺序 |
+| DELETE | /cc/api/sessions/:id/queue/:uuid | 撤回一条排队消息（走 CLI 原生 dequeue）；已被取进回合则返回 404 |
 | GET | /cc/api/sessions/:id/context | 当前回合上下文占用（需活跃引擎） |
 | GET | /cc/api/sessions/:id/models | 会话视角的模型目录、当前选择与 effort 档位 |
 | POST | /cc/api/sessions/:id/model | 切换模型；持久化为该会话默认，忙碌引擎就地热切换 |

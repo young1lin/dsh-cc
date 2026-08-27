@@ -81,26 +81,73 @@ export interface SendImage {
 }
 
 /**
- * One message held host-side because a turn was already running. Built in
- * full — mention expansion included — at submit time and carried verbatim:
- * what was queued is exactly what delivers, across recalls and even across
- * the death of the process it was queued for (the host re-enters undelivered
- * entries into the rebuilt engine; nothing is ever re-built).
+ * One submitted message, tracked from the moment it is pushed until the CLI
+ * reports it finished. Built in full — mention expansion included — at submit
+ * time and carried verbatim, so what was submitted is exactly what runs.
+ *
+ * The CLI owns the queue (see {@link SessionEngine.onLifecycle}); this record
+ * exists because the CLI's `command_lifecycle` frames name a message only by
+ * uuid. The body, the attachments, and the submit time live here so the page
+ * can list what is waiting.
  */
 export interface QueuedMessage {
-  /** Per-message identity, minted at submit; the recall handle. */
+  /** Per-message identity, minted at submit; the CLI's `command_uuid`. */
   uuid: string
   /** The submitted text, verbatim. */
   text: string
   /** The submitted attachments, already base64-encoded for the SDK. */
   images: SendImage[]
-  /** When the message joined the queue (ISO timestamp). */
+  /** The same attachments as transcript references, for the delivery echo. */
+  imageRefs: ImageRef[]
+  /** When the message was submitted (ISO timestamp). */
   queuedAt: string
-  /** The fully-built SDK message this entry delivers. */
+  /** The fully-built SDK message that was pushed. */
   message: SDKUserMessage
   /** Whether the message starts with `/`; seeds the turn shape at delivery. */
   wasCommand: boolean
+  /** Whether delivery publishes a `user` transcript row (shell mode suppresses it). */
+  echo: boolean
+  /**
+   * Where the message stands, as the CLI reports it: `pending` until the first
+   * lifecycle frame arrives, then `queued` while it waits behind a running
+   * turn, then `started` once the CLI has taken it into a turn. Only `queued`
+   * entries are shown to the page as waiting — a `pending` entry is one the
+   * CLI has not answered for yet, and flashing it as queued would lie about
+   * the common case, where the CLI takes the message immediately.
+   */
+  state: 'pending' | 'queued' | 'started'
 }
+
+/**
+ * One `command_lifecycle` frame: the CLI's own account of where a submitted
+ * message stands in its command queue. Advertised by the `msg_lifecycle_v1`
+ * capability on system/init and NOT declared on the SDK's `SDKMessage` union
+ * (verified against 0.3.220), so it is read defensively off the raw envelope.
+ */
+interface CommandLifecycle {
+  /** The uuid the message was submitted with. */
+  commandUuid: string
+  /** `queued` | `started` | a terminal state (`completed`, `cancelled`, …). */
+  state: string
+}
+
+/**
+ * Read one raw SDK envelope as a lifecycle frame.
+ * @param message - the envelope straight off the query iterator.
+ * @returns the frame, or undefined when the envelope is something else.
+ */
+function readCommandLifecycle(message: unknown): CommandLifecycle | undefined {
+  if (typeof message !== 'object' || message === null) return undefined
+  const record = message as Record<string, unknown>
+  if (record.type !== 'command_lifecycle') return undefined
+  const commandUuid = record.command_uuid
+  const state = record.state
+  if (typeof commandUuid !== 'string' || typeof state !== 'string') return undefined
+  return { commandUuid, state }
+}
+
+/** The system/init capability that promises `command_lifecycle` frames. */
+const LIFECYCLE_CAPABILITY = 'msg_lifecycle_v1'
 
 /**
  * One telemetry push: the control channel's context-accounting and usage
@@ -238,17 +285,28 @@ export class SessionEngine {
    */
   private turnWasCommand = false
   /**
-   * Messages sent while a turn was already running, held host-side. The CLI
-   * DROPS a user message pushed onto the stream mid-turn (verified against
-   * the 0.3.220 payload: no queue-operation, no echo, the message vanishes),
-   * so the queue lives here and drains into the input stream only at the
-   * model-call boundary — the moment a turn's result leaves the CLI idle.
-   * An entry leaves this queue ONLY by being delivered; when the process
-   * dies first, the host carries the undelivered entries into the rebuilt
-   * engine instead (see takeQueued / restoreQueue) — they never reached
-   * the CLI, so re-entering them loses nothing.
+   * Every submitted message the CLI has not finished with yet, in submit
+   * order. Messages are pushed onto the input stream the moment they are
+   * submitted, turn in flight or not: the CLI keeps its OWN command queue
+   * (verified live against the 2.1.220 payload — a message pushed mid-turn
+   * comes straight back as `command_lifecycle {state:'queued'}` and starts at
+   * the next boundary), and duplicating it host-side is what made the page
+   * disagree with the CLI. This map is the display mirror of that queue: the
+   * lifecycle frames say WHICH uuids wait, and these records say what they
+   * contain.
+   *
+   * The one thing the CLI's queue cannot survive is the death of its own
+   * process, so entries that never started are still handed to the rebuilt
+   * engine by the host (see takeQueued / restoreQueue).
    */
-  private readonly pendingQueue: QueuedMessage[] = []
+  private readonly outbox = new Map<string, QueuedMessage>()
+  /**
+   * Whether the running CLI advertises `msg_lifecycle_v1`; undefined until
+   * system/init answers. A CLI without it never reports queue state, so
+   * submissions are treated as delivered on push — the pre-queue behaviour,
+   * which is the honest fallback when the process cannot be asked.
+   */
+  private lifecycleSupported: boolean | undefined
   /** The session's live task table in start order; display state only. */
   private readonly taskTable = new Map<string, TaskRow>()  /** Trailing CLI stderr, capped at STDERR_TAIL_LIMIT characters. */
   private stderrTail = ''
@@ -392,13 +450,23 @@ export class SessionEngine {
   /**
    * Submit one user text message, starting the CLI query on first use.
    *
-   * A send while a turn is still running is HELD, not pushed: the CLI drops a
-   * user message that arrives mid-turn, so it joins {@link pendingQueue} and
-   * enters the real conversation only at the next model-call boundary (the
-   * running turn's result).
+   * The message is pushed onto the input stream immediately, running turn or
+   * not: the CLI queues it itself and reports the queueing back through
+   * `command_lifecycle`. Nothing is held here — the page's "waiting" list is
+   * read from those frames, so it can never disagree with what the CLI will
+   * actually run, and a batch that piles up behind one turn is coalesced into
+   * a single turn by the CLI exactly as it is in the terminal.
    * @param text - the message body.
+   * @param images - attachments, already base64-encoded for the SDK.
+   * @param options - `imageRefs` are the same attachments in transcript-
+   *   reference form, published with the delivery echo; `echo` false suppresses
+   *   that transcript row (shell mode writes its own).
    */
-  async send(text: string, images: SendImage[] = []): Promise<void> {
+  async send(
+    text: string,
+    images: SendImage[] = [],
+    options: { imageRefs?: ImageRef[]; echo?: boolean } = {},
+  ): Promise<void> {
     if (this.closed) throw new Error('dsh-cc: engine is closed')
     this.lastUsed = Date.now()
     this.ensureStarted()
@@ -422,6 +490,7 @@ export class SessionEngine {
       uuid,
       text,
       images,
+      imageRefs: options.imageRefs ?? [],
       queuedAt: new Date().toISOString(),
       message: {
         type: 'user',
@@ -434,87 +503,189 @@ export class SessionEngine {
       // against the payload: init → synthetic assistant → result, no echo), so
       // its command-ness seeds at delivery and only a later echo refines it.
       wasCommand: text.trimStart().startsWith('/'),
+      echo: options.echo !== false,
+      state: 'pending',
     }
-    if (this.busy) {
-      this.pendingQueue.push(entry)
-      this.patch({ queued: this.pendingQueue.length })
-      return
-    }
-    this.deliver(entry)
+    this.submit(entry)
   }
 
   /**
-   * Hand one built message to the CLI at a moment it can actually accept it:
-   * no turn in flight. Seeding the turn-shape flags here — not in send() — is
-   * what keeps a queued `/cmd` from reclassifying the envelope still running.
-   * This is also where a submission becomes the replay anchor: only a
-   * delivered message belongs in {@link lastSend}.
-   * @param entry - the queued-built message with its command-ness seed.
+   * Push one built message at the CLI and start tracking it. The CLI decides
+   * whether it runs now or waits; either way the answer comes back as a
+   * lifecycle frame.
+   * @param entry - the built submission.
    */
-  private deliver(entry: QueuedMessage): void {
-    this.lastSend = { text: entry.text, images: entry.images }
-    this.streamedThisTurn = false
-    this.turnWasCommand = entry.wasCommand
+  private submit(entry: QueuedMessage): void {
+    // Read BEFORE the insert: whether anything of ours is still outstanding is
+    // what decides if this message can possibly be waiting on something.
+    const outstanding = this.outbox.size
+    this.outbox.set(entry.uuid, entry)
+    // Optimistic: a submission always means work is outstanding, and the page's
+    // stop control must arm on the click, not on the CLI's acknowledgement.
     this.busy = true
     this.input.push(entry.message)
+    // With nothing of ours outstanding this message IS the turn — it cannot be
+    // queued behind anything — so its transcript row goes out now rather than
+    // after a round trip that, on a cold session, is a process spawn away. A
+    // CLI that reports no lifecycle at all can never tell us when a message
+    // delivers, so there too it counts as delivered on push.
+    if (outstanding === 0 || this.lifecycleSupported === false) this.startEntry(entry)
   }
 
   /**
-   * A read-only snapshot of the undelivered queue, oldest first. The copy is
-   * shallow; entries are immutable outside the delivery path.
-   * @returns the queued entries in delivery order.
+   * Take one submission into a turn: the CLI has started it (or the running
+   * CLI cannot report starts at all). Seeding the turn-shape flags HERE — not
+   * at submit — is what keeps a waiting `/cmd` from reclassifying the envelope
+   * still in flight, and this is where the message becomes both the transcript
+   * row the page renders and the replay anchor a model fallback re-sends.
+   * @param entry - the submission the CLI has taken.
+   */
+  private startEntry(entry: QueuedMessage): void {
+    if (entry.state === 'started') return
+    entry.state = 'started'
+    this.lastSend = { text: entry.text, images: entry.images }
+    this.streamedThisTurn = false
+    // A coalesced batch starts every member at once, so command-ness is the
+    // union over the batch rather than the last member's own flag.
+    this.turnWasCommand = this.turnWasCommand || entry.wasCommand
+    this.busy = true
+    // The CLI never echoes a submitted user message back over the stream (it
+    // echoes only tool results), so this is the transcript row's one source.
+    if (entry.echo) {
+      this.publish({
+        kind: 'user',
+        text: entry.text,
+        ...(entry.imageRefs.length > 0 ? { images: entry.imageRefs } : {}),
+      })
+    }
+    this.patch({ queued: this.queuedCount() })
+  }
+
+  /**
+   * How many submissions the CLI has confirmed are waiting behind the running
+   * turn. A `pending` submission is deliberately not counted; see
+   * {@link QueuedMessage.state}.
+   * @returns the waiting count.
+   */
+  private queuedCount(): number {
+    let count = 0
+    for (const entry of this.outbox.values()) if (entry.state === 'queued') count += 1
+    return count
+  }
+
+  /**
+   * The submissions the CLI reports as waiting, oldest first — what the page
+   * lists under the composer.
+   * @returns the waiting entries in submit order.
    */
   queuedItems(): readonly QueuedMessage[] {
-    return [...this.pendingQueue]
+    return [...this.outbox.values()].filter(entry => entry.state === 'queued')
   }
 
   /**
-   * Recall one queued message: remove it before the CLI ever sees it. An
-   * entry already delivered left the queue at its model-call boundary, so it
-   * simply does not match — the caller's 404 semantics.
+   * Recall one waiting message through the CLI's own dequeue control, so the
+   * page and the CLI can never disagree about whether it will still run. The
+   * CLI refuses (answers `cancelled: false`) once the message has been taken
+   * into a turn — the caller's 404 semantics.
    * @param uuid - the entry's id from the queue snapshot.
-   * @returns the removed entry, or undefined when no queued entry matches.
+   * @returns the removed entry, or undefined when the CLI would not drop it.
    */
-  removeQueued(uuid: string): QueuedMessage | undefined {
-    const index = this.pendingQueue.findIndex(entry => entry.uuid === uuid)
-    if (index < 0) return undefined
-    const [removed] = this.pendingQueue.splice(index, 1)
-    this.patch({ queued: this.pendingQueue.length })
-    return removed
+  async removeQueued(uuid: string): Promise<QueuedMessage | undefined> {
+    const entry = this.outbox.get(uuid)
+    if (entry === undefined || entry.state !== 'queued') return undefined
+    // `cancelAsyncMessage` ships in the SDK runtime but is stripped from its
+    // published types (checked against 0.3.220), so it is reached through a
+    // narrowed view rather than assumed present.
+    const control = this.query as (Query & { cancelAsyncMessage?(id: string): Promise<boolean> }) | undefined
+    if (control?.cancelAsyncMessage === undefined) return undefined
+    this.lastUsed = Date.now()
+    let cancelled = false
+    try {
+      cancelled = await control.cancelAsyncMessage(uuid)
+    } catch {
+      return undefined
+    }
+    if (!cancelled) return undefined
+    this.outbox.delete(uuid)
+    this.patch({ queued: this.queuedCount() })
+    return entry
   }
 
   /**
-   * Take the whole undelivered queue out — the death hand-off. The host
-   * holds the entries and re-enters them into the next engine for this
-   * session; taking rather than copying is what makes the hand-off
-   * idempotent when more than one end-of-life path passes through here.
-   * @returns the entries in delivery order; the engine keeps none.
+   * Take out every submission the CLI never started — the death hand-off. The
+   * CLI's queue dies with its process, so the host holds these and re-submits
+   * them to the next engine; a started entry is NOT taken, because that one is
+   * the failed turn the host replays through {@link lastSend}.
+   * @returns the entries in submit order; the engine keeps none of them.
    */
   takeQueued(): QueuedMessage[] {
-    const entries = [...this.pendingQueue]
-    this.pendingQueue.length = 0
+    const entries: QueuedMessage[] = []
+    for (const [uuid, entry] of [...this.outbox]) {
+      if (entry.state === 'started') continue
+      entries.push(entry)
+      this.outbox.delete(uuid)
+    }
     return entries
   }
 
   /**
-   * Re-enter undelivered entries from a previous engine, original order
-   * first. The entries are the submissions as built — nothing is re-expanded
-   * — so what was queued is exactly what delivers. An idle engine starts
-   * draining immediately through the normal boundary path; a busy one holds
-   * the entries ahead of anything queued after the hand-off.
+   * Re-submit entries a previous engine died holding, original order first.
+   * The entries are the submissions as built — nothing is re-expanded — so
+   * what was submitted is exactly what runs; the new CLI queues them itself.
    * @param entries - the retained entries, oldest first.
    */
   restoreQueue(entries: readonly QueuedMessage[]): void {
     if (entries.length === 0) return
     this.lastUsed = Date.now()
-    // Delivering below pushes into the input stream, which needs its query.
+    // Submitting below pushes into the input stream, which needs its query.
     this.ensureStarted()
-    this.pendingQueue.unshift(...entries)
-    if (!this.busy) {
-      const first = this.pendingQueue.shift()
-      if (first !== undefined) this.deliver(first)
+    for (const entry of entries) this.submit({ ...entry, state: 'pending' })
+    this.patch({ queued: this.queuedCount() })
+  }
+
+  /**
+   * Fold one `command_lifecycle` frame into the outbox. The CLI is the
+   * authority here: it says which uuids wait, which have been taken into a
+   * turn, and which are finished. A frame for a uuid this engine never
+   * submitted (the CLI enqueues its own — cron triggers, auto-resume
+   * continuations) is ignored rather than treated as an error.
+   * @param frame - the validated lifecycle frame.
+   */
+  private onLifecycle(frame: CommandLifecycle): void {
+    const entry = this.outbox.get(frame.commandUuid)
+    if (entry === undefined) return
+    if (frame.state === 'queued') {
+      if (entry.state === 'pending') {
+        entry.state = 'queued'
+        this.patch({ queued: this.queuedCount() })
+      }
+      return
     }
-    this.patch({ queued: this.pendingQueue.length })
+    if (frame.state === 'started') {
+      this.startEntry(entry)
+      return
+    }
+    // Everything else is terminal (completed, cancelled, …): the message is
+    // done with, whichever way it ended.
+    this.outbox.delete(frame.commandUuid)
+    this.patch({ queued: this.queuedCount() })
+  }
+
+  /**
+   * Drop waiting submissions the CLI's interrupt receipt did not list. The
+   * receipt is a synchronous snapshot of the survivors, so anything absent
+   * from it will never run and must leave the page's list with it.
+   * @param surviving - the `still_queued` uuids from the receipt.
+   */
+  private reconcileQueue(surviving: readonly string[]): void {
+    const keep = new Set(surviving)
+    let changed = false
+    for (const [uuid, entry] of [...this.outbox]) {
+      if (entry.state !== 'queued' || keep.has(uuid)) continue
+      this.outbox.delete(uuid)
+      changed = true
+    }
+    if (changed) this.patch({ queued: this.queuedCount() })
   }
 
   /**
@@ -548,8 +719,10 @@ export class SessionEngine {
     ].filter(part => part !== '').join('\n')
     this.publish({ kind: 'commandOutput', text: report })
     // The wrapped transcript message: the model reads the command and its
-    // output exactly as the CLI's own shell mode presents them.
-    await this.send('下面是我在终端直接执行的命令及其输出：\n\n' + report, [])
+    // output exactly as the CLI's own shell mode presents them. It publishes no
+    // transcript row of its own — the commandOutput rows above already show the
+    // user everything this message carries.
+    await this.send('下面是我在终端直接执行的命令及其输出：\n\n' + report, [], { echo: false })
     return result.exitCode
   }
 
@@ -799,11 +972,19 @@ export class SessionEngine {
     }
   }
 
-  /** Request cancellation of the current turn; the query and process stay alive. */
+  /**
+   * Request cancellation of the current turn; the query and process stay
+   * alive. On a CLI advertising `interrupt_receipt_v1` the answer names the
+   * submissions that survive the interrupt (they run at the next boundary, as
+   * they do in the terminal), so the page's waiting list is reconciled against
+   * it rather than left to drift.
+   */
   async interrupt(): Promise<void> {
     this.lastUsed = Date.now()
     try {
-      await this.query?.interrupt()
+      const receipt = await this.query?.interrupt()
+      const surviving = receipt?.still_queued
+      if (Array.isArray(surviving)) this.reconcileQueue(surviving)
     } catch (error) {
       await this.hooks.emit({
         kind: 'error',
@@ -1038,6 +1219,14 @@ export class SessionEngine {
   }
 
   private onMessage(message: SDKMessage): void {
+    // Read before the switch: `command_lifecycle` is a real CLI envelope that
+    // the SDK's SDKMessage union does not declare, so it would otherwise fall
+    // through to the default branch and the queue would go unreported.
+    const lifecycle = readCommandLifecycle(message)
+    if (lifecycle !== undefined) {
+      this.onLifecycle(lifecycle)
+      return
+    }
     switch (message.type) {
       case 'stream_event': {
         this.onStreamEvent(message)
@@ -1072,6 +1261,15 @@ export class SessionEngine {
         if (message.subtype === 'init') {
           this.claudeSessionId = message.session_id
           this.liveModel = message.model
+          // Feature-detect the queue channel rather than version-sniff. A CLI
+          // without it never reports a start, so anything already submitted
+          // (the first message always races init) counts as delivered now.
+          const capabilities = (message as { capabilities?: unknown }).capabilities
+          this.lifecycleSupported = Array.isArray(capabilities)
+            && capabilities.includes(LIFECYCLE_CAPABILITY)
+          if (!this.lifecycleSupported) {
+            for (const entry of this.outbox.values()) this.startEntry(entry)
+          }
           this.patch({ claudeSessionId: message.session_id })
           this.publish({
             kind: 'system',
@@ -1178,17 +1376,19 @@ export class SessionEngine {
         return
       }
       case 'result': {
-        // A result is the one model-call boundary: the CLI is idle for exactly
-        // this instant, so a held message enters the real conversation NOW.
-        // Flipping fully idle while the queue is non-empty would strand the
-        // queued turn — the page would lose its stop control and the runtime's
-        // busy guards (settings save, account switch, env recycle) would
-        // close the live engine mid-turn.
-        const next = this.pendingQueue.shift()
+        // This result closes the turn every started submission belonged to;
+        // their terminal lifecycle frames follow immediately, but the busy flag
+        // has to settle here, on the boundary itself. Anything still waiting
+        // keeps the session busy — flipping fully idle with a queued turn about
+        // to start would strand it: the page would lose its stop control and
+        // the runtime's busy guards (settings save, account switch, env
+        // recycle) would close the live engine mid-turn.
+        for (const [uuid, entry] of [...this.outbox]) {
+          if (entry.state === 'started') this.outbox.delete(uuid)
+        }
         this.streamedThisTurn = false
         this.turnWasCommand = false
-        if (next !== undefined) this.deliver(next)
-        else this.busy = false
+        this.busy = this.outbox.size > 0
         const isError = message.subtype !== 'success' || message.is_error === true
         this.publish({
           kind: 'result',
@@ -1205,7 +1405,7 @@ export class SessionEngine {
         })
         this.patch({
           status: this.busy ? 'busy' : 'idle',
-          queued: this.pendingQueue.length,
+          queued: this.queuedCount(),
           ...(this.liveModel !== undefined ? { lastGoodModel: this.liveModel } : {}),
           ...(message.total_cost_usd !== undefined ? { totalCostUsd: message.total_cost_usd } : {}),
         })
@@ -1409,10 +1609,10 @@ export class SessionEngine {
     this.busy = false
     this.queryEnded = true
     this.streamedThisTurn = false
-    // The held queue OUTLIVES the process: nothing in it ever reached the
-    // CLI, so it stays put for the host to carry into the rebuilt engine
-    // (takeQueued / restoreQueue) instead of dying here. Only a delivered
-    // message ever leaves the queue, and delivered ones never return.
+    // The submissions the CLI never started OUTLIVE the process: its own queue
+    // dies with it, so they stay in the outbox for the host to carry into the
+    // rebuilt engine (takeQueued / restoreQueue) instead of dying here. A
+    // started one is not carried — that turn is the host's lastSend replay.
     // Tasks are bound to the CLI process; the transcript cards survive it.
     this.taskTable.clear()
     this.publishTasks()
@@ -1420,11 +1620,11 @@ export class SessionEngine {
     try {
       if (error !== undefined) {
         await this.hooks.emit({ kind: 'error', message: this.describeFailure(error) })
-        await this.hooks.updateMeta({ status: 'error', lastError: error.message, queued: this.pendingQueue.length })
+        await this.hooks.updateMeta({ status: 'error', lastError: error.message, queued: this.queuedCount() })
         await this.hooks.onEngineFailure?.(error)
         return
       }
-      await this.hooks.updateMeta({ status: 'idle', queued: this.pendingQueue.length })
+      await this.hooks.updateMeta({ status: 'idle', queued: this.queuedCount() })
     } finally {
       this.onEnd?.()
     }
