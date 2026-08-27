@@ -1,0 +1,19 @@
+# 全仓库统一 LF —— 索引里是 LF，检出到工作区还是 LF，Windows 上也不转换。
+#
+# 为什么放在 .gitattributes 而不是只靠 core.autocrlf：属性文件跟着仓库走，
+# 换台机器、换个克隆者都照样生效；core.* 是每个人本地的，管不住别人。
+# 本仓库曾因为 src/runtime.ts 以 CRLF 入库，一次整文件重写把它翻成 LF，
+# 制造了 3900 行虚假 diff —— 统一之后这类噪声在源头就没有了。
+* text=auto eol=lf
+
+# 明确标出可能被误判成文本、从而被换行归一化改坏的二进制。
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.pdf   binary

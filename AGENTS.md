@@ -85,3 +85,5 @@ node 半区各模块（读懂 catalog 这一层是理解全局的关键）：
 ## 代码风格
 
 2 空格缩进、单引号、无默认导出；每个导出函数写 JSDoc（含 `@param` / `@returns`）；每个文件开头是解释模块职责的 `@module` 注释。面向用户的文案（日志、UI）用中文。改代码时以周边文件为准。
+
+**换行一律 LF**，由 `.gitattributes` 的 `* text=auto eol=lf` 强制（跟着仓库走，换机器换克隆者都生效），`.editorconfig` 在编辑器侧配套。仓库里曾有一个文件以 CRLF 入库，一次整文件重写把它翻成 LF，制造了 3900 行虚假 diff —— 现已全量归一，别再用会改写整文件换行的手段（Windows 上的 python 整文件读写、`Out-File` 默认编码）去改代码。怀疑时用 `git diff --stat --ignore-cr-at-eol` 看真实改动量。

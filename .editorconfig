@@ -1,0 +1,14 @@
+# 编辑器侧的同一条规则，和 .gitattributes 配套：文件在写盘那一刻就是 LF，
+# 不是等到 git 检出时才被纠正。缩进/引号风格见 AGENTS.md「代码风格」。
+root = true
+
+[*]
+end_of_line = lf
+charset = utf-8
+indent_style = space
+indent_size = 2
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.md]
+trim_trailing_whitespace = false
