@@ -32,6 +32,7 @@ import type {
   CcEventInput,
   ImageRef,
   PermissionAnswer,
+  PendingDialogRequest,
   PermissionModeValue,
   PermissionRequest,
   SessionMeta,
@@ -185,6 +186,35 @@ export class SessionEngine {
   private readonly permissionInputs = new Map<string, Record<string, unknown>>()
   private readonly permissionSuggestions = new Map<string, PermissionUpdate[]>()
   private readonly dialogs = new Map<string, (result: UserDialogResult) => void>()
+
+  /**
+   * Dialog requests above, kept in wire shape so a page that joins later can
+   * replay them; entries leave this registry the moment their resolver runs.
+   */
+  private readonly openDialogRequests = new Map<string, PendingDialogRequest>()
+
+  /** Permission requests parked on {@link pending}, in wire shape, same replay contract. */
+  private readonly openPermissions = new Map<string, PermissionRequest>()
+
+  /**
+   * The permission requests currently parked awaiting a page answer, in wire
+   * shape — the material a session-detail snapshot carries so a page that
+   * joins later replays the approval cards.
+   * @returns the requests in creation order.
+   */
+  pendingPermissionRequests(): PermissionRequest[] {
+    return [...this.openPermissions.values()]
+  }
+
+  /**
+   * The question bridges currently open, same contract as
+   * {@link pendingPermissionRequests}.
+   * @returns the requests in creation order.
+   */
+  pendingDialogRequests(): PendingDialogRequest[] {
+    return [...this.openDialogRequests.values()]
+  }
+
   private readonly canUseTool: CanUseTool
   private readonly onUserDialog: OnUserDialog
   /** Block indices of the running turn whose block-start reached the page. */
@@ -220,8 +250,7 @@ export class SessionEngine {
    */
   private readonly pendingQueue: QueuedMessage[] = []
   /** The session's live task table in start order; display state only. */
-  private readonly taskTable = new Map<string, TaskRow>()
-  /** Trailing CLI stderr, capped at STDERR_TAIL_LIMIT characters. */
+  private readonly taskTable = new Map<string, TaskRow>()  /** Trailing CLI stderr, capped at STDERR_TAIL_LIMIT characters. */
   private stderrTail = ''
   private started = false
   private closed = false
@@ -310,9 +339,13 @@ export class SessionEngine {
     this.onUserDialog = async (request, { signal }) => {
       const requestId = randomUUID()
       const decided = new Promise<UserDialogResult>(resolve => {
-        this.dialogs.set(requestId, resolve)
+        this.trackDialog(requestId, request.dialogKind, request.payload, resolve)
         signal.addEventListener('abort', () => {
-          if (this.dialogs.delete(requestId)) resolve({ behavior: 'cancelled' })
+          const settled = this.dialogs.get(requestId)
+          if (settled !== undefined) {
+            this.dialogs.delete(requestId)
+            settled({ behavior: 'cancelled' })
+          }
         }, { once: true })
       })
       this.hooks.dialogRequest({ id: requestId, kind: request.dialogKind, payload: request.payload })
@@ -327,13 +360,7 @@ export class SessionEngine {
       const requestId = randomUUID()
       this.permissionInputs.set(requestId, input)
       if (options.suggestions !== undefined) this.permissionSuggestions.set(requestId, options.suggestions)
-      const decided = new Promise<PermissionResult>(resolve => {
-        this.pending.set(requestId, resolve)
-        options.signal.addEventListener('abort', () => {
-          if (this.pending.delete(requestId)) resolve({ behavior: 'deny', message: '请求已取消' })
-        }, { once: true })
-      })
-      this.hooks.permissionRequest({
+      const request: PermissionRequest = {
         id: requestId,
         toolName,
         input,
@@ -343,12 +370,21 @@ export class SessionEngine {
         ...(options.suggestions !== undefined ? { suggestions: options.suggestions } : {}),
         ...(options.blockedPath !== undefined ? { blockedPath: options.blockedPath } : {}),
         ...(options.decisionReason !== undefined ? { decisionReason: options.decisionReason } : {}),
+      }
+      const decided = new Promise<PermissionResult>(resolve => {
+        this.pending.set(requestId, resolve)
+        options.signal.addEventListener('abort', () => {
+          if (this.pending.delete(requestId)) resolve({ behavior: 'deny', message: '请求已取消' })
+        }, { once: true })
       })
+      this.openPermissions.set(requestId, request)
+      this.hooks.permissionRequest(request)
       try {
         return await decided
       } finally {
         this.permissionInputs.delete(requestId)
         this.permissionSuggestions.delete(requestId)
+        this.openPermissions.delete(requestId)
       }
     }
   }
@@ -542,7 +578,7 @@ export class SessionEngine {
   private async bridgeQuestion(input: Record<string, unknown>, signal: AbortSignal): Promise<PermissionResult> {
     const requestId = randomUUID()
     const decided = new Promise<PermissionResult>(resolve => {
-      this.dialogs.set(requestId, result => {
+      this.trackDialog(requestId, 'ask_user_question', input, result => {
         if (result.behavior === 'cancelled') {
           resolve({ behavior: 'deny', message: '用户没有回答（取消了问题）' })
           return
@@ -550,8 +586,10 @@ export class SessionEngine {
         resolve({ behavior: 'deny', message: formatQuestionAnswer(result.result) })
       })
       signal.addEventListener('abort', () => {
-        if (this.dialogs.delete(requestId)) {
-          resolve({ behavior: 'deny', message: '请求已取消' })
+        const settled = this.dialogs.get(requestId)
+        if (settled !== undefined) {
+          this.dialogs.delete(requestId)
+          settled({ behavior: 'cancelled' })
         }
       }, { once: true })
     })
@@ -831,6 +869,23 @@ export class SessionEngine {
   }
 
   /**
+   * Register one dialog request: the resolver lands in {@link dialogs} wrapped
+   * so the wire-shape copy leaves {@link openDialogRequests} exactly when the
+   * promise settles, whichever path (page answer, abort, dispose) ends it.
+   * @param id - the request id.
+   * @param kind - the dialog kind string.
+   * @param payload - the structured payload the page renders.
+   * @param resolve - the underlying promise resolver.
+   */
+  private trackDialog(id: string, kind: string, payload: Record<string, unknown>, resolve: (result: UserDialogResult) => void): void {
+    this.dialogs.set(id, result => {
+      this.openDialogRequests.delete(id)
+      resolve(result)
+    })
+    this.openDialogRequests.set(id, { id, kind, payload })
+  }
+
+  /**
    * Deliver the page's dialog answer.
    * @param requestId - the pending dialog id.
    * @param answers - the completed result payload; undefined cancels.
@@ -839,6 +894,7 @@ export class SessionEngine {
   answerDialog(requestId: string, answers: unknown): boolean {
     const resolve = this.dialogs.get(requestId)
     if (!resolve) return false
+    this.openDialogRequests.delete(requestId)
     this.dialogs.delete(requestId)
     this.lastUsed = Date.now()
     resolve(answers === undefined ? { behavior: 'cancelled' } : { behavior: 'completed', result: answers })
@@ -853,10 +909,12 @@ export class SessionEngine {
       this.pending.delete(requestId)
       resolve({ behavior: 'deny', message: '会话已关闭' })
     }
+    this.openPermissions.clear()
     for (const [requestId, resolve] of [...this.dialogs]) {
       this.dialogs.delete(requestId)
       resolve({ behavior: 'cancelled' })
     }
+    this.openDialogRequests.clear()
     this.input.close()
     this.abort.abort()
     try {

@@ -4,3 +4,4 @@ lib/
 .claude/
 *.log
 docs-ref/
+replay-probe.txt

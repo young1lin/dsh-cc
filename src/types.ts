@@ -547,6 +547,21 @@ export interface LiveTurnSnapshot {
   seq: number
   /** The folded turn, or null when no turn is in flight. */
   turn: LiveTurn | null
+  /**
+   * Tool-permission requests parked awaiting a page answer when the snapshot
+   * was taken. A page that opens (or catches up) mid-request replays them as
+   * approval cards; the wire omits the field entirely on older node halves.
+   */
+  pendingPermissions?: PermissionRequest[]
+  /** Question bridges still open at snapshot time, same replay contract. */
+  pendingDialogs?: PendingDialogRequest[]
+}
+
+/** A dialog bridge request as snapshots and replays carry it. */
+export interface PendingDialogRequest {
+  id: string
+  kind: string
+  payload: Record<string, unknown>
 }
 
 /** One row of a session's live task table, folded from the CLI's task frames. */

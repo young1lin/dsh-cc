@@ -11,7 +11,7 @@
  * @module dsh-cc/client/Interaction
  */
 
-import { useState, type ReactElement } from 'react'
+import { useEffect, useState, type ReactElement } from 'react'
 import { Button, Input } from '@deepseek-ai/dsh-client-ui-primitives'
 import { registerCss } from './css.ts'
 import { toolSummary } from './Transcript.tsx'
@@ -27,7 +27,7 @@ registerCss('interaction', `
   background: var(--dsw-alias-state-warn-tertiary);
 }
 
-.cc-ask-head { font: var(--dsw-font-s-strong-14); color: var(--dsw-alias-label-primary); }
+.cc-ask-head { display: flex; align-items: baseline; gap: 8px; font: var(--dsw-font-s-strong-14); color: var(--dsw-alias-label-primary); }
 
 .cc-ask-sub {
   margin-top: 2px;
@@ -84,6 +84,15 @@ registerCss('interaction', `
 
 .cc-q-label { font: var(--dsw-font-xs-strong-13); color: var(--dsw-alias-label-primary); }
 .cc-q-desc { font: var(--dsw-font-xxs-12); color: var(--dsw-alias-label-secondary); }
+
+/* How long this answer has been parked; lives in the head's far end. */
+.cc-ask-wait {
+  margin-left: auto;
+  flex: none;
+  font: var(--dsw-font-xxs-12);
+  color: var(--dsw-alias-label-tertiary);
+  font-variant-numeric: tabular-nums;
+}
 `)
 
 /**
@@ -111,7 +120,14 @@ export function PermissionCard(props: {
   onAnswer(answer: PermissionAnswer): void
 }): ReactElement {
   const [note, setNote] = useState('')
+  const [waited, setWaited] = useState(0)
   const { request } = props
+  // The CLI parks the whole turn on this answer, and over a slow gateway the
+  // card can sit much longer than the UI suggests — make the wait visible.
+  useEffect(() => {
+    const timer = setInterval(() => setWaited(value => value + 1), 1000)
+    return () => clearInterval(timer)
+  }, [])
   const target = toolSummary(request.toolName, request.input)
   const canRemember = (request.suggestions?.length ?? 0) > 0
   const destination = rememberDestination(request.toolName)
@@ -127,6 +143,7 @@ export function PermissionCard(props: {
     <div className="cc-ask">
       <div className="cc-ask-head">
         {request.title ?? `Claude 请求使用 ${request.displayName ?? request.toolName}`}
+        <span className="cc-ask-wait" title="回合正停在这个答案上">已等待 {Math.floor(waited / 60)}:{String(waited % 60).padStart(2, '0')}</span>
       </div>
       {request.description !== undefined && <div className="cc-ask-sub">{request.description}</div>}
       {request.blockedPath !== undefined && (

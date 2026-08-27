@@ -312,6 +312,26 @@ export function CcApp(props: { onClose(): void }): ReactElement {
     if (snapshot.seq < (liveSeqsRef.current[sessionId] ?? 0)) return
     liveSeqsRef.current[sessionId] = snapshot.seq
     setLiveBySession(previous => ({ ...previous, [sessionId]: { seq: snapshot.seq, turn: snapshot.turn ?? undefined } }))
+    // Replay requests that were parked while no page was watching: union by id,
+    // so a card the live frames already delivered is never duplicated (and one
+    // the frames missed — reload mid-request — still appears). Removal stays
+    // with the *-done frames; the server auto-denies on turn stop/engine death.
+    const perms = snapshot.pendingPermissions
+    if (perms !== undefined && perms.length > 0) {
+      setPermissions(previous => {
+        const known = new Set(previous.map(item => item.request.id))
+        const seeds = perms.filter(request => !known.has(request.id)).map(request => ({ sessionId, request }))
+        return seeds.length > 0 ? [...previous, ...seeds] : previous
+      })
+    }
+    const dialogsSnapshot = snapshot.pendingDialogs
+    if (dialogsSnapshot !== undefined && dialogsSnapshot.length > 0) {
+      setDialogs(previous => {
+        const known = new Set(previous.map(item => item.id))
+        const seeds = dialogsSnapshot.filter(request => !known.has(request.id)).map(({ id, payload }) => ({ sessionId, id, payload }))
+        return seeds.length > 0 ? [...previous, ...seeds] : previous
+      })
+    }
   }
 
   /**

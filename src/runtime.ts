@@ -1499,7 +1499,15 @@ export class CcRuntime {
    * @returns the snapshot; seq 0 and a null turn when nothing ever streamed.
    */
   private liveSnapshot(sessionId: string): LiveTurnSnapshot {
-    return { seq: this.liveSeqs.get(sessionId) ?? 0, turn: this.liveTurns.get(sessionId) ?? null }
+    const engine = this.liveEngine(sessionId)
+    const pendingPermissions = engine?.pendingPermissionRequests() ?? []
+    const pendingDialogs = engine?.pendingDialogRequests() ?? []
+    return {
+      seq: this.liveSeqs.get(sessionId) ?? 0,
+      turn: this.liveTurns.get(sessionId) ?? null,
+      ...(pendingPermissions.length > 0 ? { pendingPermissions } : {}),
+      ...(pendingDialogs.length > 0 ? { pendingDialogs } : {}),
+    }
   }
 
   /**
