@@ -353,34 +353,24 @@ function resultStats(event: Extract<CcEvent, { kind: 'result' }>): string {
 }
 
 /**
- * Write text to the clipboard. The async Clipboard API is the primary path
- * (the GUI's loopback origin is a secure context); the hidden-textarea
- * `execCommand` dance is the fallback for hosts where it is unavailable.
+ * The turn's assistant prose — every `assistant` event between the user
+ * message that opened the turn and the `result` that closed it, joined the
+ * way the host's own tail copy joins a turn's text blocks. Tool calls and
+ * thinking stay out: this is the reply-as-projection, not the full record.
  *
- * @param text - the text to place on the clipboard.
- * @returns whether the write verifiably landed.
+ * @param events - the whole committed transcript.
+ * @param seq - `seq` of the turn's `result` event.
+ * @returns the joined text; empty when the turn produced no prose.
  */
-export async function copyTextToClipboard(text: string): Promise<boolean> {
-  if (navigator.clipboard !== undefined) {
-    try {
-      await navigator.clipboard.writeText(text)
-      return true
-    } catch {
-      // A rejection here says nothing about the fallback's chances.
-    }
+export function turnAssistantText(events: readonly CcEvent[], seq: number): string {
+  const end = events.findIndex(event => event.seq === seq && event.kind === 'result')
+  if (end < 0) return ''
+  const texts: string[] = []
+  for (let index = end - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event === undefined) break
+    if (event.kind === 'user') break
+    if (event.kind === 'assistant' && event.text !== '') texts.unshift(event.text)
   }
-  const area = document.createElement('textarea')
-  area.value = text
-  area.setAttribute('readonly', '')
-  area.style.position = 'fixed'
-  area.style.opacity = '0'
-  document.body.appendChild(area)
-  try {
-    area.select()
-    return document.execCommand('copy')
-  } catch {
-    return false
-  } finally {
-    area.remove()
-  }
+  return texts.join('\n\n')
 }

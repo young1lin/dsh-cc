@@ -13,8 +13,20 @@
  * @module dsh-cc/client/Transcript
  */
 
-import { memo, useEffect, useMemo, useRef, useState, type ReactElement } from 'react'
-import { DisclosureRow, IconThinkOutline14, MarkdownText, type MarkdownFileMentions } from '@deepseek-ai/dsh-client-ui-primitives'
+import { memo, useEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from 'react'
+import {
+  DisclosureRow,
+  IconBranchOutline16,
+  IconCheckOutline16,
+  IconCopyOutline16,
+  IconRefreshOutline16,
+  IconShareOutline16,
+  IconThinkOutline14,
+  MarkdownText,
+  Tooltip,
+  writeClipboard,
+  type MarkdownFileMentions,
+} from '@deepseek-ai/dsh-client-ui-primitives'
 import { commandToken, matchCommand } from './command-mentions.ts'
 import { registerCss } from './css.ts'
 import { FileViewer } from './FileViewer.tsx'
@@ -22,7 +34,7 @@ import { fileMentionsFor } from './file-mentions.ts'
 import { compact } from './status/format.ts'
 import { ToolRow } from './tool/ToolRow.tsx'
 import { stringField } from './tool/wire.ts'
-import { copyTextToClipboard, formatTurnForCopy } from './turn-copy.ts'
+import { formatTurnForCopy, turnAssistantText } from './turn-copy.ts'
 import type { LiveTurnState } from '../live-turn.ts'
 import { MEDIA_TYPE_EXTENSIONS, type CcEvent, type SlashCommand } from '../types.ts'
 
@@ -141,11 +153,14 @@ registerCss('transcript', `
 
 .cc-user-wrap .cc-user { max-width: 100%; }
 
-/* Time-travel affordances: quiet until the row is hovered, matching the
-   host's per-row hover controls. */
+/* The per-row icon action cluster, ported from the host's
+   MessageIconActions: quiet until the row is hovered, opacity-only so the
+   layout never shifts, and always reachable by keyboard (focus-within). */
 .cc-user-actions {
   display: flex;
+  align-items: center;
   gap: 8px;
+  height: calc(28px + var(--dsh-content-font-delta, 0px));
   padding: 2px 4px 0;
   opacity: 0;
   transition: opacity var(--ds-transition-duration) var(--ds-ease-in-out);
@@ -153,20 +168,69 @@ registerCss('transcript', `
 
 .cc-user-wrap:hover .cc-user-actions, .cc-user-actions:focus-within { opacity: 1; }
 
-.cc-user-action {
-  padding: 1px 8px;
+/* One icon action: the host's .action geometry — 28px round hover surface,
+   15px glyph riding the content font delta. */
+.cc-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(28px + var(--dsh-content-font-delta, 0px));
+  height: calc(28px + var(--dsh-content-font-delta, 0px));
+  padding: 6px;
   border: none;
-  border-radius: 999px;
+  border-radius: 28px;
   background: transparent;
   color: var(--dsw-alias-label-tertiary);
-  font: var(--dsw-font-xxs-12);
   cursor: pointer;
 }
 
-.cc-user-action:hover {
-  background: var(--dsw-alias-bg-layer-1);
-  color: var(--dsw-alias-label-primary);
+.cc-action svg {
+  width: calc(15px + var(--dsh-content-font-delta, 0px));
+  height: calc(15px + var(--dsh-content-font-delta, 0px));
 }
+
+.cc-action:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-secondary);
+}
+
+/* Assistant prose segment + its hover copy row. The row is reserved (no
+   layout shift) but transparent until the segment is hovered — the same
+   reveal contract the user rows use. */
+.cc-assistant-wrap { align-self: stretch; }
+
+.cc-msg-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  height: calc(26px + var(--dsh-content-font-delta, 0px));
+  opacity: 0;
+  transition: opacity var(--ds-transition-duration) var(--ds-ease-in-out);
+}
+
+.cc-assistant-wrap:hover .cc-msg-actions,
+.cc-msg-actions:focus-within,
+.cc-think:hover .cc-msg-actions { opacity: 1; }
+
+/* The thinking disclosure seats its copy icon inside the header band, so the
+   actions row overlays instead of stacking below the collapsible body. */
+.cc-think { position: relative; }
+
+.cc-think .cc-msg-actions {
+  position: absolute;
+  top: 0;
+  right: 0;
+  height: 24px;
+}
+
+/* The turn tail's copy rides inside the stats strip; revealed with the strip
+   on hover so a settled transcript stays visually quiet. */
+.cc-tail { cursor: default; }
+
+.cc-tail .cc-msg-actions { height: auto; opacity: 0; transition: opacity var(--ds-transition-duration) var(--ds-ease-in-out); }
+
+.cc-tail:hover .cc-msg-actions, .cc-tail .cc-msg-actions:focus-within { opacity: 1; }
 
 /* A compaction boundary: the conversation was summarized here; the line reads
    as a quiet seam, not a message. */
@@ -320,34 +384,76 @@ function ThinkingItem(props: { text: string }): ReactElement {
       >
         <div className="cc-think-body">{props.text}</div>
       </DisclosureRow>
+      <div className="cc-msg-actions">
+        <CopyAction label="复制思考过程" build={() => props.text} />
+      </div>
     </div>
   )
 }
 
 /**
- * The user row's 「复制回合」 action: builds the turn's Markdown on click —
- * never during render, so streaming never pays for a copy nobody asked for —
- * and flashes the outcome on the button itself, the quietest surface that
- * needs no extra chrome.
+ * One hover-revealed icon action with the host's tooltip chrome — the same
+ * contract the host's MessageIconActions gives its rows, so a dsh-cc row
+ * reads as native.
  *
- * @param props.build - builds the text from the row's render-time closure.
- * @returns the button element.
+ * @param props.label - the tooltip and aria-label.
+ * @param props.onClick - the action.
+ * @param props.children - the icon glyph.
+ * @returns the action button.
  */
-function CopyTurnAction(props: { build(): string }): ReactElement {
-  const [state, setState] = useState<'idle' | 'done' | 'fail'>('idle')
-  const timer = useRef<ReturnType<typeof setTimeout>>(undefined)
-  useEffect(() => () => clearTimeout(timer.current), [])
+function IconAction(props: { label: string; onClick(): void; children: ReactNode }): ReactElement {
+  return (
+    <Tooltip label={props.label} side="bottom">
+      <button type="button" className="cc-action" aria-label={props.label} onClick={props.onClick}>
+        {props.children}
+      </button>
+    </Tooltip>
+  )
+}
+
+/**
+ * The copy icon action: the host's check swap for one second after the write
+ * lands, with re-click gating so the window can neither re-copy nor stack
+ * timers. Text is built on click — never during render — so streaming rows
+ * never pay for a copy nobody asked for.
+ *
+ * @param props.label - the resting tooltip; swaps to 已复制 on success.
+ * @param props.build - builds the text at click time.
+ * @param props.icon - the resting glyph; defaults to the copy icon.
+ * @returns the action button.
+ */
+function CopyAction(props: { label: string; build(): string; icon?: ReactNode }): ReactElement {
+  const [copied, setCopied] = useState(false)
+  const pending = useRef(false)
+  const timer = useRef<number | null>(null)
+  const epoch = useRef(0)
+  useEffect(() => () => {
+    epoch.current += 1
+    pending.current = false
+    if (timer.current !== null) clearTimeout(timer.current)
+  }, [])
   const onClick = (): void => {
-    void copyTextToClipboard(props.build()).then(ok => {
-      setState(ok ? 'done' : 'fail')
-      clearTimeout(timer.current)
-      timer.current = setTimeout(() => setState('idle'), 1600)
+    if (copied || pending.current) return
+    const mark = epoch.current
+    pending.current = true
+    void writeClipboard(props.build()).then(ok => {
+      if (mark !== epoch.current) return
+      pending.current = false
+      if (!ok) return
+      setCopied(true)
+      timer.current = window.setTimeout(() => {
+        timer.current = null
+        setCopied(false)
+      }, 1000)
     })
   }
+  const label = copied ? '已复制' : props.label
   return (
-    <button type="button" className="cc-user-action" onClick={onClick}>
-      {state === 'done' ? '已复制' : state === 'fail' ? '复制失败' : '复制回合'}
-    </button>
+    <Tooltip label={label} side="bottom">
+      <button type="button" className="cc-action" aria-label={label} onClick={onClick}>
+        {copied ? <IconCheckOutline16 /> : props.icon ?? <IconCopyOutline16 />}
+      </button>
+    </Tooltip>
   )
 }
 
@@ -384,6 +490,7 @@ function EventItem(props: {
   mentions: MarkdownFileMentions
   commands: readonly SlashCommand[]
   buildTurnText?: (event: Extract<CcEvent, { kind: 'user' }>) => string
+  buildReplyText?: (event: Extract<CcEvent, { kind: 'result' }>) => string
   onFork?: (event: Extract<CcEvent, { kind: 'user' }>) => void
   onRewind?: (event: Extract<CcEvent, { kind: 'user' }>) => void
 }): ReactElement | null {
@@ -427,27 +534,29 @@ function EventItem(props: {
             )}
             {body}
           </div>
-          {/* 复制回合 works off the events list alone, so it shows on every
-              user row; 分叉/回滚 still need the native-message anchor. */}
-          {(props.buildTurnText !== undefined
-            || (event.nativeMessageId !== undefined
-              && (props.onFork !== undefined || props.onRewind !== undefined))) && (
-            <div className="cc-user-actions">
-              {props.buildTurnText !== undefined && (
-                <CopyTurnAction build={() => props.buildTurnText?.(event) ?? ''} />
-              )}
-              {event.nativeMessageId !== undefined && props.onFork !== undefined && (
-                <button type="button" className="cc-user-action" onClick={() => { props.onFork?.(event) }}>
-                  分叉
-                </button>
-              )}
-              {event.nativeMessageId !== undefined && props.onRewind !== undefined && (
-                <button type="button" className="cc-user-action" onClick={() => { props.onRewind?.(event) }}>
-                  回滚文件
-                </button>
-              )}
-            </div>
-          )}
+          {/* Host-parity icon chrome: 复制/复制回合 work off the events list
+              alone so they show on every user row; 分叉/回滚 still need the
+              native-message anchor. Tooltips carry what the glyphs don't say. */}
+          <div className="cc-user-actions">
+            <CopyAction label="复制" build={() => event.text} />
+            {props.buildTurnText !== undefined && (
+              <CopyAction
+                label="复制回合（输入 + 回复 + 工具与思考）"
+                icon={<IconShareOutline16 />}
+                build={() => props.buildTurnText?.(event) ?? ''}
+              />
+            )}
+            {event.nativeMessageId !== undefined && props.onFork !== undefined && (
+              <IconAction label="分叉：从此消息开新会话" onClick={() => { props.onFork?.(event) }}>
+                <IconBranchOutline16 />
+              </IconAction>
+            )}
+            {event.nativeMessageId !== undefined && props.onRewind !== undefined && (
+              <IconAction label="回滚文件：恢复到此消息时" onClick={() => { props.onRewind?.(event) }}>
+                <IconRefreshOutline16 />
+              </IconAction>
+            )}
+          </div>
         </div>
       )
     }
@@ -469,9 +578,17 @@ function EventItem(props: {
     }
     case 'assistant':
       return (
-        <div className="cc-assistant">
-          <MarkdownText text={event.text} fileMentions={props.mentions} />
-          {event.aborted === true && <div className="cc-note">已中断</div>}
+        <div className="cc-assistant-wrap">
+          <div className="cc-assistant">
+            <MarkdownText text={event.text} fileMentions={props.mentions} />
+            {event.aborted === true && <div className="cc-note">已中断</div>}
+          </div>
+          {/* The host closes every assistant turn with a copy control; a
+              dsh-cc turn interleaves several prose segments around tool
+              calls, so each segment carries its own. */}
+          <div className="cc-msg-actions">
+            <CopyAction label="复制" build={() => event.text} />
+          </div>
         </div>
       )
     case 'thinking':
@@ -499,6 +616,13 @@ function EventItem(props: {
               {part}
             </span>
           ))}
+          {/* Host-parity tail copy: the turn's whole prose as one text, the
+              same thing the host's turn tail writes. */}
+          {props.buildReplyText !== undefined && (
+            <span className="cc-msg-actions">
+              <CopyAction label="复制整段回复" build={() => props.buildReplyText?.(event) ?? ''} />
+            </span>
+          )}
         </div>
       )
     }
@@ -578,6 +702,9 @@ export const Transcript = memo(function Transcript(props: {
   // the newest block a click catches is the newest block there is.
   const buildTurnText = (event: Extract<CcEvent, { kind: 'user' }>): string =>
     formatTurnForCopy({ events: props.events, userSeq: event.seq, live: props.liveRef?.current })
+  // The turn-tail copy: the turn's whole prose as one text, host semantics.
+  const buildReplyText = (event: Extract<CcEvent, { kind: 'result' }>): string =>
+    turnAssistantText(props.events, event.seq)
   return (
     <>
       {items.map((item, index) => item.k === 'tool'
@@ -588,6 +715,7 @@ export const Transcript = memo(function Transcript(props: {
             mentions={mentions}
             commands={props.commands}
             buildTurnText={buildTurnText}
+            buildReplyText={buildReplyText}
             onFork={props.onFork}
             onRewind={props.onRewind}
           />)}
