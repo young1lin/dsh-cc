@@ -7,8 +7,9 @@
  */
 
 import { memo, type ReactElement } from 'react'
-import type { ContextUsage, UsageInfo } from './api/telemetry.ts'
+import type { ContextUsage, GitInfo, UsageInfo } from './api/telemetry.ts'
 import { registerCss } from './css.ts'
+import { BranchTag } from './status/BranchTag.tsx'
 import { ContextMeter } from './status/ContextMeter.tsx'
 import { McpMenu } from './status/McpMenu.tsx'
 import { ModelMenu } from './status/ModelMenu.tsx'
@@ -40,6 +41,8 @@ registerCss('status-bar', `
  * session has no override of its own.
  * @param props.context - the session's latest context-window snapshot; absent for a cold session.
  * @param props.usage - the session's latest usage snapshot; absent for a cold session.
+ * @param props.git - the session cwd's live branch/worktree readout; absent
+ *   hides the tag (no git, or not read yet).
  * @param props.fallbackCostUsd - the session's cumulative cost from the session
  * list, shown when `usage` is unavailable (a cold session's live control
  * channel has no running process to ask, but its historical cost is still known).
@@ -54,6 +57,7 @@ export const StatusBar = memo(function StatusBar(props: {
   configMode: string
   context: ContextUsage | undefined
   usage: UsageInfo | undefined
+  git?: GitInfo
   fallbackCostUsd?: number
   modelMenuSignal?: number
 }): ReactElement {
@@ -62,6 +66,7 @@ export const StatusBar = memo(function StatusBar(props: {
       <PermissionModeMenu sessionId={props.sessionId} sessionMode={props.sessionMode} configMode={props.configMode} />
       <ModelMenu sessionId={props.sessionId} busy={props.busy} openSignal={props.modelMenuSignal} />
       <McpMenu sessionId={props.sessionId} busy={props.busy} />
+      <BranchTag git={props.git} />
       {props.context !== undefined && <ContextMeter context={props.context} />}
       <UsageReadout info={props.usage} fallbackCostUsd={props.fallbackCostUsd} />
     </div>

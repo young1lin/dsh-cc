@@ -8,10 +8,15 @@
  * so a gateway account never sees "quota unavailable" for data it simply
  * doesn't have.
  *
+ * What the snapshot stores is the CLI's `resets_at` timestamp — never a
+ * remaining duration — so the reset countdown is recomputed against the
+ * user's own clock on a shared ticking timer, and keeps moving between
+ * telemetry frames instead of freezing at whatever the last frame said.
+ *
  * @module dsh-cc/client/status/UsageReadout
  */
 
-import type { ReactElement } from 'react'
+import { useEffect, useState, type ReactElement } from 'react'
 import { Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { UsageInfo, UsageWindow } from '../api/telemetry.ts'
 import { registerCss } from '../css.ts'
@@ -31,6 +36,8 @@ registerCss('status-usage', `
 
 .cc-usage-meter { display: flex; align-items: center; gap: 6px; }
 .cc-usage-meter-label { color: var(--dsw-alias-label-tertiary); }
+/* tabular digits so the ticking countdown doesn't wobble as it counts down */
+.cc-usage-meter-reset { color: var(--dsw-alias-label-tertiary); font-variant-numeric: tabular-nums; }
 
 .cc-usage-meter-bar {
   width: 46px;
@@ -55,10 +62,42 @@ function utilizationTier(percent: number | null): 'ok' | 'warn' | 'error' {
 }
 
 /**
+ * Whether a window still has a future reset stamp worth counting down to.
+ * @param window - the window; null/undefined when the CLI reports none.
+ * @returns true when `resets_at` parses to an instant still in the future.
+ */
+function hasFutureReset(window: UsageWindow | null | undefined): boolean {
+  const at = Date.parse(window?.resets_at ?? '')
+  return !Number.isNaN(at) && at > Date.now()
+}
+
+/**
+ * The shared clock the reset countdowns count against. The snapshot carries
+ * the CLI's `resets_at` timestamps, so the remaining time must be derived
+ * from the user's own clock on every tick — computing it once per render
+ * would freeze the text between telemetry frames. The timer runs only while
+ * some window still has a future reset stamp (an idle or windowless account
+ * holds no timer) and retires itself when the last stamp passes.
+ * @param active - whether any visible window currently has a future reset.
+ * @returns the current epoch ms.
+ */
+function useTickingNow(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!active) return
+    setNow(Date.now())
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [active])
+  return now
+}
+
+/**
  * One rate-limit window as a small progress meter with a reset countdown.
  * @param props.label - window label, e.g. `5h`.
  * @param props.window - the window's utilization and reset time; undefined/null when the CLI has neither.
- * @param props.now - current epoch ms, for the reset countdown.
+ * @param props.now - current epoch ms from the shared ticking clock, so the
+ *   countdown derives from the stored stamp against the user's time, live.
  * @returns the meter node.
  */
 function UsageMeter(props: { label: string; window: UsageWindow | null | undefined; now: number }): ReactElement {
@@ -74,6 +113,7 @@ function UsageMeter(props: { label: string; window: UsageWindow | null | undefin
           <span className="cc-usage-meter-fill" data-tier={tier} style={{ width: `${percent ?? 0}%` }} />
         </span>
         <strong>{percent === null ? '—' : `${percent}%`}</strong>
+        {reset !== '' && <span className="cc-usage-meter-reset">{reset}</span>}
       </span>
     </Tooltip>
   )
@@ -110,6 +150,13 @@ function sumTokens(session: NonNullable<UsageInfo['session']>): { input: number;
 export function UsageReadout(props: { info: UsageInfo | undefined; fallbackCostUsd?: number }): ReactElement | null {
   const { info, fallbackCostUsd } = props
 
+  const limits = info?.rate_limits_available === true ? info.rate_limits : null
+  const five = limits?.five_hour
+  const seven = limits?.seven_day
+  // Hooks cannot sit behind the early returns below, so the clock is
+  // requested up front; it only ticks while a countdown actually exists.
+  const now = useTickingNow(hasFutureReset(five) || hasFutureReset(seven))
+
   if (info === undefined) {
     if (fallbackCostUsd === undefined) return null
     return (
@@ -119,11 +166,7 @@ export function UsageReadout(props: { info: UsageInfo | undefined; fallbackCostU
     )
   }
 
-  const limits = info.rate_limits_available === true ? info.rate_limits : null
-  const five = limits?.five_hour
-  const seven = limits?.seven_day
   if (five != null || seven != null) {
-    const now = Date.now()
     return (
       <div className="cc-usage">
         {info.subscription_type != null && info.subscription_type !== '' && (

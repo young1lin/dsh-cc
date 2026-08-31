@@ -38,7 +38,7 @@ import {
   rewindApply, rewindPreview, sendMessage, stopSession, stopTask, type RewindResult,
 } from './api/sessions.ts'
 import { fetchConfig } from './api/settings.ts'
-import { fetchContext, fetchUsage, setPermissionMode, setEffort, type ContextUsage, type UsageInfo } from './api/telemetry.ts'
+import { fetchContext, fetchGitInfo, fetchUsage, setPermissionMode, setEffort, type ContextUsage, type GitInfo, type UsageInfo } from './api/telemetry.ts'
 import type {
   CcEvent, ConfigSummary, LiveTurnSnapshot, PermissionAnswer, PermissionRequest, SessionMeta, SlashCommand,
   TaskRow,
@@ -228,6 +228,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
    */
   const [eventsBySession, setEventsBySession] = useState<Record<string, CcEvent[]>>({})
   const [usage, setUsage] = useState<UsageInfo | undefined>()
+  const [git, setGit] = useState<GitInfo | undefined>()
   const [context, setContext] = useState<ContextUsage | undefined>()
   const [permissions, setPermissions] = useState<PendingPermission[]>([])
   const [dialogs, setDialogs] = useState<PendingDialog[]>([])
@@ -438,6 +439,17 @@ export function CcApp(props: { onClose(): void }): ReactElement {
       })
       .catch(() => {
         // A cold session has no live process to ask; the meter stays hidden.
+      })
+    // The branch tag, unlike the meters, needs no live process — git answers
+    // for the cwd directly — so it loads for cold sessions too.
+    fetchGitInfo(id)
+      .then(result => {
+        if (currentIdRef.current === id && result.available && result.git !== undefined) {
+          setGit(result.git)
+        }
+      })
+      .catch(() => {
+        // Outside a repo the tag stays hidden; nothing to recover.
       })
   }
 
@@ -768,6 +780,17 @@ export function CcApp(props: { onClose(): void }): ReactElement {
           if (message.sessionId !== currentIdRef.current) break
           if (message.context !== undefined) setContext(message.context as ContextUsage)
           if (message.usage !== undefined) setUsage(message.usage as UsageInfo)
+          // A turn may have moved the cwd's branch (a Bash git checkout);
+          // the per-response frame is the moment to re-read the branch tag.
+          fetchGitInfo(message.sessionId)
+            .then(result => {
+              if (result.available && result.git !== undefined && currentIdRef.current === message.sessionId) {
+                setGit(result.git)
+              }
+            })
+            .catch(() => {
+              // Best effort; the next switch or frame retries.
+            })
           break
         }
         default:
@@ -814,6 +837,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
       })
     setContext(undefined)
     setUsage(undefined)
+    setGit(undefined)
     refreshTelemetry(currentId)
     // The command cache loads on selection when the engine is already live
     // (a returning visit); a cold session reads available:false and falls
@@ -1112,6 +1136,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
               configMode={config?.permissionMode ?? 'auto'}
               context={context}
               usage={usage}
+              git={git}
               fallbackCostUsd={current.totalCostUsd}
               modelMenuSignal={modelMenuSignal}
             />

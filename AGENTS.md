@@ -51,6 +51,7 @@ node 半区各模块（读懂 catalog 这一层是理解全局的关键）：
 | `live-turn.ts` | 流式帧折叠 reducer，**两半共用同一份**，页面中途加入/切回拿到的进行中回合才一致 |
 | `mentions.ts` | 发消息时的 @ 提及展开：文件内容 / 文件夹目录树作为文本块追加（触发规则：行首或空白后的 `@`；总量 1MB 上限） |
 | `file-index.ts` | @ 提及菜单的项目索引：会话 cwd 下的一次有界 BFS 遍历（5000 行 / 层 2000 / 深 16），TTL 缓存；与发送侧共用 `types.ts` 里的 `SKIPPED_DIR` 单一忽略权威 —— 菜单绝不提供注入会跳过的东西 |
+| `git-info.ts` | 会话 cwd 的实时 git 读数（分支 / worktree 名 / detached 短 sha）：一次 `rev-parse` + 短 TTL 缓存 + 在途去重，`GET /sessions/:id/git` 供状态条分支标签；SDK 控制通道没有分支查询，CLI 持久化的 `gitBranch` 只是滞后快照，所以直接问 git —— 冷会话也有 |
 | `blobs.ts` | 图片字节按 SHA-256 内容寻址存储（页面粘贴与转录回读同源同 id）；`sweep()` 回收无引用且超过宽限期的文件 |
 | `config.ts` | schemastery schema；结构化 provider 字段解析成 env 叠加，显式 `env` 永远赢 |
 | `store-watch.ts` | 递归监听 CLI 主目录，报出「哪几个项目目录变了」；带速率上限，作用域不确定时如实说 full |

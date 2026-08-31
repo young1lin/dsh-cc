@@ -65,6 +65,30 @@ export interface UsageInfo {
   } | null
 }
 
+/** Git readout for the session's working directory. */
+export interface GitInfo {
+  /** Checked-out branch; '' when HEAD is detached. */
+  branch: string
+  /** Short commit sha, present when HEAD is detached. */
+  detached?: string
+  /** Linked-worktree name, when the cwd lives inside one. */
+  worktree?: string
+  /** Repository (or worktree) root, as git resolves it. */
+  root?: string
+}
+
+/**
+ * GET /sessions/:id/git — where the session's cwd sits in git.
+ *
+ * Unlike usage/context, this is read from git by the node half rather than
+ * probed from a live CLI process, so a cold session carries it too.
+ * @param id - session id.
+ * @returns the readout, or available:false when the cwd is outside any repo.
+ */
+export function fetchGitInfo(id: string): Promise<{ available: boolean; git?: GitInfo }> {
+  return api<{ available: boolean; git?: GitInfo }>(`/sessions/${id}/git`)
+}
+
 /**
  * GET /sessions/:id/usage.
  * @param id - session id.

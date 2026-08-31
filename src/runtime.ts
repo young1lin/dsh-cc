@@ -22,6 +22,7 @@ import { BlobStore, isImageMediaType } from './blobs.ts'
 import { cachedCommands, rememberCommands } from './command-cache.ts'
 import { SessionCatalog, type CatalogRefresh } from './catalog.ts'
 import { fileIndexFor } from './file-index.ts'
+import { gitInfoFor } from './git-info.ts'
 import { effectiveEnvEntries, maskSecret, readDirListing, readSdkVersion, readTextFile } from './http-support.ts'
 import { reduceDelta, type LiveTurn } from './live-turn.ts'
 import { deleteNativeSession, forkNativeSession, renameNativeSession } from './native-sessions.ts'
@@ -1052,6 +1053,17 @@ export class CcRuntime {
             await this.closeEngine(session.id)
           }
           return json(res, { ok: true, mode })
+        }
+        if (parts.length === 3 && parts[2] === 'git' && method === 'GET') {
+          // Branch/worktree readout for the status strip. Ground truth is git
+          // itself over the session cwd — the CLI only persists a lagging
+          // end-of-session branch stamp — and no live engine is involved, so
+          // a cold session shows its branch too.
+          const session = this.store.get(id) ?? this.catalog.get(id)
+          if (!session) return json(res, { error: '会话不存在' }, 404)
+          const git = await gitInfoFor(session.cwd)
+          if (git === undefined) return json(res, { available: false })
+          return json(res, { available: true, git })
         }
         if (parts.length === 3 && parts[2] === 'usage' && method === 'GET') {
           // Same adopting-race guard as the context route.

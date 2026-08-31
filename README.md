@@ -17,7 +17,8 @@ dsh-cc 是一个 DSH 外挂双面插件：在 DSH Web GUI 右缘加入一个 **C
 - **@ 文件/文件夹提及**：打 `@` 即全项目模糊搜索 —— 一次有界索引（5000 行 / 层 2000 / 深 16，忽略 node_modules、`.git` 等重目录）覆盖整个工作目录，子序列匹配（`mc` 找 `mention-core`）按 basename 精确>前缀>连续>子序列排名；输入绝对路径则实时列出该目录子项导航盘上任何位置。↑↓/PageUp/PageDown/Home/End 选择，Enter/Tab 插入（整段替换半打的 token、自动补尾空格、文件夹补 `/`）；手打的 `@相对路径` / `@绝对路径` 同样生效 —— 文件内容与文件夹目录树随消息注入上下文（总量上限 1MB）
 - **文件路径点击查看**：对话文本里反引号包裹的文本文件路径（带分隔符或绝对路径 + 已知文本扩展名）可点击打开查看器，显示磁盘最新内容（行号 + 语法高亮，> 2MB 截断）
 - **图片输入**：粘贴或拖入图片（每张 ≤ 5MB）随消息发送，转录回读同一份内容寻址存储
-- **用量与上下文读数**：状态栏显示模型 / 档位选择、上下文窗口占用与账户用量；每次模型响应完成后经 SSE 自动刷新一次（CLI statusline 的节奏 —— 按响应计，不按流式增量计）
+- **用量与上下文读数**：状态栏显示模型 / 档位选择、上下文窗口占用与账户用量；每次模型响应完成后经 SSE 自动刷新一次（CLI statusline 的节奏 —— 按响应计，不按流式增量计）。订阅额度窗口存的是 CLI 返回的 `resets_at` 时间戳，重置倒计时按用户本地时钟逐秒重算并直接显示在 5h / 周窗口旁，不会冻结在上次快照
+- **分支 / worktree 标签**：状态条显示会话 cwd 当前所在的 git 分支（detached 时显示短 sha；位于 linked worktree 时悬停可见 worktree 名与仓库根）。读数由插件直接跑 `git rev-parse` 获得 —— SDK 控制通道没有分支查询，CLI 持久化的 `gitBranch` 只是回合结束时的滞后快照；冷会话同样可查，回合结束后自动重读（回合中可能 `git checkout` 过）
 - **Esc 中断回合**：回合进行中在输入框按 Esc 即中断（与「停止」按钮同路径）；Esc 分层保持「菜单 → 中断 → 离开输入框 → 关闭面板」
 - **每会话草稿与输入历史**：未发送的草稿（含已上传图片）按会话落盘，切换 / 刷新不丢；发送过的消息按「项目 + 账号」记入历史，输入框空态或回溯态下 ↑↓ 翻取、编辑即退出回溯
 - **排队交给 CLI 自己做**：回合进行中发送的消息立即推给 CLI，由 CLI 的命令队列排；它回的 `command_lifecycle` 帧就是页面「谁在等」的唯一真相。等待中的消息在转录流上方成条列出（时间 + 首行预览 + 「撤回」），撤回走 CLI 原生 dequeue，撤得掉才算撤掉；本轮结束时**整批合并成一个回合**发出（CLI 的 coalescing，模型一次看到用户的连续意图，也只计一次费）。转录行在消息真正被取进回合时才写 —— 排队中的消息不会伪装成已发出。引擎异常死亡时未开跑的队列整体移交下一个进程
@@ -146,12 +147,12 @@ C:/PythonProject/dev/dsh-cc
         Composer.tsx       输入框      LiveTurnView.tsx  进行中回合
         CommandMenu.tsx    斜杠命令弹窗 MentionPicker.tsx  @ 文件菜单渲染
         mention-core.ts    @ 菜单纯逻辑（token 语法 / 模糊排名 / 绝对路径导航 / 插入规划）
-        StatusBar.tsx      模型 / 档位 / 上下文 / 用量状态条
+        StatusBar.tsx      模型 / 档位 / 分支 / 上下文 / 用量状态条
         Interaction.tsx    权限审批卡片 + AskUserQuestion 卡片
         api/               fetch + EventSource 封装（http / sessions / settings / telemetry / interaction）
         tool/              各类工具卡片（terminal / read / diff / search / web / TodoList…）
         settings/          SettingsModal / ProviderForm / EnvEditor / SessionEnvModal / AccountPanel
-        status/            用量与上下文读数（UsageReadout / ContextMeter / ModelMenu）
+        status/            用量与上下文读数（UsageReadout / ContextMeter / ModelMenu / BranchTag）
 ```
 
 - **node 半区**是函数插件（具名导出 `name`/`inject`/`Config`/`apply`），等待 `webServer` 服务后把 `/cc/api` 前缀路由注册到宿主 HTTP 服务上；不与宿主 cordis 发生类继承耦合。
@@ -188,6 +189,7 @@ C:/PythonProject/dev/dsh-cc
 | POST | /cc/api/sessions/:id/effort | 切换思考档位；per-session：持久化到该会话，只影响该会话 |
 | POST | /cc/api/sessions/:id/permission-mode | 切换权限模式；持久化为该会话默认，忙碌引擎就地热切换 |
 | GET | /cc/api/sessions/:id/usage | 账户用量（需活跃引擎） |
+| GET | /cc/api/sessions/:id/git | 会话 cwd 的 git 分支 / worktree / detached 读数（直接跑 git，无需活跃引擎；不在仓库内回 `available: false`） |
 | GET | /cc/api/sessions/:id/commands | CLI 支持的斜杠命令（需活跃引擎；冷会话回退到该「账号+项目」上次记档的目录，带 `stale`） |
 | POST | /cc/api/sessions/:id/commands | 先重新加载插件与技能再返回目录（改完技能不必重开会话）；插件/技能各自失败各自报，走 `failures` |
 | GET | /cc/api/sessions/:id/mcp | 该会话的 MCP 服务器与连接状态、作用域、工具数（读自活进程；无进程返回 `available: false`） |
