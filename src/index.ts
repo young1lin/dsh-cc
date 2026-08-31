@@ -21,8 +21,8 @@ import { CcRuntime } from './runtime.ts'
 
 export { Config, type ClaudeCodeConfig } from './config.ts'
 
-/** Plugin name. */
-export const name = 'dsh-cc'
+/** Plugin name — the npm package name, the convention function plugins follow. */
+export const name = '@young1lin/dsh-cc'
 
 /** The plugin waits for the web HTTP carrier before mounting its routes. */
 export const inject: string[] = ['webServer']

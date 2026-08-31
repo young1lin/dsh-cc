@@ -1,8 +1,17 @@
 {
-  "name": "dsh-cc",
+  "name": "@young1lin/dsh-cc",
   "version": "0.1.0",
-  "private": true,
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Claude Code inside the DeepSeek Harness web GUI: right-edge dock entry, session overlay, and an env-configurable Claude Agent SDK bridge",
+  "author": "young1lin",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/young1lin/dsh-cc.git"
+  },
+  "homepage": "https://github.com/young1lin/dsh-cc#readme",
+  "bugs": "https://github.com/young1lin/dsh-cc/issues",
   "type": "module",
   "license": "MIT",
   "main": "lib/index.js",
@@ -23,8 +32,24 @@
     "clean": "node -e \"fs.rmSync('lib', { recursive: true, force: true })\" --input-type=module || true",
     "typecheck": "tsc --noEmit",
     "build": "tsc --noEmit && tsdown",
-    "watch": "tsdown --watch"
+    "watch": "tsdown --watch",
+    "smoke": "node scripts/client-smoke.mjs",
+    "prepublishOnly": "pnpm run build && pnpm run smoke && pnpm pack --dry-run"
   },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.22.0",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "plugin",
+    "claude-code",
+    "claude-agent-sdk",
+    "anthropic",
+    "web-ui"
+  ],
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.220"
   },
@@ -48,6 +73,7 @@
     "lib/index.js",
     "lib/client.js",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ]
 }

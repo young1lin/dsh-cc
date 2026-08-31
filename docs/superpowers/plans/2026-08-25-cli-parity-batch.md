@@ -15,7 +15,7 @@
 - House style: 2-space indent, single quotes, no default exports, JSDoc with `@param`/`@returns` on every exported function, `@module` comment at each file head. UI copy in Chinese. Match the surrounding files.
 - No test framework exists and none may be added. Verification per task is `pnpm typecheck` plus the concrete live checks named in the task.
 - Lab instance: `dsh --profile web --no-open --port 3090` from **Git Bash** (PowerShell `Start-Process` cannot run the npm shim). The user's own instance is on **3080** — before touching it, check `GET /cc/api/sessions` shows zero busy sessions. API base `/cc/api`.
-- The plugin must be re-installed (`dsh plugin --profile web add C:/PythonProject/dev/dsh-cc`) or link-installed + `pnpm build` before lab verification; restart dsh after install.
+- The plugin must be re-installed (`dsh plugin --profile web add /path/to/dsh-cc`) or link-installed + `pnpm build` before lab verification; restart dsh after install.
 - SDK pinned at `@anthropic-ai/claude-agent-sdk@0.3.220`; facts about task frames/controls below were read from its `sdk.d.ts` and hold for that version.
 - Task table and TODO pin are display state only — never persisted; the transcript stays the durable record (CLI-owned facts stay in CLI storage).
 - Line endings: repo is LF. After edits, `git diff --stat` must show only intended files.
@@ -1173,9 +1173,9 @@ export async function readTextFile(pathname: string): Promise<FileContent> {
 Run: `pnpm typecheck && pnpm build` — Expected: pass. Lab:
 
 ```sh
-curl -s "localhost:3090/cc/api/fs/file?path=C:/PythonProject/dev/dsh-cc/src/types.ts" | head -c 200
-curl -s "localhost:3090/cc/api/fs/file?path=C:/PythonProject/dev/dsh-cc/missing.ts"     # 404
-curl -s "localhost:3090/cc/api/fs/file?path=C:/PythonProject/dev/dsh-cc/lib/client.js" | python -c "import sys,json;print(len(json.load(sys.stdin)['file']['content']))"
+curl -s "localhost:3090/cc/api/fs/file?path=/path/to/dsh-cc/src/types.ts" | head -c 200
+curl -s "localhost:3090/cc/api/fs/file?path=/path/to/dsh-cc/missing.ts"     # 404
+curl -s "localhost:3090/cc/api/fs/file?path=/path/to/dsh-cc/lib/client.js" | python -c "import sys,json;print(len(json.load(sys.stdin)['file']['content']))"
 ```
 
 Expected: the file head; the 404; a length ≤ 2097152.

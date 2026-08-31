@@ -38,20 +38,47 @@ dsh-cc 是一个 DSH 外挂双面插件：在 DSH Web GUI 右缘加入一个 **C
 
 ## 安装
 
-前置：本机已安装 Node 22+、pnpm；DSH 已安装（`dsh` 命令可用）。
+### 前置：安装 DSH
+
+本机还没有 `dsh` 命令时，先全局安装 DSH（需要 Node 22+）：
 
 ```sh
-cd C:/PythonProject/dev/dsh-cc
+npm install -g @deepseek-ai/dsh
+```
+
+然后用 `dsh web` 启动 Web GUI（已在运行则跳过，装完插件重启即可）。
+
+### 从 npm 安装（推荐）
+
+```sh
+dsh plugin --profile web add @young1lin/dsh-cc
+```
+
+重启 dsh（web profile）后刷新页面，界面右缘即出现「Claude Code」dock 按钮。零配置即可用（使用本机 Claude Code 登录态）；要切换模型 / 走代理，见下方「配置」一节。
+
+更新到最新版：
+
+```sh
+dsh plugin --profile web update @young1lin/dsh-cc@latest
+```
+
+### 从源码安装（开发）
+
+前置：本机已安装 Node 22+、pnpm。
+
+```sh
+git clone https://github.com/young1lin/dsh-cc.git
+cd dsh-cc
 pnpm install
 pnpm run build
 
 # 装进 web profile（GUI 使用的 profile）
-dsh plugin --profile web add C:/PythonProject/dev/dsh-cc
+dsh plugin --profile web add .
 
 # 重启 dsh（web profile）后刷新页面
 ```
 
-> 开发迭代：改完代码 `pnpm run build` 后重新执行上面的 `dsh plugin ... add` 并重启即可（file: 安装按 files 打包）。也可以用 `dsh plugin --profile web add link:C:/PythonProject/dev/dsh-cc` 做链接安装，配合 `pnpm run watch` 免重新 add（仅改 lib 产物时）。
+> 开发迭代：改完代码 `pnpm run build` 后重新执行上面的 `dsh plugin ... add` 并重启即可（file: 安装按 files 打包）。也可以用 `dsh plugin --profile web add link:<本仓库路径>` 做链接安装，配合 `pnpm run watch` 免重新 add（仅改 lib 产物时）。
 
 ## 配置（模型 / 代理 / 密钥）
 
@@ -123,7 +150,7 @@ Claude Code 把一个账号的全部家当放在同一个根目录下：凭证�
 ## 架构
 
 ```
-C:/PythonProject/dev/dsh-cc
+dsh-cc（仓库根目录）
 ├─ package.json          dsh.bundle + dsh.client 声明（双面插件）
 ├─ cordis.patch.yml      bundle 层：挂载 dsh-cc 插件行
 └─ src/
@@ -215,3 +242,7 @@ C:/PythonProject/dev/dsh-cc
 - 斜杠命令菜单需要活跃引擎（新会话发出第一条消息后可用）；输入框与转录里的蓝色识别态依赖该会话的命令列表缓存，拿不到列表时保持普通文本。
 - `@` 提及只在 `@` 位于行首或空白之后时触发（`user@host` 这类词中 @ 永不触发）；文件夹提及注入的是目录树而非文件内容；二进制或不可读的路径静默保持普通文本；一条消息全部提及的注入总量上限 1MB，超出部分打省略标记。
 - SDK 固定为 `@anthropic-ai/claude-agent-sdk@0.3.220`（自带对应版本 CLI 载荷，与本机安装的 claude 版本无关）。
+
+## 许可证
+
+[MIT](./LICENSE)

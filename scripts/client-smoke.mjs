@@ -28,7 +28,7 @@ const requireStub = (name) => {
 // eslint-disable-next-line no-eval -- the artifact is a closure bundle, not a module
 eval(readFileSync(join(packageDir, 'lib', 'client.js'), 'utf8'))
 
-if (!loaded || loaded.id !== 'dsh-cc') {
+if (!loaded || loaded.id !== '@young1lin/dsh-cc') {
   console.error('FAIL: loader handoff missing')
   process.exit(1)
 }
