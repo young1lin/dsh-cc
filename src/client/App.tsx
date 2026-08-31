@@ -1119,6 +1119,12 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                   <span>{current.cwd}</span>
                   {current.lastGoodModel !== undefined && <span>· {current.lastGoodModel}</span>}
                   {config !== undefined && <span>· {config.permissionMode}</span>}
+                  {/* 账号绑定指向另一个根：说清楚这个会话的额度与凭据来自哪里 */}
+                  {current.accountEnv !== undefined && current.configDir !== undefined
+                    && config !== undefined
+                    && current.configDir.toLowerCase() !== config.configDir.toLowerCase() && (
+                    <span>· 账号根 {current.configDir.split(/[\\/]/).filter(Boolean).pop()}</span>
+                  )}
                 </span>
               )}
             </div>

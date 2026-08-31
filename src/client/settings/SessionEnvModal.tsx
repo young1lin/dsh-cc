@@ -42,8 +42,37 @@ registerCss('session-env-modal', `
   font: var(--dsw-font-xxs-12);
   color: var(--dsw-alias-label-secondary);
 }
+
+.cc-account-bind {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-2);
+  font: var(--dsw-font-xxs-12);
+}
+
+.cc-account-bind code {
+  font-family: var(--ds-font-family-code);
+  color: var(--dsw-alias-label-primary);
+}
 `)
 
+/**
+ * Mask a credential value for display: enough of the ends to recognize the
+ * key that produced it, never enough to use it.
+ * @param key - the env var name; credentials are masked by name pattern.
+ * @param value - the value.
+ * @returns the display-safe value.
+ */
+function maskValue(key: string, value: string): string {
+  if (!/TOKEN|KEY|SECRET/i.test(key)) return value
+  if (value.length <= 12) return '••••••'
+  return `${value.slice(0, 6)}…${value.slice(-4)}`
+}
 /**
  * Parse an exported env JSON string into a string map, rejecting anything
  * that is not a flat `{ KEY: "value" }` object.
@@ -146,6 +175,18 @@ export function SessionEnvModal(props: {
       )}
     >
       <div className="cc-settings">
+        {props.session.accountEnv !== undefined && (
+          <div className="cc-account-bind">
+            <div>账号绑定（创建会话时生效，此会话之后一直使用，全局切换不影响）：</div>
+            <div>根目录 <code>{props.session.configDir ?? '（未记录）'}</code></div>
+            {Object.entries(props.session.accountEnv).map(([key, value]) => (
+              <div key={key}>{key} <code>{maskValue(key, value)}</code></div>
+            ))}
+            {Object.keys(props.session.accountEnv).length === 0 && (
+              <div>无接入点变量 —— 账号直连（凭据走根目录里的登录态）</div>
+            )}
+          </div>
+        )}
         <div className="cc-hint">
           只作用于这个会话的下一个 claude 进程，例如让它单独走另一个中转站：设置 ANTHROPIC_BASE_URL 与 ANTHROPIC_AUTH_TOKEN。留空则沿用全局设置；进行中的回合不受影响。导出会把当前变量以 JSON 复制到剪贴板，导入粘贴即可复用。
         </div>

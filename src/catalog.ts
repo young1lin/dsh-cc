@@ -93,6 +93,71 @@ export class SessionCatalog {
    * disk a second identical sweep per tick.
    */
   private refreshInFlight: Promise<CatalogRefresh> | undefined
+  /**
+   * Live terminal writers under roots OTHER than the active one, keyed by
+   * normalized root path, as sets of native session ids. Bound sessions on
+   * those roots need their ownership answered too — the send and delete gates
+   * read it — and their registry lives in their own root, not the active one.
+   */
+  private foreignPeers = new Map<string, Set<string>>()
+
+  /**
+   * Re-read the live-process registries of every non-active root that bound
+   * sidecar rows point at.
+   *
+   * Usually zero or one extra directory read per refresh; roots with no bound
+   * rows are not touched, so an account that once had sessions here costs
+   * nothing after they are gone.
+   * @returns nothing; {@link foreignPeers} is replaced on success. A failed
+   *   root read keeps that root's previous answer rather than failing the
+   *   whole refresh.
+   */
+  private async refreshForeignPeers(): Promise<void> {
+    const roots = new Map<string, string>()
+    for (const meta of this.store.list()) {
+      if (meta.accountEnv === undefined || meta.claudeSessionId === undefined) continue
+      if (meta.configDir === undefined || sameDir(meta.configDir, this.activeConfigDir())) continue
+      roots.set(this.rootKey(meta.configDir), meta.configDir)
+    }
+    if (roots.size === 0) {
+      this.foreignPeers = new Map()
+      return
+    }
+    const next = new Map<string, Set<string>>()
+    await Promise.all([...roots.entries()].map(async ([key, dir]) => {
+      try {
+        const peers = await readPeerSessions(dir)
+        next.set(key, new Set(peers.keys()))
+      } catch {
+        next.set(key, this.foreignPeers.get(key) ?? new Set())
+      }
+    }))
+    this.foreignPeers = next
+  }
+
+  /**
+   * Normalize a root path for {@link foreignPeers} keying.
+   * @param root - the absolute account root.
+   * @returns the map key for that root.
+   */
+  private rootKey(root: string): string {
+    return process.platform === 'win32' ? root.toLowerCase() : root
+  }
+
+  /**
+   * Stamp terminal ownership onto one merged row whose root is not active.
+   *
+   * Active-root rows get their ownership from the native merge; a bound row on
+   * another root has no native counterpart here, so its answer comes from
+   * {@link foreignPeers}. Our own engines never count as terminal writers.
+   * @param row - the merged copy about to be returned to the page.
+   */
+  private stampForeignOwnership(row: SessionMeta): void {
+    if (row.accountEnv === undefined || row.claudeSessionId === undefined) return
+    if (row.configDir === undefined || sameDir(row.configDir, this.activeConfigDir())) return
+    const owned = this.foreignPeers.get(this.rootKey(row.configDir))?.has(row.claudeSessionId) === true
+    row.terminalOwned = owned && !this.drivesNative(row.claudeSessionId)
+  }
 
   /**
    * @param store - the dsh-cc sidecar.
@@ -105,12 +170,16 @@ export class SessionCatalog {
    * @param activeConfigDir - the Claude Code home currently in force. Read
    *   through a callback rather than captured, because switching accounts
    *   moves it under a catalog that outlives the switch.
+   * @param accountEnv - the provider-scope environment in force right now,
+   *   stamped onto rows this catalog adopts (the binding a spawn of them
+   *   will use from then on). Also a callback, for the same reason.
    */
   constructor(
     private readonly store: SessionStore,
     private readonly blobs: BlobStore,
     private readonly drivesNative: (claudeSessionId: string) => boolean = () => false,
     private readonly activeConfigDir: () => string = baselineConfigDir,
+    private readonly accountEnv: () => Record<string, string> = () => ({}),
   ) {}
 
   /**
@@ -131,15 +200,17 @@ export class SessionCatalog {
    * Whether one sidecar row belongs to the Claude Code home in force.
    *
    * A row's `claudeSessionId` only resolves inside the root it was created
-   * under, so rows from another account are not merely uninteresting here —
-   * their transcripts cannot be read and a send against them would resume
-   * nothing. Rows written before accounts existed carry no stamp and belong
-   * to the baseline root.
+   * under — unless the row carries an account binding, whose stamped root and
+   * provider scope are exactly what a spawn of it uses, transcript reads
+   * included. Bound rows therefore stay listed and usable whatever root is
+   * active; rows written before bindings existed carry no stamp and follow
+   * the active root as before.
    * @param meta - the sidecar row.
    * @returns true when the row is in scope for the active root.
    */
   private inScope(meta: SessionMeta): boolean {
-    return sameDir(meta.configDir ?? baselineConfigDir(), this.activeConfigDir())
+    return meta.accountEnv !== undefined
+      || sameDir(meta.configDir ?? baselineConfigDir(), this.activeConfigDir())
   }
 
   /**
@@ -187,6 +258,7 @@ export class SessionCatalog {
       // No readable CLI store: the sidecar list stands on its own.
       return QUIET_REFRESH
     }
+    await this.refreshForeignPeers()
     this.applyPeers(fresh, peers)
     this.native = fresh
     return this.commit(fresh)
@@ -239,6 +311,9 @@ export class SessionCatalog {
     } catch {
       return undefined
     }
+    // Scoped reads only cover the active root; a bound session on another
+    // root can still gain or lose a terminal writer while nobody switched.
+    void this.refreshForeignPeers().catch(() => undefined)
     const touched = new Set(encodedDirs)
     // Everything outside the touched directories is carried over untouched;
     // inside them the scoped read is authoritative, which is what lets a
@@ -319,6 +394,7 @@ export class SessionCatalog {
     for (const meta of this.store.list()) {
       if (!this.inScope(meta)) continue
       const row = { ...meta }
+      this.stampForeignOwnership(row)
       merged.push(row)
       if (row.claudeSessionId !== undefined) adopted.set(row.claudeSessionId, row)
     }
@@ -365,6 +441,7 @@ export class SessionCatalog {
     }
     if (!this.inScope(stored)) return undefined
     const row = { ...stored }
+    this.stampForeignOwnership(row)
     const native = row.claudeSessionId === undefined
       ? undefined
       : this.native.find(meta => meta.id === row.claudeSessionId)
@@ -416,8 +493,11 @@ export class SessionCatalog {
       claudeSessionId: native.id,
       origin: 'cli',
       // The native row came out of the root in force, so that is the root the
-      // sidecar record belongs to for as long as it exists.
+      // sidecar record belongs to for as long as it exists — and the binding
+      // is the provider scope in force at adoption, so later page-level
+      // switches cannot reroute this conversation's quota.
       configDir: this.activeConfigDir(),
+      accountEnv: this.accountEnv(),
     }
     delete snapshot.terminalOwned
     return await this.store.adopt(snapshot)

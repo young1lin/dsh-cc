@@ -58,7 +58,9 @@ node 半区各模块（读懂 catalog 这一层是理解全局的关键）：
 
 **核心不变量**：CLI 的存储是会话身份 / 标题 / 转录的唯一权威；sidecar 只存 CLI 表达不了的字段（模型覆盖、env 层、live 状态、计量成本、草稿转录、标题来源标记）。两边按原生 id（sidecar 的 `claudeSessionId`）对齐；native 记录上的字段不得泄漏进合并后的 sidecar 行。标题规则对齐 CLI：页面建的草稿在首次发消息时以消息首行自动命名（`titleSource: 'auto'`），手动命名（`titleSource: 'user'`）永不被自动覆盖；收养的 CLI 会话本来就带着 CLI 自己的派生标题，不参与自动命名。
 
-**账号根目录的不变量**：任一时刻只有一个 `CLAUDE_CONFIG_DIR` 生效，由 `accounts.ts` 独家拥有 —— SDK 的 `listSessions` 之流和 `peer-sessions` 都只认 `process.env.CLAUDE_CONFIG_DIR`（无 per-call 选项），所以切账号 = 改写 dsh 进程自己的这个变量。因此 `CLAUDE_CONFIG_DIR` 在两个 env 编辑器里都被拒（写进 env 只会搬动被 spawn 的进程、搬不动插件自己的读，正是要防的分叉），cordis 配置里的则在 `resolveConfig` 提升成 `configDir`。切换时必须把一切从旧根目录读来的缓存一起作废：`account`、`modelCatalog`、catalog signature、所有引擎；有 busy 引擎则拒绝切换（409）。sidecar 行创建时盖 `configDir` 章，`catalog.list()` 按此过滤。
+**账号根目录的不变量**：进程级任一时刻只有一个 `CLAUDE_CONFIG_DIR` 生效，由 `accounts.ts` 独家拥有 —— SDK 的 `listSessions` 之流只认 `process.env.CLAUDE_CONFIG_DIR`（无 per-call 选项），所以切账号 = 改写 dsh 进程自己的这个变量；`peer-sessions` 的默认读法同源（但接受 per-call 根参数）。因此 `CLAUDE_CONFIG_DIR` 在两个 env 编辑器里都被拒（写进 env 只会搬动被 spawn 的进程、搬不动插件自己的读，正是要防的分叉），cordis 配置里的则在 `resolveConfig` 提升成 `configDir`。切换时必须把一切从旧根目录读来的缓存一起作废：`account`、`modelCatalog`、catalog signature、所有引擎；有 busy 引擎则拒绝切换（409）。
+
+**会话级账号绑定的不变量**：sidecar 行在创建/收养时盖 `configDir` + `accountEnv`（provider 键域快照，`{}` 是有效绑定＝账号直连；`undefined`＝旧式行，跟随全局）双章，此后该会话的 spawn（`configFor` 的绑定分支：provider 键域与 `CLAUDE_CONFIG_DIR` 以行上的章为准，章里没有的 provider 键从继承环境删除，手写的会话 env 层仍在章之上）、resume、转录读取（`native-transcript` 的 per-call `configDir`）都按行上的章走 —— A 账号会话与 B 账号会话可并存，全局切换不搬动任何已绑会话的额度与凭据。绑定了别的根的行不因根不同而被 `inScope`/`assertInScope` 拦下（它们的转录与 resume 在自己的根里解析），其 `terminalOwned` 从**那个根自己的** `sessions/` 注册表读（`catalog.refreshForeignPeers`，无绑定行的根不读）。`catalog.list()` 对无章的旧行仍按 active 根过滤。
 
 **排队的不变量**：**队列归 CLI 所有，宿主只做镜像。** CLI 自己有一条命令队列（能力位 `msg_lifecycle_v1`，2.1.220 载荷实测）：任何时候推进流的用户消息都会回一条 `command_lifecycle` 帧 —— `queued`（在跑的回合后面等）→ `started`（被取进某个回合）→ 终态。所以 `send()` **一律立即推流**，绝不宿主侧扣着；`engine.ts` 的 `outbox` 只是这些 uuid 的正文/时间/附件镜像，供页面列出「谁在等」。三条硬约束：
 

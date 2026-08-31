@@ -22,9 +22,13 @@ export interface PeerSession {
   kind: string
 }
 
-/** The registry directory, honoring the same env override the CLI does. */
-function sessionsDir(): string {
-  return join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'sessions')
+/**
+ * The registry directory, honoring the same env override the CLI does.
+ * @param dir - an explicit account root; defaults to the one in force.
+ * @returns the `<root>/sessions` directory path.
+ */
+function sessionsDir(dir?: string): string {
+  return join(dir ?? process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'sessions')
 }
 
 /**
@@ -50,21 +54,24 @@ function isAlive(pid: number): boolean {
  * transcript just happens to be fresh". When several processes hold the
  * same session (a resumed terminal plus a headless run), the last live
  * one read wins — callers only ask whether ANY live writer exists.
+ * @param dir - the account root whose registry to read; defaults to the one
+ *   in force. A session bound to another root still needs its ownership
+ *   answered, and that answer lives in that root's own registry.
  * @returns the live peers; an empty map when the registry is absent or
  *   unreadable, which means nothing is terminal-owned.
  */
-export async function readPeerSessions(): Promise<Map<string, PeerSession>> {
+export async function readPeerSessions(dir?: string): Promise<Map<string, PeerSession>> {
   const peers = new Map<string, PeerSession>()
   let names: string[]
   try {
-    names = await readdir(sessionsDir())
+    names = await readdir(sessionsDir(dir))
   } catch {
     return peers
   }
   for (const name of names) {
     if (!name.endsWith('.json')) continue // Skip the *.key peer-auth secrets.
     try {
-      const raw = JSON.parse(await readFile(join(sessionsDir(), name), 'utf8')) as Partial<PeerSession>
+      const raw = JSON.parse(await readFile(join(sessionsDir(dir), name), 'utf8')) as Partial<PeerSession>
       if (typeof raw.pid !== 'number' || typeof raw.sessionId !== 'string') continue
       if (!isAlive(raw.pid)) continue
       peers.set(raw.sessionId, {

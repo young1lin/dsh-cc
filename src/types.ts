@@ -157,6 +157,18 @@ export interface SessionMeta {
   /** Git branch the CLI recorded for the session, when it knows one. */
   gitBranch?: string
   /**
+   * Provider-scope env captured when the row was created or adopted: the
+   * endpoint, credential, tier-alias, proxy, and timeout keys a spawn started
+   * at that moment would have carried. Together with `configDir` it is the
+   * row's account binding — every later spawn of this session uses the
+   * binding instead of whatever is globally active, so concurrent sessions
+   * on different accounts cannot bleed quota or credentials into each other.
+   * `{}` is a real binding ("account-direct, no provider env"); undefined
+   * marks rows from before bindings existed, which keep following the
+   * globally active account exactly as before.
+   */
+  accountEnv?: Record<string, string>
+  /**
    * A live CLI process (terminal REPL, `claude -p`, another SDK client)
    * currently holds this session open, per the `~/.claude/sessions`
    * registry. The page is read-only for such a session: the other process

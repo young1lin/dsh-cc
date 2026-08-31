@@ -242,6 +242,7 @@ export class CcRuntime {
       this.blobs,
       id => this.drivesNative(id),
       () => this.activeConfigDir(),
+      () => this.providerScopeSnapshot(),
     )
     // The CLI store is read from disk, so the first list is served from the
     // sidecar alone and the broadcast that follows fills in the rest.
@@ -437,6 +438,26 @@ export class CcRuntime {
   }
 
   /**
+   * The provider-scope environment a spawn started right now would carry:
+   * each key's winning layer — config over the inherited environment — with
+   * preset deletions honored. This is the account binding stamped onto every
+   * session row at initialization, so the row can reproduce it on every later
+   * spawn no matter what the global layers say by then.
+   * @returns the provider-scope snapshot; possibly empty (account-direct).
+   */
+  private providerScopeSnapshot(): Record<string, string> {
+    const effective = this.effectiveConfig()
+    const deletes = new Set((effective.envDeletes ?? []).map(key => key.toLowerCase()))
+    const snapshot: Record<string, string> = {}
+    for (const key of PROVIDER_ENV_NAMES) {
+      if (deletes.has(key.toLowerCase())) continue
+      const value = effective.env[key] ?? process.env[key]
+      if (typeof value === 'string' && value !== '') snapshot[key] = value
+    }
+    return snapshot
+  }
+
+  /**
    * The effective config with one session's own layers folded in: its env
    * map, and its reasoning-effort override.
    *
@@ -450,6 +471,36 @@ export class CcRuntime {
   private configFor(session: SessionMeta): ResolvedConfig {
     const base = this.effectiveConfig()
     const effort = this.effortFor(session)
+    // A row with an account binding carries its own provider scope and root:
+    // the stamp replaces the global layers for exactly those keys, so a
+    // session initialized under one account keeps using it after the page
+    // switches to another. The manual per-session env layer stays on top — an
+    // explicit edit outranks the stamp — and the root always comes from the
+    // row itself. Provider keys the stamp does not carry are deleted from the
+    // inherited environment, so one account's credentials cannot leak into
+    // another account's session.
+    if (session.accountEnv !== undefined) {
+      const scope = new Set(PROVIDER_ENV_NAMES.map(key => key.toUpperCase()))
+      const env: Record<string, string> = {}
+      for (const [key, value] of Object.entries(base.env)) {
+        if (!scope.has(key.toUpperCase())) env[key] = value
+      }
+      Object.assign(env, session.accountEnv)
+      const ownRoot = session.configDir ?? base.configDir
+      // CLAUDE_CONFIG_DIR is asserted last: both env editors refuse the key,
+      // so nothing but the row's own root can ever supply it.
+      Object.assign(env, session.env ?? {}, { [CONFIG_DIR_ENV]: ownRoot })
+      const envDeletes = PROVIDER_ENV_NAMES.filter(
+        key => session.accountEnv?.[key] === undefined && session.env?.[key] === undefined,
+      )
+      return {
+        ...base,
+        env,
+        envDeletes,
+        permissionMode: this.permissionModeFor(session),
+        ...(effort !== undefined ? { effort } : {}),
+      }
+    }
     const layered = Object.keys(session.env ?? {}).length > 0
     const env = layered
       // The account root is re-asserted after the session layer: a row
@@ -823,6 +874,10 @@ export class CcRuntime {
           const session = await this.store.create(body ?? {}, {
             cwd: effective.cwd,
             configDir: effective.configDir,
+            // The account binding is captured at initialization on purpose:
+            // later page-level account/preset switches must not reroute this
+            // conversation's quota or credentials (see SessionMeta.accountEnv).
+            accountEnv: this.providerScopeSnapshot(),
           })
           this.broadcastSessions()
           return json(res, { session })
@@ -1287,13 +1342,16 @@ export class CcRuntime {
    * test applied where it must also gate writes. A row's `claudeSessionId`
    * only resolves inside the root it was created under, so spawning it under
    * today's root would resume nothing while the row stays invisible to the
-   * page — an engine running a session nobody can see. Rows written before
-   * accounts existed carry no stamp and belong to the baseline root, exactly
-   * as the catalog reads them.
+   * page — an engine running a session nobody can see. A row with an account
+   * binding is the exception that proves the rule: it carries its own root
+   * and provider scope, so spawning it is spawning it under ITS root, and the
+   * catalog keeps it listed. Rows written before accounts existed carry no
+   * stamp and belong to the baseline root, exactly as the catalog reads them.
    * @param session - the sidecar row a send or spawn targets.
    * @throws {ScopeConflictError} when the row belongs to another account root.
    */
   private assertInScope(session: SessionMeta): void {
+    if (session.accountEnv !== undefined) return
     if (!sameDir(session.configDir ?? baselineConfigDir(), this.activeConfigDir())) {
       throw new ScopeConflictError(SCOPE_CONFLICT_MESSAGE)
     }

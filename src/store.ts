@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs'
 import { appendFile, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
-import type { CcEvent, SessionMeta } from './types.ts'
+import { PROVIDER_ENV_NAMES, type CcEvent, type SessionMeta } from './types.ts'
 
 /** JSONL + index persistence for Claude Code conversations. */
 export class SessionStore {
@@ -103,13 +103,14 @@ export class SessionStore {
   /**
    * Create and persist a new session.
    * @param input - optional name, cwd, and model from the request body.
-   * @param defaults - fallback cwd when the request supplies none, and the
-   *   Claude Code home the row belongs to.
+   * @param defaults - fallback cwd when the request supplies none, the Claude
+   *   Code home the row belongs to, and the provider-scope account binding to
+   *   stamp (see {@link SessionMeta.accountEnv}).
    * @returns the created metadata.
    */
   async create(
     input: { name?: unknown; cwd?: unknown; model?: unknown; env?: unknown },
-    defaults: { cwd: string; configDir: string },
+    defaults: { cwd: string; configDir: string; accountEnv?: Record<string, string> },
   ): Promise<SessionMeta> {
     const now = new Date().toISOString()
     const name = typeof input.name === 'string' && input.name.trim().length > 0
@@ -128,6 +129,16 @@ export class SessionStore {
     // The account root owns CLAUDE_CONFIG_DIR; a per-session copy would point
     // the spawned process at one home while the catalog reads another.
     delete env.CLAUDE_CONFIG_DIR
+    // The account binding is system-written at creation, and provider-scope
+    // only: a stray key can never ride the stamp into a spawn environment.
+    // The empty object is a real binding — "no provider env, account-direct".
+    const accountEnv: Record<string, string> = {}
+    if (typeof defaults.accountEnv === 'object' && defaults.accountEnv !== null) {
+      for (const key of PROVIDER_ENV_NAMES) {
+        const value = defaults.accountEnv[key]
+        if (typeof value === 'string' && value !== '') accountEnv[key] = value
+      }
+    }
     const meta: SessionMeta = {
       id: randomUUID(),
       name,
@@ -140,6 +151,7 @@ export class SessionStore {
       messageCount: 0,
       totalCostUsd: 0,
       configDir: defaults.configDir,
+      accountEnv,
       ...(Object.keys(env).length > 0 ? { env } : {}),
     }
     this.sessions.set(meta.id, meta)
