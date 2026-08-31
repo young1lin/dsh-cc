@@ -169,7 +169,7 @@ export function AccountsPanel(props: {
             <Input
               className="cc-account-dir"
               value={account.dir}
-              placeholder="配置目录，如 C:\Users\me\.claude-work"
+              placeholder="配置目录，如 D:/dev/.claude-work"
               onChange={event => patch(account.id, { dir: event.target.value })}
             />
             <Button
