@@ -102,6 +102,7 @@ function sessionFingerprint(list: SessionMeta[]): string {
     session.model, session.effort ?? '', session.permissionMode ?? '',
     session.gitBranch ?? '', session.lastGoodModel ?? '', session.lastError ?? '',
     session.messageCount, session.totalCostUsd, session.queued ?? 0,
+    JSON.stringify(session.env ?? {}), JSON.stringify(session.accountEnv ?? {}),
     session.terminalOwned === true,
   ].join('')).join('')
 }
@@ -1249,6 +1250,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
         )}
         {envSessionId !== undefined && current !== undefined && current.id === envSessionId && (
           <SessionEnvModal
+            key={`${current.id}:${JSON.stringify(current.env ?? {})}`}
             session={current}
             onClose={() => setEnvSessionId(undefined)}
             onSaved={() => {

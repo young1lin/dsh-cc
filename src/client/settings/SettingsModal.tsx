@@ -15,7 +15,7 @@ import { useEffect, useState, type ReactElement } from 'react'
 import { Button, DisclosureRow, IconDataOutline16, IconSettingsOutline16, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
 import { AccountPanel } from './AccountPanel.tsx'
 import { AccountsPanel } from './AccountsPanel.tsx'
-import { EnvEditor, fromRows, toRows, type EnvRow } from './EnvEditor.tsx'
+import { EnvEditor, fromRows, toRows, validateEnvRows, type EnvRow } from './EnvEditor.tsx'
 import { ProviderForm } from './ProviderForm.tsx'
 import { LAYER_LABELS, omitStructuredKeys, pickStructuredKeys } from './providerFields.ts'
 import { fetchSettings, saveSettings } from '../api/settings.ts'
@@ -122,6 +122,8 @@ registerCss('settings-modal', `
 /* The structured provider form outgrew the default 380px dialog: widen it and let the
    content column scroll internally so the header/footer chrome stays put. */
 .cc-settings-dialog { width: min(560px, 100%); max-height: calc(100vh - 48px); overflow: hidden; }
+/* Doubled class + border-box to beat the host Modal's later content-box cap. */
+.cc-settings-dialog.cc-settings-dialog { box-sizing: border-box; max-height: calc(100dvh - 48px); }
 .cc-settings-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 
 @media (max-height: 640px) {
@@ -183,6 +185,7 @@ export function SettingsModal(props: {
   const [model, setModel] = useState('')
   const [permissionMode, setPermissionMode] = useState('')
   const [env, setEnv] = useState<Record<string, string>>({})
+  const [baseEnv, setBaseEnv] = useState<Record<string, string>>({})
   const [presets, setPresets] = useState<EnvPreset[]>([])
   const [activePresetId, setActivePresetId] = useState('')
   const [presetName, setPresetName] = useState('')
@@ -213,8 +216,11 @@ export function SettingsModal(props: {
         // Structured form and KV editor own disjoint key sets, held as
         // separate state: re-deriving the rows from `env` on every keystroke
         // would rebuild their identities and lose input focus mid-edit.
-        setEnv(pickStructuredKeys(result.settings.env))
-        setAdvancedRows(toRows(omitStructuredKeys(result.settings.env)))
+        const activePreset = result.settings.presets.find(preset => preset.id === result.settings.activePresetId)
+        const shownEnv = activePreset?.env ?? result.settings.env
+        setBaseEnv(result.settings.env)
+        setEnv(pickStructuredKeys(shownEnv))
+        setAdvancedRows(toRows(omitStructuredKeys(shownEnv)))
         setPresets(result.settings.presets)
         setActivePresetId(result.settings.activePresetId)
         setAccounts(result.settings.accounts)
@@ -233,8 +239,9 @@ export function SettingsModal(props: {
    */
   const applyPreset = (preset: EnvPreset | undefined): void => {
     setActivePresetId(preset?.id ?? '')
-    setEnv(pickStructuredKeys(preset?.env ?? {}))
-    setAdvancedRows(toRows(omitStructuredKeys(preset?.env ?? {})))
+    const shownEnv = preset?.env ?? baseEnv
+    setEnv(pickStructuredKeys(shownEnv))
+    setAdvancedRows(toRows(omitStructuredKeys(shownEnv)))
   }
 
   /**
@@ -244,16 +251,22 @@ export function SettingsModal(props: {
    * @returns a promise settling when the save lands.
    */
   const persist = async (): Promise<void> => {
+    const invalid = validateEnvRows(advancedRows)
+    if (invalid !== undefined) throw new Error(invalid)
     // Saving while a preset is active syncs the form back into it: the form
     // IS that preset's editor (fill a token once, it stays in the bundle).
-    const synced = activePresetId !== '' && presets.some(preset => preset.id === activePresetId)
-      ? presets.map(preset => preset.id === activePresetId ? { ...preset, env: formEnv() } : preset)
+    const currentForm = formEnv()
+    const presetActive = activePresetId !== '' && presets.some(preset => preset.id === activePresetId)
+    const synced = presetActive
+      ? presets.map(preset => preset.id === activePresetId ? { ...preset, env: currentForm } : preset)
       : presets
+    const nextBaseEnv = presetActive ? baseEnv : currentForm
     setPresets(synced)
+    setBaseEnv(nextBaseEnv)
     await saveSettings({
       model,
       permissionMode,
-      env: formEnv(),
+      env: nextBaseEnv,
       presets: synced,
       activePresetId,
       accounts,
@@ -323,7 +336,7 @@ export function SettingsModal(props: {
                 className="cc-preset-chip"
                 data-active={activePresetId === preset.id}
                 title={Object.keys(preset.env).length > 0
-                  ? Object.entries(preset.env).map(([key, value]) => `${key}=${value}`).join('\n')
+                  ? `包含 ${Object.keys(preset.env).length} 个配置项；密钥不会在页面回读`
                   : '空预设：移除全部服务商变量'}
                 onClick={() => applyPreset(preset)}
               >
@@ -335,7 +348,7 @@ export function SettingsModal(props: {
                 title="删除此预设"
                 onClick={() => {
                   setPresets(previous => previous.filter(item => item.id !== preset.id))
-                  if (activePresetId === preset.id) setActivePresetId('')
+                  if (activePresetId === preset.id) applyPreset(undefined)
                 }}
               >
                 ×
@@ -400,7 +413,7 @@ export function SettingsModal(props: {
           onToggle={() => setShowAdvanced(previous => !previous)}
         >
           <div className="cc-settings-disclosure-body">
-            <EnvEditor rows={advancedRows} onChange={setAdvancedRows} />
+            <EnvEditor rows={advancedRows} onChange={setAdvancedRows} emptyLabel="尚未添加高级变量" />
           </div>
         </DisclosureRow>
 

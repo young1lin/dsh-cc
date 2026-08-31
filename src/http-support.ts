@@ -12,7 +12,8 @@ import { existsSync, readFileSync } from 'node:fs'
 import { open, readdir, stat } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { dirname, join, resolve } from 'node:path'
-import { PROVIDER_ENV_NAMES } from './types.ts'
+import { isSealedSecret } from './secret-box.ts'
+import { PROVIDER_ENV_NAMES, isSecretEnvKey } from './types.ts'
 import type { DirListing, EffectiveEnvEntry } from './types.ts'
 
 /**
@@ -30,9 +31,6 @@ const CLI_ENV_KEY = /^(ANTHROPIC_|CLAUDE_CODE_|CLAUDE_CONFIG_DIR$|API_TIMEOUT_MS
  * parent session, which must not be rendered onto a settings page.
  */
 const CLI_ENV_INJECTED = /^CLAUDE_CODE_(SESSION_ID|CHILD_SESSION|ENTRYPOINT|EXECPATH|MESSAGING_.*)$/
-
-/** Keys whose values are credentials; the page only ever sees them masked. */
-const SECRET_KEY = /(TOKEN|KEY|SECRET|PASSWORD|COOKIE)$/i
 
 /** Cap on one directory page: a pathological directory must not serialize unbounded. */
 const DIR_PAGE_LIMIT = 1000
@@ -207,7 +205,7 @@ export function effectiveEnvEntries(
   }
   for (const [key, value] of Object.entries(account)) winner.set(key, { value, layer: 'account' })
   return [...winner.entries()]
-    .map(([key, { value, layer, removed: isRemoval }]) => isRemoval === true || !SECRET_KEY.test(key)
+    .map(([key, { value, layer, removed: isRemoval }]) => isRemoval === true || !isSecretEnvKey(key)
       ? { key, value, masked: false, layer }
       : { key, value: maskSecret(value), masked: true, layer })
     .sort((left, right) => left.key.localeCompare(right.key))
@@ -219,6 +217,7 @@ export function effectiveEnvEntries(
  * @returns the masked form, e.g. `90cd…4e83`.
  */
 export function maskSecret(value: string): string {
+  if (isSealedSecret(value)) return '•••••••• · 本机加密'
   if (value.length <= 8) return '••••'
   return `${value.slice(0, 4)}…${value.slice(-4)}`
 }

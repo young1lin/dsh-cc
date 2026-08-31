@@ -16,7 +16,7 @@ import { useState, type ReactElement } from 'react'
 import { Button, Input, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import { registerCss } from '../css.ts'
 import { applyProviderFields, extractProviderFields, findEnvEntry, layerLabel, type ProviderFormFields } from './providerFields.ts'
-import type { ConfigSummary } from '../../types.ts'
+import { SECRET_VALUE_LOCKED, isSecretEnvKey, isSecretPlaceholder, type ConfigSummary } from '../../types.ts'
 
 registerCss('provider-form', `
 .cc-provider-group {
@@ -45,6 +45,23 @@ registerCss('provider-form', `
 }
 
 .cc-provider-field input { width: 100%; }
+
+.cc-provider-secret-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--dsw-alias-label-secondary);
+  font: var(--dsw-font-xxs-12);
+}
+.cc-provider-secret-note::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--dsw-alias-state-success-primary, #16a16b);
+}
+.cc-provider-secret-note.is-locked { color: var(--dsw-alias-state-warning-primary, #b66a00); }
+.cc-provider-secret-note.is-locked::before { background: var(--dsw-alias-state-warning-primary, #b66a00); }
 `)
 
 /**
@@ -64,6 +81,12 @@ function ProviderField(props: {
   reveal?: { revealed: boolean; onToggle(): void }
 }): ReactElement {
   const entry = findEnvEntry(props.config, props.provenanceKey)
+  const secret = isSecretEnvKey(props.provenanceKey)
+  const saved = secret && isSecretPlaceholder(props.value)
+  const locked = props.value === SECRET_VALUE_LOCKED
+  const placeholder = saved
+    ? locked ? '此密钥来自另一台设备；输入新值重新绑定' : '已加密保存；输入新值即可替换'
+    : props.placeholder
   return (
     <label className="cc-field cc-provider-field">
       <span className="cc-provider-field-head">
@@ -74,16 +97,24 @@ function ProviderField(props: {
         <Input
           className="cc-spacer"
           type={props.reveal !== undefined && !props.reveal.revealed ? 'password' : 'text'}
-          placeholder={props.placeholder}
-          value={props.value}
+          placeholder={placeholder}
+          value={saved ? '' : props.value}
+          autoComplete={secret ? 'new-password' : 'off'}
+          spellCheck={false}
           onChange={event => props.onChange(event.target.value)}
         />
-        {props.reveal !== undefined && (
+        {saved && <Button size="sm" onClick={() => props.onChange('')}>移除</Button>}
+        {props.reveal !== undefined && !saved && props.value !== '' && (
           <Button size="sm" onClick={props.reveal.onToggle}>{props.reveal.revealed ? '隐藏' : '显示'}</Button>
         )}
       </span>
       {/* A masked entry (secrets) can never be compared against the raw draft value, so the
           hint is shown only for the plain-text fields where the comparison is meaningful. */}
+      {secret && (saved || props.value !== '') && (
+        <span className={`cc-provider-secret-note${locked ? ' is-locked' : ''}`}>
+          {locked ? '当前密钥无法在本机解密，保存新值后将重新绑定' : saved ? '密钥已由本机凭据系统加密，页面无法回读' : '保存后将绑定当前设备并加密'}
+        </span>
+      )}
       {entry !== undefined && !entry.masked && entry.value !== props.value && (
         <span className="cc-provider-effective">
           当前生效值：<span className="cc-mono">{entry.value || '（空）'}</span>，保存后以此表单为准

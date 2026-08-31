@@ -7,9 +7,9 @@
  * sidebar entry and chat overlay) is discovered through the package's
  * dsh.client declaration; it needs no config row of its own.
  *
- * Configuration (model, proxy, API keys, permission posture) is plain
- * environment + config: edit the profile's cordis.patch.yml dsh-cc row and
- * restart, or set env keys through the row's env map.
+ * Configuration can come from host config or the page. Provider credentials
+ * written by the page are device-encrypted at rest and materialized only for
+ * the spawned Claude process; host-owned cordis/env values remain external.
  *
  * @module dsh-cc
  */

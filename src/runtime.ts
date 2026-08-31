@@ -15,6 +15,7 @@ import {
   restoreConfigDir, sameDir,
 } from './accounts.ts'
 import { loadSettings, normalizePresets, persistSettings } from './settings-file.ts'
+import { redactEnvForWire, retainWireSecrets, sealEnvForStorage } from './secret-box.ts'
 import { probeCatalogOnce } from './model-probe.ts'
 import type { ResolvedConfig } from './config.ts'
 import { SessionEngine, resolveSessionModel, resolveSessionPermissionMode, type EngineHooks, type QueuedMessage, type SendImage } from './engine.ts'
@@ -23,7 +24,7 @@ import { cachedCommands, rememberCommands } from './command-cache.ts'
 import { SessionCatalog, type CatalogRefresh } from './catalog.ts'
 import { fileIndexFor } from './file-index.ts'
 import { gitInfoFor } from './git-info.ts'
-import { effectiveEnvEntries, maskSecret, readDirListing, readSdkVersion, readTextFile } from './http-support.ts'
+import { effectiveEnvEntries, readDirListing, readSdkVersion, readTextFile } from './http-support.ts'
 import { reduceDelta, type LiveTurn } from './live-turn.ts'
 import { deleteNativeSession, forkNativeSession, renameNativeSession } from './native-sessions.ts'
 import { SessionStore } from './store.ts'
@@ -370,14 +371,39 @@ export class CcRuntime {
     this.storeWatchDir = this.storeWatch === undefined ? '' : dir
   }
 
+  /** Browser-safe settings view: secret values become keep-existing sentinels. */
+  private settingsView(): CcSettings {
+    return {
+      ...this.settings,
+      env: redactEnvForWire(this.settings.env),
+      presets: this.settings.presets.map(preset => ({
+        ...preset,
+        env: redactEnvForWire(preset.env),
+      })),
+    }
+  }
+
+  /** Browser-safe session view; no credential or encrypted envelope leaves the host. */
+  private sessionView(session: SessionMeta): SessionMeta {
+    return {
+      ...session,
+      ...(session.env !== undefined ? { env: redactEnvForWire(session.env) } : {}),
+      ...(session.accountEnv !== undefined
+        ? { accountEnv: redactEnvForWire(session.accountEnv) }
+        : {}),
+    }
+  }
+
+  /** Browser-safe form of a complete catalog frame. */
+  private sessionViews(sessions: SessionMeta[]): SessionMeta[] {
+    return sessions.map(session => this.sessionView(session))
+  }
+
   /**
    * The cordis config with page-editable settings layered on top: a non-empty
    * settings field replaces its base counterpart, an empty one keeps the base.
-   *
-   * `env` layers per key rather than wholesale. Replacing the whole map made
-   * one unrelated page edit — a proxy, a timeout — silently retire every
-   * variable the cordis config supplied, endpoint and credential included,
-   * with nothing on screen naming what had just been dropped.
+   * `env` layers per key rather than wholesale so unrelated edits cannot
+   * silently retire an endpoint or credential.
    */
   private effectiveConfig(): ResolvedConfig {
     const overrides = this.settings
@@ -454,7 +480,7 @@ export class CcRuntime {
       const value = effective.env[key] ?? process.env[key]
       if (typeof value === 'string' && value !== '') snapshot[key] = value
     }
-    return snapshot
+    return sealEnvForStorage(this.baseConfig.dataDir, snapshot)
   }
 
   /**
@@ -620,10 +646,16 @@ export class CcRuntime {
       return json(res, { error: '无效的权限模式' }, 400)
     }
     const env: Record<string, string> = {}
+    const envKeys = new Set<string>()
     if (typeof body.env === 'object' && body.env !== null) {
       for (const [key, value] of Object.entries(body.env as Record<string, unknown>)) {
-        if (typeof value !== 'string') continue
-        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue
+        if (typeof value !== 'string' || value === '') continue
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+          return json(res, { error: `环境变量名“${key}”无效` }, 400)
+        }
+        const normalizedKey = key.toUpperCase()
+        if (envKeys.has(normalizedKey)) return json(res, { error: `环境变量名“${key}”重复` }, 400)
+        envKeys.add(normalizedKey)
         if (key === CONFIG_DIR_ENV) {
           return json(res, { error: `${CONFIG_DIR_ENV} 请在「账号」里配置：写成环境变量只会改到 claude 进程，页面读取的会话目录不会跟着走。` }, 400)
         }
@@ -641,7 +673,23 @@ export class CcRuntime {
         return json(res, { error: `预设里的 ${CONFIG_DIR_ENV} 请在「账号」里配置，环境变量层不接收它。` }, 400)
       }
     }
-    const presets = normalizePresets(body.presets)
+    const previousActivePreset = this.settings.presets.find(preset => preset.id === this.settings.activePresetId)
+    const presets = normalizePresets(body.presets).map(preset => {
+      const previous = this.settings.presets.find(candidate => candidate.id === preset.id)?.env
+        ?? previousActivePreset?.env
+        ?? this.settings.env
+      return {
+        ...preset,
+        env: sealEnvForStorage(
+          this.baseConfig.dataDir,
+          retainWireSecrets(preset.env, previous),
+        ),
+      }
+    })
+    const protectedEnv = sealEnvForStorage(
+      this.baseConfig.dataDir,
+      retainWireSecrets(env, this.settings.env),
+    )
     const activePresetId = typeof body.activePresetId === 'string'
       && presets.some(preset => preset.id === body.activePresetId)
       ? body.activePresetId
@@ -662,8 +710,9 @@ export class CcRuntime {
         return json(res, { error: `有 ${busy} 个会话正在运行，等它们结束再改动当前账号的目录。` }, 409)
       }
     }
-    this.settings = { model, permissionMode, env, presets, activePresetId, accounts, activeAccountId }
-    persistSettings(this.baseConfig.dataDir, this.settings)
+    const nextSettings = { model, permissionMode, env: protectedEnv, presets, activePresetId, accounts, activeAccountId }
+    persistSettings(this.baseConfig.dataDir, nextSettings)
+    this.settings = nextSettings
     if (moved) {
       // Same cascade as an explicit switch: move the environment, then drop
       // every answer that came out of the root being left behind.
@@ -686,7 +735,7 @@ export class CcRuntime {
     await this.catalog.refresh()
     this.broadcast({ t: 'hello', config: this.configSummary() })
     this.broadcastSessions()
-    return json(res, { ok: true, settings: this.settings })
+    return json(res, { ok: true, settings: this.settingsView() })
   }
 
   /**
@@ -717,8 +766,9 @@ export class CcRuntime {
     if (busy.length > 0) {
       return json(res, { error: `有 ${busy.length} 个会话正在运行，等它们结束再切换账号。` }, 409)
     }
-    this.settings = { ...this.settings, activeAccountId: id }
-    persistSettings(this.baseConfig.dataDir, this.settings)
+    const nextSettings = { ...this.settings, activeAccountId: id }
+    persistSettings(this.baseConfig.dataDir, nextSettings)
+    this.settings = nextSettings
     // Order matters: the environment must be moved before anything re-reads,
     // and the generation bumped before the detached probes can land.
     this.configGeneration += 1
@@ -825,7 +875,7 @@ export class CcRuntime {
           current: this.settings.model,
         })
       }
-      if (parts[0] === 'settings' && parts.length === 1 && method === 'GET') return json(res, { settings: this.settings })
+      if (parts[0] === 'settings' && parts.length === 1 && method === 'GET') return json(res, { settings: this.settingsView() })
       if (parts[0] === 'settings' && parts.length === 1 && method === 'PUT') {
         return await this.saveSettings(req, res)
       }
@@ -866,7 +916,7 @@ export class CcRuntime {
       if (parts[0] === 'sessions') {
         if (parts.length === 1 && method === 'GET') {
           await this.catalog.refresh()
-          return json(res, { sessions: this.catalog.list() })
+          return json(res, { sessions: this.sessionViews(this.catalog.list()) })
         }
         if (parts.length === 1 && method === 'POST') {
           const body = await readJson(req)
@@ -880,14 +930,14 @@ export class CcRuntime {
             accountEnv: this.providerScopeSnapshot(),
           })
           this.broadcastSessions()
-          return json(res, { session })
+          return json(res, { session: this.sessionView(session) })
         }
         const id = parts[1] ?? ''
         if (parts.length === 2 && method === 'GET') {
           const session = this.store.get(id) ?? await this.catalog.adopt(id)
           if (!session) return json(res, { error: '会话不存在' }, 404)
           return json(res, {
-            session,
+            session: this.sessionView(session),
             events: await this.catalog.transcript(session),
             live: this.liveSnapshot(session.id),
             tasks: this.taskSnapshot(session.id),
@@ -976,17 +1026,27 @@ export class CcRuntime {
           if (!session) return json(res, { error: '会话不存在' }, 404)
           const body = await readJson(req)
           const env: Record<string, string> = {}
+          const envKeys = new Set<string>()
           if (typeof body?.env === 'object' && body.env !== null) {
             for (const [key, value] of Object.entries(body.env as Record<string, unknown>)) {
-              if (typeof value !== 'string') continue
-              if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue
+              if (typeof value !== 'string' || value === '') continue
+              if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+                return json(res, { error: `环境变量名“${key}”无效` }, 400)
+              }
+              const normalizedKey = key.toUpperCase()
+              if (envKeys.has(normalizedKey)) return json(res, { error: `环境变量名“${key}”重复` }, 400)
+              envKeys.add(normalizedKey)
               if (key === CONFIG_DIR_ENV) {
                 return json(res, { error: `${CONFIG_DIR_ENV} 不能按会话覆盖：会话目录是整个插件级的账号选择。` }, 400)
               }
               env[key] = value
             }
           }
-          await this.patchMeta(id, { env: Object.keys(env).length > 0 ? env : undefined })
+          const protectedEnv = sealEnvForStorage(
+            this.baseConfig.dataDir,
+            retainWireSecrets(env, session.env),
+          )
+          await this.patchMeta(id, { env: Object.keys(protectedEnv).length > 0 ? protectedEnv : undefined })
           // Environment is spawn-time: recycle the idle engine so the next
           // message spawns with the new layer. A busy turn finishes first.
           const engine = this.engines.get(id)
@@ -1864,7 +1924,7 @@ export class CcRuntime {
       this.broadcastSessions()
       return
     }
-    this.broadcast({ t: 'session', session })
+    this.broadcast({ t: 'session', session: this.sessionView(session) })
   }
 
   private broadcastSessions(): void {
@@ -1878,7 +1938,7 @@ export class CcRuntime {
     this.sessionsFramePending = true
     setImmediate(() => {
       this.sessionsFramePending = false
-      this.broadcast({ t: 'sessions', sessions: this.catalog.list() })
+      this.broadcast({ t: 'sessions', sessions: this.sessionViews(this.catalog.list()) })
     })
   }
 
@@ -1919,7 +1979,7 @@ export class CcRuntime {
     // alone is a small subset of it, and the rescan only broadcasts when the
     // native store actually moves — so a sidecar-only frame here would leave
     // the page short of every CLI session until something unrelated changed.
-    this.write(res, { t: 'sessions', sessions: this.catalog.list() })
+    this.write(res, { t: 'sessions', sessions: this.sessionViews(this.catalog.list()) })
     this.clients.add(res)
     // With nobody attached the rescan runs slowly, so that cached list can be
     // most of RESCAN_IDLE_MS old. The page gets it immediately anyway — a list

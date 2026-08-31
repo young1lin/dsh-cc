@@ -78,11 +78,19 @@ export function extractProviderFields(env: Record<string, string>): ProviderForm
  */
 export function applyProviderFields(env: Record<string, string>, fields: ProviderFormFields): Record<string, string> {
   const next = { ...env }
+  const keys = PROVIDER_ENV_KEYS
+  // The form edits whichever credential currently wins. If a legacy map has
+  // both credential variables, retain the secondary one instead of silently
+  // deleting a still-valid fallback on any unrelated field edit.
+  const secondaryCredentialKey = fields.apiKeySourceKey === keys.authToken ? keys.apiKey : keys.authToken
+  const secondaryCredential = env[secondaryCredentialKey]
   for (const key of STRUCTURED_ENV_KEYS) delete next[key]
+  if (secondaryCredential !== undefined && secondaryCredential !== '') {
+    next[secondaryCredentialKey] = secondaryCredential
+  }
   const set = (key: string, value: string): void => {
     if (value.trim() !== '') next[key] = value
   }
-  const keys = PROVIDER_ENV_KEYS
   set(keys.baseUrl, fields.baseUrl)
   set(fields.apiKeySourceKey, fields.apiKeyValue)
   set(keys.model, fields.model)

@@ -65,6 +65,47 @@ export type ProviderEnvField = keyof typeof PROVIDER_ENV_KEYS
  */
 export const PROVIDER_ENV_NAMES: readonly string[] = Object.values(PROVIDER_ENV_KEYS)
 
+/** Values protected at rest with the current device's native credential facility. */
+export const PROTECTED_ENV_NAMES: readonly string[] = [
+  PROVIDER_ENV_KEYS.authToken,
+  PROVIDER_ENV_KEYS.apiKey,
+]
+
+/** Opaque wire value meaning a secret exists and must be retained on save. */
+export const SECRET_VALUE_SET = '__DSH_CC_SECRET_SET_V1__'
+
+/** Opaque wire value meaning encrypted data came from another device and cannot be opened here. */
+export const SECRET_VALUE_LOCKED = '__DSH_CC_SECRET_LOCKED_V1__'
+
+/**
+ * Whether an environment key names credential material that must never be
+ * returned to the browser or exported in portable JSON.
+ * @param key - environment variable name.
+ * @returns true for token/key/secret/password/cookie variables.
+ */
+export function isSecretEnvKey(key: string): boolean {
+  return /(TOKEN|KEY|SECRET|PASSWORD|COOKIE)$/i.test(key)
+}
+
+/**
+ * Whether an environment key belongs to the narrow provider credential scope
+ * encrypted at rest by dsh-cc.
+ * @param key - environment variable name.
+ * @returns true for Anthropic bearer-token and API-key variables.
+ */
+export function isProtectedEnvKey(key: string): boolean {
+  return PROTECTED_ENV_NAMES.some(name => name.toUpperCase() === key.toUpperCase())
+}
+
+/**
+ * Whether a browser-supplied secret value is the keep-existing sentinel.
+ * @param value - submitted environment value.
+ * @returns true when the host must retain its existing secret.
+ */
+export function isSecretPlaceholder(value: string): boolean {
+  return value === SECRET_VALUE_SET || value === SECRET_VALUE_LOCKED
+}
+
 /**
  * Image media types mapped onto the file extension each one is stored under.
  * Shared by the blob store (forward direction) and the blob-serving URL

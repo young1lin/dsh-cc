@@ -75,6 +75,7 @@ node 半区各模块（读懂 catalog 这一层是理解全局的关键）：
 ## 硬性约束
 
 - **测试只允许走 GLM 中转**（用户配额保护；GLM env 全量见 memory）。账号直连预设只属于用户本人操作。
+- **密钥存储边界**：dsh-cc 自己写入的 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` 在 `settings.json`、预设和会话 `index.json` 中只能是 `dshcc1.*` 设备密文；内存配置同样保持密文，只有 `engine.ts` 生成 spawn env 时可调用 `openEnvForSpawn`。GET / SSE 只能发占位符，PUT 占位符表示保留，导出必须省略密钥。Windows 走 DPAPI CurrentUser，macOS 走 Keychain，Linux 优先 Secret Service、无密钥环时走 machine-id 后备。cordis 配置与父进程 env 是外部边界，不伪称已加密。
 - **预设键域语义**：`activePresetId` 激活时 `PROVIDER_ENV_KEYS` 键域由预设独占——预设之内的键替换一切层、之外的键从生效环境**删除**（`ResolvedConfig.envDeletes` → engine spawn 剥离，含大小写变体）。这是逐键覆盖表达不了的删除语义，别绕开它去改 spawn env。
 - **`/cc/api` 前缀必须校验 Host 为回环**（`localhost`/`127.0.0.1`/`::1`）：`fs/file`、`fs/list` 能读全盘，宿主 webserver 不校验前缀路由的 Host，没有这道闸 DNS rebinding 就能跨站读文件。动 handle() 入口时保住它。
 - `~/.claude/sessions/` 只读观察：不写不删，不连 `messagingSocketPath`，不碰 `*.key`（PAKE 私有协议，无稳定性承诺）。

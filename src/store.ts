@@ -7,10 +7,11 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { appendFile, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
-import { PROVIDER_ENV_NAMES, type CcEvent, type SessionMeta } from './types.ts'
+import { isSealedSecret, sealEnvForStorage, stripProtectedEnv } from './secret-box.ts'
+import { PROVIDER_ENV_NAMES, isProtectedEnvKey, type CcEvent, type SessionMeta } from './types.ts'
 
 /** JSONL + index persistence for Claude Code conversations. */
 export class SessionStore {
@@ -48,13 +49,17 @@ export class SessionStore {
       console.warn(`dsh-cc: unreadable session index, moved to ${aside}`, error)
       return
     }
-    for (const meta of raw) {
+    let migrated = false
+    for (const rawMeta of raw) {
       // No engine survives the process, so a persisted busy flag is stale.
-      if (meta.status === 'busy') meta.status = 'idle'
+      if (rawMeta.status === 'busy') rawMeta.status = 'idle'
+      migrated ||= hasPlainProtectedSecret(rawMeta.env) || hasPlainProtectedSecret(rawMeta.accountEnv)
+      const meta = this.protectLoadedMeta(rawMeta)
       this.sessions.set(meta.id, meta)
       // Seed the counter from the transcript tail so ids stay unique across restarts.
       this.seq.set(meta.id, this.lastSeq(meta.id))
     }
+    if (migrated) this.writeIndexSync()
   }
 
   /**
@@ -139,6 +144,8 @@ export class SessionStore {
         if (typeof value === 'string' && value !== '') accountEnv[key] = value
       }
     }
+    const protectedEnv = sealEnvForStorage(this.dataDir, env)
+    const protectedAccountEnv = sealEnvForStorage(this.dataDir, accountEnv)
     const meta: SessionMeta = {
       id: randomUUID(),
       name,
@@ -151,8 +158,8 @@ export class SessionStore {
       messageCount: 0,
       totalCostUsd: 0,
       configDir: defaults.configDir,
-      accountEnv,
-      ...(Object.keys(env).length > 0 ? { env } : {}),
+      accountEnv: protectedAccountEnv,
+      ...(Object.keys(protectedEnv).length > 0 ? { env: protectedEnv } : {}),
     }
     this.sessions.set(meta.id, meta)
     this.seq.set(meta.id, 0)
@@ -192,10 +199,11 @@ export class SessionStore {
     const existing = this.sessions.get(meta.id)
       ?? (meta.claudeSessionId !== undefined ? this.findByClaudeId(meta.claudeSessionId) : undefined)
     if (existing !== undefined) return existing
-    this.sessions.set(meta.id, meta)
-    this.seq.set(meta.id, this.lastSeq(meta.id))
+    const protectedMeta = this.protectMeta(meta)
+    this.sessions.set(protectedMeta.id, protectedMeta)
+    this.seq.set(protectedMeta.id, this.lastSeq(protectedMeta.id))
     await this.persistIndex()
-    return meta
+    return protectedMeta
   }
 
   /**
@@ -213,6 +221,8 @@ export class SessionStore {
     const meta = this.sessions.get(id)
     if (!meta) return undefined
     const applied = { ...patch }
+    if (applied.env !== undefined) applied.env = sealEnvForStorage(this.dataDir, applied.env)
+    if (applied.accountEnv !== undefined) applied.accountEnv = sealEnvForStorage(this.dataDir, applied.accountEnv)
     if (typeof applied.claudeSessionId === 'string' && applied.claudeSessionId !== meta.claudeSessionId) {
       const holder = this.findByClaudeId(applied.claudeSessionId)
       if (holder !== undefined && holder.id !== id) {
@@ -371,7 +381,49 @@ export class SessionStore {
   private async writeIndexOnce(): Promise<void> {
     const target = join(this.dataDir, 'index.json')
     const tmp = `${target}.${randomUUID()}.tmp`
-    await writeFile(tmp, JSON.stringify(this.list(), null, 2), 'utf8')
+    const rows = this.list().map(meta => this.protectMeta(meta))
+    await writeFile(tmp, JSON.stringify(rows, null, 2), { encoding: 'utf8', mode: 0o600 })
     await rename(tmp, target)
   }
+
+  /** Rewrite a legacy plaintext index during synchronous startup migration. */
+  private writeIndexSync(): void {
+    const target = join(this.dataDir, 'index.json')
+    const tmp = `${target}.${randomUUID()}.tmp`
+    const rows = this.list().map(meta => this.protectMeta(meta))
+    writeFileSync(tmp, JSON.stringify(rows, null, 2), { encoding: 'utf8', mode: 0o600 })
+    renameSync(tmp, target)
+  }
+
+  /** Seal a loaded legacy row, dropping plaintext credentials if native protection is unavailable. */
+  private protectLoadedMeta(meta: SessionMeta): SessionMeta {
+    try {
+      return this.protectMeta(meta)
+    } catch (error) {
+      console.warn(`dsh-cc: 会话 ${meta.id} 的旧版明文密钥无法设备加密，已移除，请在页面重新输入`, error)
+      return this.protectMeta({
+        ...meta,
+        ...(meta.env !== undefined ? { env: stripProtectedEnv(meta.env) } : {}),
+        ...(meta.accountEnv !== undefined ? { accountEnv: stripProtectedEnv(meta.accountEnv) } : {}),
+      })
+    }
+  }
+
+  /** Return a metadata copy whose persistable credential maps are sealed. */
+  private protectMeta(meta: SessionMeta): SessionMeta {
+    return {
+      ...meta,
+      ...(meta.env !== undefined ? { env: sealEnvForStorage(this.dataDir, meta.env) } : {}),
+      ...(meta.accountEnv !== undefined
+        ? { accountEnv: sealEnvForStorage(this.dataDir, meta.accountEnv) }
+        : {}),
+    }
+  }
+}
+
+/** Whether a map still carries a legacy plaintext protected credential. */
+function hasPlainProtectedSecret(env: Record<string, string> | undefined): boolean {
+  if (env === undefined) return false
+  return Object.entries(env).some(([key, value]) =>
+    isProtectedEnvKey(key) && value !== '' && !isSealedSecret(value))
 }

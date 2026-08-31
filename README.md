@@ -135,6 +135,8 @@ Claude Code 把一个账号的全部家当放在同一个根目录下：凭证�
 
 聊天页面内建的设置面板（SettingsModal）读写 `GET/PUT /cc/api/settings`，持久化到 `dataDir/settings.json`，可改默认模型、`permissionMode` 与环境变量。保存即时生效：空闲引擎被回收、下一条消息用新配置起进程，无需重启 dsh（忙碌回合先跑完）。非空字段覆盖 cordis 配置的同名字段，留空则回落到 cordis 层；`env` 按键合并而非整块替换。
 
+页面写入的 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` 不以明文落盘：Windows 使用当前用户 DPAPI 包裹随机 AES 设备密钥；macOS 使用 Keychain 中的随机 AES 密钥；Linux 优先使用 Secret Service，缺少桌面密钥环时使用“随机本地种子 + machine-id”设备绑定后备。`settings.json`、预设以及会话索引里的账号章/会话 env 只保存 `dshcc1.*` 密文，旧版明文在首次加载时原地迁移；若本机凭据设施不可用则闭锁移除旧明文并要求在页面重新输入，不让插件整体失效。密钥只在启动 Claude 子进程前于内存中解开。GET / SSE 只返回“已设置”占位符，页面不能回读明文，安全导出会省略密钥，所以复制配置到另一台设备后必须重新输入。cordis 补丁和父进程环境由用户/宿主管理，不在插件的落盘加密边界内。
+
 预设（presets）是命名的服务商环境包：`activePresetId` 指向其一时，`PROVIDER_ENV_KEYS` 键域内预设即全部真相——预设里的键替换各层、没列的键从生效环境删除（spawn 时逐键剥离，含大小写变体），这样「账号直连」才能在 shell 里导出了网关凭证的机器上真正回到账号登录。`/cc/api` 前缀整体校验 Host 必须为本机回环，堵住 DNS rebinding 经由 `fs/file`、`fs/list` 读任意文件的通路。
 
 常用环境变量参考：
@@ -194,20 +196,20 @@ dsh-cc（仓库根目录）
 |---|---|---|
 | GET | /cc/api/config | 生效配置摘要：数据目录、默认 cwd、模型、权限模式、SDK 版本；环境变量逐键列出并标注来源层（进程 / 插件 / 页面设置），以 TOKEN / KEY / SECRET / PASSWORD / COOKIE 结尾的键打码，其余原样返回 |
 | GET | /cc/api/models | 当前全局配置下的模型目录（由 CLI / 网关解析；`available: false` 表示无 CLI 应答，回落静态别名） |
-| GET | /cc/api/settings | 读取页面可编辑设置层（模型 / permissionMode / env） |
-| PUT | /cc/api/settings | 替换页面可编辑设置层（含账号列表）；持久化到 dataDir/settings.json 并即时生效 |
+| GET | /cc/api/settings | 读取页面可编辑设置层（模型 / permissionMode / env）；密钥值只返回不可回读的“已设置/设备不匹配”占位符 |
+| PUT | /cc/api/settings | 替换页面可编辑设置层（含账号列表）；密钥占位符表示保留原值，新密钥先设备加密再持久化到 dataDir/settings.json，并即时生效 |
 | POST | /cc/api/accounts/active | 切换当前账号根目录（`{id}`，空 id = 回默认）；有会话在跑返回 409 |
 | POST | /cc/api/images | 上传一张图片（原始字节 + content-type，≤ 5MB），返回内容寻址引用 |
 | GET | /cc/api/blobs/:id.:ext | 回读已存图片（immutable 长缓存） |
 | GET | /cc/api/fs/list?path= | 工作目录选择器的目录列表（无 path 列盘符根） |
 | GET | /cc/api/fs/index?path= | @ 提及菜单的项目文件索引：path 下的一次有界遍历（5000 行 / 层 2000 / 深 16，忽略依赖与构建目录），工作目录相对路径 + 截断标记；宿主侧短暂缓存 |
 | GET | /cc/api/fs/file?path= | 读取文本文件最新内容（≤2MB，超出截断；二进制拒绝） |
-| GET | /cc/api/sessions | 会话列表（含 CLI 原生会话；`terminalOwned` 标注终端持有） |
+| GET | /cc/api/sessions | 会话列表（含 CLI 原生会话；`terminalOwned` 标注终端持有）；env/accountEnv 密钥只含占位符，SSE 同样不传明文或密文 |
 | POST | /cc/api/sessions | 新建会话（可带名称 / cwd / 模型）；创建时把当时生效的账号根目录与服务商键域盖成该会话的绑定章（`accountEnv` + `configDir`），之后的 spawn 永远用它 |
 | GET | /cc/api/sessions/:id | 会话详情 + 转录（尾部 800 条）+ 进行中回合快照 + 任务表快照 |
 | DELETE | /cc/api/sessions/:id | 删除会话（连同 CLI 原生转录）；原生存储删除失败（如 Windows 下文件被终端进程占用）时返回 409 + error，会话保留 |
 | PUT | /cc/api/sessions/:id/name | 重命名（同步改 CLI 记录，`claude --resume` 列表同名；手动命名后永不被自动命名覆盖） |
-| PUT | /cc/api/sessions/:id/env | 会话级环境层；空闲引擎即时回收，下一条消息用新环境起进程 |
+| PUT | /cc/api/sessions/:id/env | 会话级环境层；密钥设备加密、占位符保留原值；空闲引擎即时回收，下一条消息用新环境起进程 |
 | POST | /cc/api/sessions/:id/messages | 发送消息（可带图片引用）；一律立即推给 CLI，回合运行中由 CLI 的命令队列排队、本轮结束时整批合并成一个回合发出（`queued` 计数随 sessions 帧下发）；终端持有（terminalOwned）的会话返回 409 |
 | GET | /cc/api/sessions/:id/queue | CLI 报告为「在等」的消息（uuid + 正文 + 入队时间 + 附件数），投递顺序 |
 | DELETE | /cc/api/sessions/:id/queue/:uuid | 撤回一条排队消息（走 CLI 原生 dequeue）；已被取进回合则返回 404 |

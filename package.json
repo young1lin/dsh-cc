@@ -34,7 +34,8 @@
     "build": "tsc --noEmit && tsdown",
     "watch": "tsdown --watch",
     "smoke": "node scripts/client-smoke.mjs",
-    "prepublishOnly": "pnpm run build && pnpm run smoke && pnpm pack --dry-run"
+    "secret-contract": "node --experimental-transform-types scripts/secret-contract.mjs",
+    "prepublishOnly": "pnpm run build && pnpm run smoke && pnpm run secret-contract && pnpm pack --dry-run"
   },
   "engines": {
     "node": ">=22"

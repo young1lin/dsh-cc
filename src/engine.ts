@@ -25,6 +25,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk'
 import type { ResolvedConfig } from './config.ts'
 import { mentionBlocks } from './mentions.ts'
+import { openEnvForSpawn } from './secret-box.ts'
 import { runShell } from './shell-run.ts'
 import { shellPolicyFor } from './shell-policy.ts'
 import type {
@@ -1249,12 +1250,15 @@ export class SessionEngine {
       delete env[key.toLowerCase()]
       delete env[key.toUpperCase()]
     }
-    return env
+    // dsh-cc-managed credentials stay as opaque envelopes throughout storage,
+    // API handling, layering, and stale-engine comparison. This is the sole
+    // materialization boundary: plaintext lives only in the child env object
+    // immediately before the SDK spawns Claude Code.
+    return openEnvForSpawn(this.config.dataDir, env)
   }
 
   private ensureStarted(): void {
     if (this.started) return
-    this.started = true
     const model = resolveSessionModel(this.startSpec.model, this.config.model)
     const permissionMode = resolveSessionPermissionMode(this.startSpec.permissionMode, this.config.permissionMode)
     const options: Options = {
@@ -1280,8 +1284,10 @@ export class SessionEngine {
       ...(this.config.executablePath ? { pathToClaudeCodeExecutable: this.config.executablePath } : {}),
       ...(this.claudeSessionId ? { resume: this.claudeSessionId } : {}),
     }
-    this.query = query({ prompt: this.input, options })
-    void this.consume(this.query)
+    const started = query({ prompt: this.input, options })
+    this.query = started
+    this.started = true
+    void this.consume(started)
   }
 
   /**
