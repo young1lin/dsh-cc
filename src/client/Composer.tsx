@@ -403,14 +403,6 @@ export const Composer = memo(function Composer(props: {
     if (props.readOnly === true) setMenu(undefined)
   }, [props.readOnly])
 
-  // A recalled queued message re-enters the draft at its end, on a newline —
-  // never over whatever the user is typing when the recall lands.
-  useEffect(() => {
-    const request = props.restoreRequest
-    if (request === undefined) return
-    setValue(previous => (previous === '' ? request.text : previous + '\n' + request.text))
-  }, [props.restoreRequest])
-
   // History recall, live only while navigating: the entry list snapshot,
   // the cursor into it (newest = 0, -1 = the stashed-draft position below
   // the newest), and the draft put aside on the way in. Editing, sending,
@@ -443,6 +435,17 @@ export const Composer = memo(function Composer(props: {
     setMenu(undefined)
     recallRef.current = null
   }, [props.sessionId])
+
+  // A recalled message re-enters the draft at its end, on a newline — never
+  // over whatever the user is typing when the recall lands. Declared AFTER
+  // the session-switch draft adoption above on purpose: a restore that rides
+  // a switch (a rewind's edit-and-resend prefill) must land on the new
+  // session's adopted draft, not be clobbered by it.
+  useEffect(() => {
+    const request = props.restoreRequest
+    if (request === undefined) return
+    setValue(previous => (previous === '' ? request.text : previous + '\n' + request.text))
+  }, [props.restoreRequest])
 
   // Closing the surface must not eat the tail of the debounce window: the
   // last <400ms of typing is flushed on unmount too.

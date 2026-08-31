@@ -196,6 +196,26 @@ export function rewindApply(id: string, userMessageId: string): Promise<RewindRe
 }
 
 /**
+ * POST /sessions/:id/rewind-apply — rewind the CONVERSATION to one user
+ * message: the session continues from the anchor, everything after it is
+ * discarded, and the session-level settings (model / env / account binding)
+ * carry over. Optionally restores the tracked files to the same point first.
+ * @param id - session id.
+ * @param body - the anchor message plus whether files roll back too.
+ * @returns the rewound session's id (a new native id under the same name)
+ *   and a warning string when part of the operation needs manual attention.
+ */
+export function rewindConversation(
+  id: string,
+  body: { userMessageId: string; restoreFiles: boolean },
+): Promise<{ sessionId: string; warning?: string }> {
+  return api<{ sessionId: string; warning?: string }>(`/sessions/${id}/rewind-apply`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+/**
  * Upload one pasted or dropped image, returning the reference to attach to a
  * message. The body is the raw file; the server reads its type from the
  * `content-type` header rather than parsing a multipart envelope.

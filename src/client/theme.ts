@@ -443,6 +443,34 @@ body.cc-resizing { cursor: col-resize; user-select: none; }
   color: var(--dsw-alias-state-warn-primary);
 }
 
+/* The rewind dialog's file-restore checkbox row: title + reason/stats under
+   it, dimmed to inert when the preview refused (cold engine, no tracking). */
+.cc-rewind-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.cc-rewind-check:hover { background: var(--dsw-alias-bg-layer-1); }
+
+.cc-rewind-check input {
+  margin-top: 3px;
+  accent-color: var(--dsw-alias-brand-primary);
+}
+
+.cc-rewind-check[data-disabled] { cursor: default; opacity: 0.6; }
+
+.cc-rewind-check[data-disabled]:hover { background: transparent; }
+
+.cc-rewind-check span { display: flex; flex-direction: column; gap: 1px; }
+
+.cc-rewind-check-title { font: var(--dsw-font-xs-13); color: var(--dsw-alias-label-primary); }
+
+.cc-rewind-check-copy { font: var(--dsw-font-xxs-12); color: var(--dsw-alias-label-tertiary); }
+
 .cc-mono {
   font: var(--dsw-font-markdown-code-block-small);
   font-family: var(--ds-font-family-code);

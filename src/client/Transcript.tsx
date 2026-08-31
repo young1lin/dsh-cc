@@ -16,7 +16,6 @@
 import { memo, useEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from 'react'
 import {
   DisclosureRow,
-  IconBranchOutline16,
   IconCheckOutline16,
   IconCopyOutline16,
   IconRefreshOutline16,
@@ -111,11 +110,13 @@ registerCss('transcript', `
   color: var(--dsw-alias-label-tertiary);
 }
 
-/* Turn tail: the same quiet stats strip the host closes a turn with. */
+/* Turn tail: the host's own turn tail starts at the LEFT (copy action,
+   then the stats), so the strip stretches instead of centering. */
 .cc-tail {
-  align-self: center;
+  align-self: stretch;
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 4px 10px;
   padding: 2px 0 6px;
   font: var(--dsw-font-xxs-12);
@@ -196,13 +197,16 @@ registerCss('transcript', `
 
 /* Assistant prose segment + its hover copy row. The row is reserved (no
    layout shift) but transparent until the segment is hovered — the same
-   reveal contract the user rows use. */
+   reveal contract the user rows use. AI-side actions hug the LEFT edge
+   (the host's own assistant rows do; user rows hug the right), with the
+   host's -6px optical pull so the glyph lines up with the text column. */
 .cc-assistant-wrap { align-self: stretch; }
 
 .cc-msg-actions {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: flex-start;
+  margin-left: -6px;
   gap: 8px;
   height: calc(26px + var(--dsh-content-font-delta, 0px));
   opacity: 0;
@@ -491,7 +495,6 @@ function EventItem(props: {
   commands: readonly SlashCommand[]
   buildTurnText?: (event: Extract<CcEvent, { kind: 'user' }>) => string
   buildReplyText?: (event: Extract<CcEvent, { kind: 'result' }>) => string
-  onFork?: (event: Extract<CcEvent, { kind: 'user' }>) => void
   onRewind?: (event: Extract<CcEvent, { kind: 'user' }>) => void
 }): ReactElement | null {
   const { event } = props
@@ -546,13 +549,8 @@ function EventItem(props: {
                 build={() => props.buildTurnText?.(event) ?? ''}
               />
             )}
-            {event.nativeMessageId !== undefined && props.onFork !== undefined && (
-              <IconAction label="分叉：从此消息开新会话" onClick={() => { props.onFork?.(event) }}>
-                <IconBranchOutline16 />
-              </IconAction>
-            )}
             {event.nativeMessageId !== undefined && props.onRewind !== undefined && (
-              <IconAction label="回滚文件：恢复到此消息时" onClick={() => { props.onRewind?.(event) }}>
+              <IconAction label="回退：对话回到这条消息之前，内容填回输入框" onClick={() => { props.onRewind?.(event) }}>
                 <IconRefreshOutline16 />
               </IconAction>
             )}
@@ -610,19 +608,19 @@ function EventItem(props: {
       const parts = tailParts(event)
       return (
         <div className="cc-tail">
+          {/* Host-parity tail copy LEADS the row (host order: copy action,
+              then the stats), the turn's whole prose as one text. */}
+          {props.buildReplyText !== undefined && (
+            <span className="cc-msg-actions">
+              <CopyAction label="复制整段回复" build={() => props.buildReplyText?.(event) ?? ''} />
+            </span>
+          )}
           {parts.map((part, index) => (
             <span key={part}>
               {index > 0 && <span className="cc-tail-sep"> · </span>}
               {part}
             </span>
           ))}
-          {/* Host-parity tail copy: the turn's whole prose as one text, the
-              same thing the host's turn tail writes. */}
-          {props.buildReplyText !== undefined && (
-            <span className="cc-msg-actions">
-              <CopyAction label="复制整段回复" build={() => props.buildReplyText?.(event) ?? ''} />
-            </span>
-          )}
         </div>
       )
     }
@@ -679,7 +677,7 @@ function ToolItem(props: { item: Extract<Item, { k: 'tool' }>; cwd: string | und
  * delta.
  * @param props - the ordered events, the session's cached slash commands
  *   (the user row's blue command token is best-effort: no cache, no blue),
- *   the optional fork / file-rewind callbacks for user rows that carry a
+ *   the optional rewind callback for user rows that carry a
  *   native message id, and the parent's ref to the in-flight turn so「复制
  *   回合」on the newest row includes what is still streaming.
  * @returns the transcript nodes.
@@ -687,7 +685,6 @@ function ToolItem(props: { item: Extract<Item, { k: 'tool' }>; cwd: string | und
 export const Transcript = memo(function Transcript(props: {
   events: CcEvent[]
   commands: readonly SlashCommand[]
-  onFork?: (event: Extract<CcEvent, { kind: 'user' }>) => void
   onRewind?: (event: Extract<CcEvent, { kind: 'user' }>) => void
   liveRef?: { readonly current: LiveTurnState | undefined }
 }): ReactElement {
@@ -716,7 +713,6 @@ export const Transcript = memo(function Transcript(props: {
             commands={props.commands}
             buildTurnText={buildTurnText}
             buildReplyText={buildReplyText}
-            onFork={props.onFork}
             onRewind={props.onRewind}
           />)}
       {viewPath !== undefined && <FileViewer path={viewPath} onClose={() => setViewPath(undefined)} />}

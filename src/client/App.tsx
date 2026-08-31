@@ -34,8 +34,8 @@ import { OverlayContext, useOverlay, type OverlaySignal } from './overlay.ts'
 import { connectEvents } from './api/http.ts'
 import { answerDialog, answerPermission, fetchCommands, reloadCommands } from './api/interaction.ts'
 import {
-  backgroundTask, createSession, deleteSession, fetchSession, fetchSessions, forkSession, renameSession,
-  rewindApply, rewindPreview, sendMessage, stopSession, stopTask, type RewindResult,
+  backgroundTask, createSession, deleteSession, fetchSession, fetchSessions, renameSession,
+  rewindConversation, rewindPreview, sendMessage, stopSession, stopTask, type RewindResult,
 } from './api/sessions.ts'
 import { fetchConfig } from './api/settings.ts'
 import { fetchContext, fetchGitInfo, fetchUsage, setPermissionMode, setEffort, type ContextUsage, type GitInfo, type UsageInfo } from './api/telemetry.ts'
@@ -59,16 +59,24 @@ interface PendingDialog {
 }
 
 /**
- * One file-rewind in flight through its confirm popover: the anchor message,
- * the preview the CLI answered with, and whether the apply already ran (the
- * popover then shows the result posture with the CLI's own skipped-links
- * report instead of the confirm buttons).
+ * One rewind in flight through its dialog: the anchor user message (whose
+ * text rides back into the composer once the rewound session opens — the
+ * CLI /rewind edit-and-resend semantics), the files preview when a live
+ * engine answered, and the file-restore checkbox it feeds.
  */
 interface RewindTarget {
   sessionId: string
   userMessageId: string
-  result: RewindResult
-  applied: boolean
+  /** The anchor's full text; the dialog quotes its first line, the composer gets all of it. */
+  anchorText: string
+  /** The anchor's image count, so the dialog can warn they need re-attaching. */
+  anchorImages: number
+  /** The files preview once it lands; absent while loading or refused. */
+  result?: RewindResult
+  /** Why the files preview refused (cold engine, no checkpoints), when it did. */
+  filesRefusal?: string
+  /** Whether the rewind also restores the tracked files; forced off on refusal. */
+  restoreFiles: boolean
 }
 
 /** One session's folded live turn plus the delta counter it was folded to. */
@@ -166,6 +174,24 @@ export function failedRetryText(events: readonly CcEvent[]): string | undefined 
     if (event?.kind === 'user') return event.text === '' ? undefined : event.text
   }
   return undefined
+}
+
+/**
+ * The file-restore checkbox's description line: the refusal reason when the
+ * preview was refused, the preview stats once it landed, a loading note
+ * before that.
+ * @param target - the dialog's rewind target.
+ * @returns the copy under the checkbox title.
+ */
+function filesCheckCopy(target: RewindTarget): string {
+  if (target.filesRefusal !== undefined) return `不可用：${target.filesRefusal}`
+  if (target.result === undefined) return '正在读取文件改动预览…（回滚不经过回收站）'
+  const files = target.result.filesChanged?.length ?? 0
+  const { insertions, deletions } = target.result
+  const lines = insertions !== undefined || deletions !== undefined
+    ? `（+${insertions ?? 0} 行 / -${deletions ?? 0} 行）`
+    : ''
+  return `将恢复 ${files} 个文件${lines}；改动不经过回收站`
 }
 
 function readCommandCache(): CommandCache | undefined {
@@ -1058,49 +1084,55 @@ export function CcApp(props: { onClose(): void }): ReactElement {
     const id = currentIdRef.current
     if (id !== undefined) backgroundTask(id, taskId).catch(fail)
   }, [fail])
-  // 时间旅行两入口：都从 refs 读当前会话（Transcript 是 memo 组件，回调必须
-  // 稳定，否则每帧流式重渲都会击穿整列转录的 memo）。
-  const forkFrom = useCallback((event: Extract<CcEvent, { kind: 'user' }>): void => {
+  // 回退入口：从 refs 读当前会话（Transcript 是 memo 组件，回调必须稳定，
+  // 否则每帧流式重渲都会击穿整列转录的 memo）。
+  const rewindFrom = useCallback((event: Extract<CcEvent, { kind: 'user' }>): void => {
     const id = currentIdRef.current
     const messageId = event.nativeMessageId
     if (id === undefined || messageId === undefined) return
-    forkSession(id, { upToMessageId: messageId })
+    setRewindTarget({
+      sessionId: id,
+      userMessageId: messageId,
+      anchorText: event.text,
+      anchorImages: event.images?.length ?? 0,
+      restoreFiles: true,
+    })
+    // The files preview is best-effort: a cold engine, or one without file
+    // checkpoints, refuses, and the dialog then disables the file checkbox
+    // with the refusal as the reason.
+    rewindPreview(id, messageId)
       .then(result => {
+        setRewindTarget(previous => previous !== undefined && previous.userMessageId === messageId
+          ? { ...previous, result }
+          : previous)
+      })
+      .catch((cause: unknown) => {
+        const message = cause instanceof Error ? cause.message : String(cause)
+        setRewindTarget(previous => previous !== undefined && previous.userMessageId === messageId
+          ? { ...previous, filesRefusal: message, restoreFiles: false }
+          : previous)
+      })
+  }, [])
+  const applyRewind = (): void => {
+    const target = rewindTarget
+    if (target === undefined) return
+    rewindConversation(target.sessionId, {
+      userMessageId: target.userMessageId,
+      restoreFiles: target.restoreFiles,
+    })
+      .then(result => {
+        // The rewound conversation is a new session under the same name:
+        // switch to it, retire the old row via a direct list read, and put
+        // the anchor's text back into the composer for edit-and-resend.
         setCurrentId(result.sessionId)
-        // The fork route refreshed the catalog before answering, but its SSE
-        // frame and this response race; one direct list read settles the new
-        // row even when the frame was lost on a stalled stream.
+        setRewindTarget(undefined)
+        recallQueuedText(target.anchorText)
         fetchSessions()
           .then(list => setSessions(list.sessions))
           .catch(() => {
             // The next sessions frame lands the same rows.
           })
-      })
-      .catch(fail)
-  }, [fail])
-  const rewindFrom = useCallback((event: Extract<CcEvent, { kind: 'user' }>): void => {
-    const id = currentIdRef.current
-    const messageId = event.nativeMessageId
-    if (id === undefined || messageId === undefined) return
-    rewindPreview(id, messageId)
-      .then(result => {
-        setRewindTarget({ sessionId: id, userMessageId: messageId, result, applied: false })
-      })
-      .catch(fail)
-  }, [fail])
-  const applyRewind = (): void => {
-    const target = rewindTarget
-    if (target === undefined || target.applied) return
-    rewindApply(target.sessionId, target.userMessageId)
-      .then(result => {
-        setRewindTarget({ ...target, result, applied: true })
-        // The files on disk changed; the transcript text did not, but a fresh
-        // read is the cheapest way to settle anything derived from it.
-        fetchSession(target.sessionId)
-          .then(detail => mergeSessionEvents(target.sessionId, detail.events))
-          .catch(() => {
-            // The rewind itself succeeded; the next selection re-reads anyway.
-          })
+        if (result.warning !== undefined) setError(result.warning)
       })
       .catch(fail)
   }
@@ -1182,7 +1214,6 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                   <Transcript
                     events={events}
                     commands={commandsFor(current)}
-                    onFork={forkFrom}
                     onRewind={rewindFrom}
                     liveRef={liveForCopyRef}
                   />
@@ -1278,36 +1309,37 @@ export function CcApp(props: { onClose(): void }): ReactElement {
           <Modal
             open
             onClose={() => setRewindTarget(undefined)}
-            title="回滚文件"
+            title="回退会话"
             closeLabel="关闭"
-            footer={rewindTarget.applied
-              ? <Button variant="primary" onClick={() => setRewindTarget(undefined)}>知道了</Button>
-              : (
-                <>
-                  <Button onClick={() => setRewindTarget(undefined)}>取消</Button>
-                  <Button variant="primary" onClick={applyRewind}>回滚</Button>
-                </>
-              )}
+            footer={(
+              <>
+                <Button onClick={() => setRewindTarget(undefined)}>取消</Button>
+                <Button variant="primary" onClick={applyRewind}>回退</Button>
+              </>
+            )}
           >
             <div className="cc-rewind">
               <div className="cc-rewind-hint">
-                {rewindTarget.applied
-                  ? '已把会话修改过的文件恢复到该消息时的状态；对话记录本身不变。'
-                  : '将把会话修改过的文件恢复到这条消息时的状态；对话记录本身不变，文件改动不经过回收站。'}
+                对话将回到「{rewindTarget.anchorText.split('\n', 1)[0]?.slice(0, 40) || '（仅图片）'}」这条消息之前，
+                这条消息会填回输入框，可编辑后重新发送；之后的对话记录将被丢弃。
               </div>
-              <div className="cc-rewind-stats">
-                {rewindTarget.applied ? '已回滚 ' : '将回滚 '}
-                {rewindTarget.result.filesChanged?.length ?? 0}
-                {' 个文件'}
-                {rewindTarget.result.insertions !== undefined || rewindTarget.result.deletions !== undefined
-                  ? `（+${rewindTarget.result.insertions ?? 0} 行 / -${rewindTarget.result.deletions ?? 0} 行）`
-                  : ''}
-              </div>
-              {(rewindTarget.result.skippedLinks ?? 0) > 0 && (
+              {rewindTarget.anchorImages > 0 && (
                 <div className="cc-rewind-warn">
-                  有 {rewindTarget.result.skippedLinks} 个文件因符号链接或备份不可读等原因未被回滚，请手动检查。
+                  该消息附带 {rewindTarget.anchorImages} 张图片：图片不会自动填回，需要重新粘贴。
                 </div>
               )}
+              <label className="cc-rewind-check" data-disabled={rewindTarget.filesRefusal !== undefined || undefined}>
+                <input
+                  type="checkbox"
+                  checked={rewindTarget.restoreFiles}
+                  disabled={rewindTarget.filesRefusal !== undefined}
+                  onChange={event => setRewindTarget({ ...rewindTarget, restoreFiles: event.currentTarget.checked })}
+                />
+                <span>
+                  <span className="cc-rewind-check-title">同时回滚文件到这条消息时</span>
+                  <span className="cc-rewind-check-copy">{filesCheckCopy(rewindTarget)}</span>
+                </span>
+              </label>
             </div>
           </Modal>
         )}

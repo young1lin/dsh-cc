@@ -26,7 +26,7 @@ import { fileIndexFor } from './file-index.ts'
 import { gitInfoFor } from './git-info.ts'
 import { effectiveEnvEntries, readDirListing, readSdkVersion, readTextFile } from './http-support.ts'
 import { reduceDelta, type LiveTurn } from './live-turn.ts'
-import { deleteNativeSession, forkNativeSession, renameNativeSession } from './native-sessions.ts'
+import { deleteNativeSession, forkNativeSession, messageBeforeUuid, renameNativeSession } from './native-sessions.ts'
 import { SessionStore } from './store.ts'
 import { watchClaudeHome, type StoreChange, type StoreWatch } from './store-watch.ts'
 import type {
@@ -1307,6 +1307,114 @@ export class CcRuntime {
         }
         if (parts.length === 3 && parts[2] === 'rewind' && method === 'POST') {
           return await this.rewindFiles(id, req, res, false)
+        }
+        if (parts.length === 3 && parts[2] === 'rewind-apply' && method === 'POST') {
+          // Conversation rewind as edit-and-resend, composed rather than
+          // native: the SDK offers no transcript truncation, so the rewound
+          // conversation is a fork cut BEFORE the anchor message — the anchor
+          // itself rides back into the page's composer, the CLI /rewind
+          // semantics — carrying the row's own name and session-level
+          // settings, and the original is deleted right after. On the rail
+          // it reads as the SAME session having gone back.
+          const session = this.store.get(id) ?? await this.catalog.adopt(id)
+          if (!session) return json(res, { error: '会话不存在' }, 404)
+          if (session.claudeSessionId === undefined) {
+            return json(res, { error: '草稿会话无可回退内容' }, 400)
+          }
+          if (this.liveEngine(session.id)?.busy === true) {
+            return json(res, { error: '回合进行中，稍后再试' }, 409)
+          }
+          if (this.catalog.terminalOwned(session.id)) {
+            return json(res, { error: '该会话正由终端中的 Claude 进程使用，等它退出后再回退' }, 409)
+          }
+          const body = await readJson(req)
+          const userMessageId = typeof body?.userMessageId === 'string' && body.userMessageId !== ''
+            ? body.userMessageId
+            : undefined
+          if (userMessageId === undefined) return json(res, { error: '缺少回退锚点消息' }, 400)
+          // 1) Files first: the rewind control rides the ORIGINAL session's
+          //    live query, whose checkpoints die with the delete below.
+          let filesWarning: string | undefined
+          if (body?.restoreFiles === true) {
+            const engine = this.liveEngine(session.id)
+            if (engine === undefined) {
+              return json(res, { error: '文件回滚需要正在运行的会话进程；可取消勾选后仅回退对话' }, 409)
+            }
+            const files = await engine.rewindFiles(userMessageId, false)
+            if (!files.canRewind) {
+              return json(res, { error: files.error ?? '文件回滚被拒绝' }, 409)
+            }
+            if ((files.skippedLinks ?? 0) > 0) {
+              filesWarning = `有 ${files.skippedLinks} 个文件因符号链接或备份不可读等原因未被回滚，请手动检查`
+            }
+          }
+          // 2) The rewound conversation: a fork cut at the record BEFORE the
+          //    anchor. A first-message anchor has nothing before it — the
+          //    rewind is then a fresh empty conversation under the same name
+          //    (a draft row, bound to the same account root and cwd).
+          const cut = await messageBeforeUuid(session.claudeSessionId, {
+            cwd: session.cwd,
+            anchorUuid: userMessageId,
+          })
+          const rewoundId = cut !== undefined
+            ? (await forkNativeSession(session.claudeSessionId, {
+              cwd: session.cwd,
+              upToMessageId: cut,
+              title: session.name,
+            })).sessionId
+            : (await this.store.create(
+              { name: session.name, cwd: session.cwd },
+              {
+                cwd: session.cwd,
+                // A pre-binding row carries no stamp; those follow the
+                // effective root exactly as a fresh create would.
+                configDir: session.configDir ?? this.effectiveConfig().configDir,
+                accountEnv: session.accountEnv ?? this.providerScopeSnapshot(),
+              },
+            )).id
+          // 3) Session-level settings move over: model / effort / permission
+          //    / env layer are sidecar-only fields the native fork cannot
+          //    carry. The fork's adopt stamps the CURRENT root's binding, so
+          //    the original's binding is written over it — a session on
+          //    another account rewinds onto its own account. (The draft-row
+          //    path already carries its binding from the create above.)
+          if (cut !== undefined) {
+            await this.catalog.refresh()
+            const adopted = await this.catalog.adopt(rewoundId)
+            if (adopted !== undefined) {
+              await this.patchMeta(adopted.id, {
+                model: session.model,
+                effort: session.effort,
+                permissionMode: session.permissionMode,
+                lastGoodModel: session.lastGoodModel,
+                env: session.env,
+                accountEnv: session.accountEnv,
+                configDir: session.configDir,
+              })
+            }
+          }
+          // 4) Delete the original on both stores — the DELETE handler's
+          //    body, minus its guards (already passed above). A native-delete
+          //    failure is reported as a warning, not an error: the rewind
+          //    DID happen, only the old row's cleanup is left to the user.
+          let warning = filesWarning
+          const key = session.id
+          await this.closeEngine(key)
+          if (id !== key) await this.closeEngine(id)
+          this.retainedQueues.delete(key)
+          if (id !== key) this.retainedQueues.delete(id)
+          this.liveSeqs.delete(key)
+          try {
+            await deleteNativeSession(session.claudeSessionId, { cwd: session.cwd })
+            await this.store.remove(key)
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            this.ctx.logger?.warn?.(`dsh-cc: rewind left the original session ${key} behind: ${message}`)
+            warning = (warning === undefined ? '' : `${warning}；`) + `对话已回退，但原会话的 CLI 记录删除失败（${message}），请手动删除原会话`
+          }
+          if ((await this.catalog.refresh()).changed) this.broadcastSessions()
+          else this.broadcastSession(rewoundId)
+          return json(res, { sessionId: rewoundId, ...(warning !== undefined ? { warning } : {}) })
         }
         if (parts.length === 3 && parts[2] === 'queue' && method === 'GET') {
           const session = this.store.get(id)

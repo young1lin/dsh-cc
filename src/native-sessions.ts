@@ -11,9 +11,11 @@ import {
   deleteSession,
   forkSession,
   getSessionInfo,
+  getSessionMessages,
   listSessions,
   renameSession,
   type SDKSessionInfo,
+  type SessionMessage,
 } from '@anthropic-ai/claude-agent-sdk'
 import type { SessionMeta } from './types.ts'
 
@@ -179,6 +181,33 @@ export async function deleteNativeSession(sessionId: string, options: NativeSess
   } catch (error) {
     throw new Error(`dsh-cc: failed to delete native session ${sessionId}`, { cause: error })
   }
+}
+
+/**
+ * The UUID of the native record immediately preceding one user message —
+ * the inclusive fork cut that lands a rewound conversation BEFORE the
+ * anchor, so the anchor itself can ride back into the composer for
+ * edit-and-resend (the CLI /rewind semantics).
+ *
+ * @param sessionId - native session id.
+ * @param options - project directory and the anchor message's UUID.
+ * @returns the previous record's UUID, or undefined when the anchor is the
+ *   session's first message (nothing precedes it to cut at).
+ * @throws when the transcript read fails or the anchor is not in it.
+ */
+export async function messageBeforeUuid(
+  sessionId: string,
+  options: { cwd?: string; anchorUuid: string },
+): Promise<string | undefined> {
+  let messages: SessionMessage[]
+  try {
+    messages = await getSessionMessages(sessionId, { dir: options.cwd })
+  } catch (error) {
+    throw new Error(`dsh-cc: failed to read native transcript for session ${sessionId}`, { cause: error })
+  }
+  const index = messages.findIndex(message => message.uuid === options.anchorUuid)
+  if (index < 0) throw new Error('dsh-cc: anchor message not found in native transcript')
+  return index > 0 ? messages[index - 1]?.uuid : undefined
 }
 
 /** Options for {@link forkNativeSession}. */
