@@ -941,7 +941,14 @@ export class CcRuntime {
           return await this.sendMessage(id, req, res)
         }
         if (parts.length === 3 && parts[2] === 'context' && method === 'GET') {
-          const session = this.store.get(id)
+          // This and the usage/models reads fire in the same tick as the
+          // adopting GET /sessions/:id when a CLI session is first opened, so
+          // they regularly land before the sidecar row exists. A session the
+          // catalog knows is not "nonexistent" — it merely has no live engine
+          // yet, which is exactly what available:false reports. catalog.get is
+          // the read-only view: a telemetry poll must not write an adoption
+          // row of its own.
+          const session = this.store.get(id) ?? this.catalog.get(id)
           if (!session) return json(res, { error: '会话不存在' }, 404)
           const engine = this.liveEngine(session.id)
           if (engine === undefined) return json(res, { available: false })
@@ -950,7 +957,9 @@ export class CcRuntime {
           return json(res, { available: true, context })
         }
         if (parts.length === 3 && parts[2] === 'models' && method === 'GET') {
-          const session = this.store.get(id)
+          // Same adopting-race guard as the context route: the status bar's
+          // model picker reads on every selection, cold session or not.
+          const session = this.store.get(id) ?? this.catalog.get(id)
           if (!session) return json(res, { error: '会话不存在' }, 404)
           const engine = this.liveEngine(session.id)
           const current = resolveSessionModel(session.model, this.effectiveConfig().model) ?? ''
@@ -1045,7 +1054,8 @@ export class CcRuntime {
           return json(res, { ok: true, mode })
         }
         if (parts.length === 3 && parts[2] === 'usage' && method === 'GET') {
-          const session = this.store.get(id)
+          // Same adopting-race guard as the context route.
+          const session = this.store.get(id) ?? this.catalog.get(id)
           if (!session) return json(res, { error: '会话不存在' }, 404)
           const engine = this.liveEngine(session.id)
           if (engine === undefined) {

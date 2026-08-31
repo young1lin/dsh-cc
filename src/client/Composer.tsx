@@ -69,6 +69,27 @@ registerCss('composer', `
 
 .cc-input-shell[data-drop='true'] { border-color: var(--dsw-alias-brand-primary); }
 
+/* A terminal claude holds this session: the composer is a read-only mirror.
+   The note says why and the way out; the locked shell refuses the pointer so
+   no caret can sit in an input that would silently swallow keystrokes. */
+.cc-readonly-note {
+  margin: 0 0 8px;
+  padding: 7px 12px;
+  border: 1px solid var(--dsw-alias-state-warn-primary);
+  border-radius: 8px;
+  background: var(--dsw-alias-state-warn-tertiary);
+  color: var(--dsw-alias-state-warn-primary);
+  font: var(--dsw-font-xs-13);
+}
+
+.cc-input-shell[data-readonly='true'] {
+  border-style: dashed;
+  background: var(--dsw-alias-bg-base);
+  cursor: not-allowed;
+}
+
+.cc-input-shell[data-readonly='true'] .cc-input { pointer-events: none; }
+
 /* The recognition mirror: metrics-matched to .cc-input (padding 0, the same
    font shorthand, pre-wrap) so its text lands exactly under the ghosted
    textarea text. It clips rather than scrolls; the textarea's onScroll keeps
@@ -659,6 +680,9 @@ export const Composer = memo(function Composer(props: {
    * @returns true when at least one file was an image and was taken.
    */
   const attach = (files: File[]): boolean => {
+    // A terminal-owned session cannot send, so attachments parked here would
+    // be unusable draft weight behind the lock.
+    if (props.readOnly === true) return false
     const picked = files.filter(file => file.type.startsWith('image/'))
     if (picked.length === 0) return false
     setFailure(undefined)
@@ -720,9 +744,16 @@ export const Composer = memo(function Composer(props: {
         </div>
       )}
       {failure !== undefined && <div className="cc-error-bar">{failure}</div>}
+      {props.readOnly === true && (
+        <div className="cc-readonly-note">
+          此会话正被终端里的 Claude 进程占用，页面端只读 —— 在那个终端退出（/exit 或按两次
+          Ctrl+C）后即可在这里继续对话；<span className="cc-mono">claude ps</span> 可查看占用进程。
+        </div>
+      )}
       <div
         className="cc-input-shell"
         data-drop={dropping}
+        data-readonly={props.readOnly === true ? 'true' : undefined}
         onDragOver={event => {
           event.preventDefault()
           setDropping(true)
