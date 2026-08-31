@@ -117,7 +117,7 @@ export function ProviderForm(props: {
     <div className="cc-settings">
       <ProviderField
         label="API 地址"
-        placeholder="留空 = Claude 官方端点，例如 https://open.bigmodel.cn/api/anthropic"
+        placeholder="留空 = Claude 官方端点，例如 https://api.example.com/anthropic"
         value={fields.baseUrl}
         onChange={baseUrl => patch({ baseUrl })}
         provenanceKey="ANTHROPIC_BASE_URL"

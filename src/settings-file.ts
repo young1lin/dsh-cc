@@ -49,22 +49,27 @@ export function normalizePresets(value: unknown): EnvPreset[] {
 
 /**
  * The presets a first run — or a settings file from before presets existed —
- * starts with. The GLM bundle snapshots whatever provider environment this
- * process itself inherited, so on a machine already pointed at a gateway the
- * preset works on first click; the account bundle is everything else stripped
- * back to just the proxy, which is what 账号直连 means on such a machine.
- * @returns the two seeded presets.
+ * starts with. Both bundles snapshot only what this process itself actually
+ * inherited: the proxy trio keeps live values only (a machine with no proxy
+ * env seeds 账号直连 as a true empty bundle, which is direct account
+ * connection by definition), and the GLM bundle is seeded only when this
+ * machine already points at a gateway — ANTHROPIC_BASE_URL set — snapshotting
+ * the whole provider scope then. No endpoint or proxy port is ever baked in:
+ * a public install never defaults into anyone's relay.
+ * @returns the seeded presets — always 账号直连, plus GLM 中转 on gateway machines.
  */
 function seedPresets(): EnvPreset[] {
-  const proxy: Record<string, string> = {
-    HTTP_PROXY: process.env.HTTP_PROXY ?? process.env.http_proxy ?? 'http://127.0.0.1:7890',
-    HTTPS_PROXY: process.env.HTTPS_PROXY ?? process.env.https_proxy ?? 'http://127.0.0.1:7890',
-    NO_PROXY: process.env.NO_PROXY ?? process.env.no_proxy ?? 'localhost,127.0.0.1',
-  }
-  const glm: Record<string, string> = {
-    ...proxy,
-    ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL ?? 'https://open.bigmodel.cn/api/anthropic',
-  }
+  const proxy: Record<string, string> = {}
+  const httpProxy = process.env.HTTP_PROXY ?? process.env.http_proxy
+  const httpsProxy = process.env.HTTPS_PROXY ?? process.env.https_proxy
+  const noProxy = process.env.NO_PROXY ?? process.env.no_proxy
+  if (httpProxy) proxy.HTTP_PROXY = httpProxy
+  if (httpsProxy) proxy.HTTPS_PROXY = httpsProxy
+  if (noProxy) proxy.NO_PROXY = noProxy
+  else if (httpProxy || httpsProxy) proxy.NO_PROXY = 'localhost,127.0.0.1'
+  const baseUrl = process.env.ANTHROPIC_BASE_URL
+  if (!baseUrl) return [{ id: 'account', name: '账号直连', env: proxy }]
+  const glm: Record<string, string> = { ...proxy, ANTHROPIC_BASE_URL: baseUrl }
   // Snapshot every other provider-scope variable this process carries: the
   // tier-alias mapping (opus/sonnet/haiku) and a relay's long timeout ride
   // along with the endpoint and credential instead of silently falling back

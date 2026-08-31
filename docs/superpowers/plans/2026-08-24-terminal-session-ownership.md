@@ -244,7 +244,7 @@ Restart the verification instance (kill the 3090 listener via `netstat -ano | gr
 
 ```bash
 mkdir -p /tmp/peer-test && cd /tmp/peer-test
-ANTHROPIC_BASE_URL=https://open.bigmodel.cn/api/anthropic \
+ANTHROPIC_BASE_URL=https://gateway.example.com/api/anthropic \
 ANTHROPIC_AUTH_TOKEN="$GLM_TOKEN" ANTHROPIC_MODEL=glm-5.3 \
 claude -p '从 1 慢慢数到 30，每个数字一行' &
 # $GLM_TOKEN: the Zhipu key from the user's environment — deliberately not
