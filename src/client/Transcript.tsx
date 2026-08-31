@@ -13,7 +13,7 @@
  * @module dsh-cc/client/Transcript
  */
 
-import { memo, useMemo, useState, type ReactElement } from 'react'
+import { memo, useEffect, useMemo, useRef, useState, type ReactElement } from 'react'
 import { DisclosureRow, IconThinkOutline14, MarkdownText, type MarkdownFileMentions } from '@deepseek-ai/dsh-client-ui-primitives'
 import { commandToken, matchCommand } from './command-mentions.ts'
 import { registerCss } from './css.ts'
@@ -22,6 +22,8 @@ import { fileMentionsFor } from './file-mentions.ts'
 import { compact } from './status/format.ts'
 import { ToolRow } from './tool/ToolRow.tsx'
 import { stringField } from './tool/wire.ts'
+import { copyTextToClipboard, formatTurnForCopy } from './turn-copy.ts'
+import type { LiveTurnState } from '../live-turn.ts'
 import { MEDIA_TYPE_EXTENSIONS, type CcEvent, type SlashCommand } from '../types.ts'
 
 registerCss('transcript', `
@@ -323,6 +325,33 @@ function ThinkingItem(props: { text: string }): ReactElement {
 }
 
 /**
+ * The user row's 「复制回合」 action: builds the turn's Markdown on click —
+ * never during render, so streaming never pays for a copy nobody asked for —
+ * and flashes the outcome on the button itself, the quietest surface that
+ * needs no extra chrome.
+ *
+ * @param props.build - builds the text from the row's render-time closure.
+ * @returns the button element.
+ */
+function CopyTurnAction(props: { build(): string }): ReactElement {
+  const [state, setState] = useState<'idle' | 'done' | 'fail'>('idle')
+  const timer = useRef<ReturnType<typeof setTimeout>>(undefined)
+  useEffect(() => () => clearTimeout(timer.current), [])
+  const onClick = (): void => {
+    void copyTextToClipboard(props.build()).then(ok => {
+      setState(ok ? 'done' : 'fail')
+      clearTimeout(timer.current)
+      timer.current = setTimeout(() => setState('idle'), 1600)
+    })
+  }
+  return (
+    <button type="button" className="cc-user-action" onClick={onClick}>
+      {state === 'done' ? '已复制' : state === 'fail' ? '复制失败' : '复制回合'}
+    </button>
+  )
+}
+
+/**
  * Format a turn's closing stats the way the host closes a turn.
  * @param event - the result event.
  * @returns the stats fragments.
@@ -346,14 +375,15 @@ function tailParts(event: Extract<CcEvent, { kind: 'result' }>): string[] {
  * Render one non-tool transcript event.
  * @param props - the event, the file-mentions resolver its markdown renders
  *   with, the session's cached slash commands for the user row's blue command
- *   token, and the optional time-travel actions shown on rows that carry a
- *   native message id.
+ *   token, the optional whole-turn copy builder, and the optional time-travel
+ *   actions shown on rows that carry a native message id.
  * @returns the node, or null for an entry with nothing to show.
  */
 function EventItem(props: {
   event: CcEvent
   mentions: MarkdownFileMentions
   commands: readonly SlashCommand[]
+  buildTurnText?: (event: Extract<CcEvent, { kind: 'user' }>) => string
   onFork?: (event: Extract<CcEvent, { kind: 'user' }>) => void
   onRewind?: (event: Extract<CcEvent, { kind: 'user' }>) => void
 }): ReactElement | null {
@@ -397,15 +427,21 @@ function EventItem(props: {
             )}
             {body}
           </div>
-          {event.nativeMessageId !== undefined
-            && (props.onFork !== undefined || props.onRewind !== undefined) && (
+          {/* 复制回合 works off the events list alone, so it shows on every
+              user row; 分叉/回滚 still need the native-message anchor. */}
+          {(props.buildTurnText !== undefined
+            || (event.nativeMessageId !== undefined
+              && (props.onFork !== undefined || props.onRewind !== undefined))) && (
             <div className="cc-user-actions">
-              {props.onFork !== undefined && (
+              {props.buildTurnText !== undefined && (
+                <CopyTurnAction build={() => props.buildTurnText?.(event) ?? ''} />
+              )}
+              {event.nativeMessageId !== undefined && props.onFork !== undefined && (
                 <button type="button" className="cc-user-action" onClick={() => { props.onFork?.(event) }}>
                   分叉
                 </button>
               )}
-              {props.onRewind !== undefined && (
+              {event.nativeMessageId !== undefined && props.onRewind !== undefined && (
                 <button type="button" className="cc-user-action" onClick={() => { props.onRewind?.(event) }}>
                   回滚文件
                 </button>
@@ -513,11 +549,15 @@ function ToolItem(props: { item: Extract<Item, { k: 'tool' }>; cwd: string | und
  * commits, and the commands array only changes when the session's cached
  * catalog does, so the O(n) projection and every ToolRow's card parse run
  * only when the transcript really changed. The action callbacks must be
- * stable for the same reason — the parent passes useCallback'd handlers.
+ * stable for the same reason — the parent passes useCallback'd handlers, and
+ * the live turn arrives as a ref (identity-stable, read at click time)
+ * precisely because passing its value would re-render the whole column per
+ * delta.
  * @param props - the ordered events, the session's cached slash commands
  *   (the user row's blue command token is best-effort: no cache, no blue),
- *   and the optional fork / file-rewind callbacks for user rows that carry a
- *   native message id.
+ *   the optional fork / file-rewind callbacks for user rows that carry a
+ *   native message id, and the parent's ref to the in-flight turn so「复制
+ *   回合」on the newest row includes what is still streaming.
  * @returns the transcript nodes.
  */
 export const Transcript = memo(function Transcript(props: {
@@ -525,6 +565,7 @@ export const Transcript = memo(function Transcript(props: {
   commands: readonly SlashCommand[]
   onFork?: (event: Extract<CcEvent, { kind: 'user' }>) => void
   onRewind?: (event: Extract<CcEvent, { kind: 'user' }>) => void
+  liveRef?: { readonly current: LiveTurnState | undefined }
 }): ReactElement {
   const items = useMemo(() => projectTranscript(props.events), [props.events])
   const cwd = useMemo(() => sessionCwd(props.events), [props.events])
@@ -532,6 +573,11 @@ export const Transcript = memo(function Transcript(props: {
   // the cwd does; a settled render's mentions cannot go stale mid-turn.
   const [viewPath, setViewPath] = useState<string | undefined>()
   const mentions = useMemo(() => fileMentionsFor(cwd, setViewPath), [cwd])
+  // Built per settled render, read only on click: the events array here is
+  // the committed truth, while the live turn is fetched through the ref so
+  // the newest block a click catches is the newest block there is.
+  const buildTurnText = (event: Extract<CcEvent, { kind: 'user' }>): string =>
+    formatTurnForCopy({ events: props.events, userSeq: event.seq, live: props.liveRef?.current })
   return (
     <>
       {items.map((item, index) => item.k === 'tool'
@@ -541,6 +587,7 @@ export const Transcript = memo(function Transcript(props: {
             event={item.event}
             mentions={mentions}
             commands={props.commands}
+            buildTurnText={buildTurnText}
             onFork={props.onFork}
             onRewind={props.onRewind}
           />)}

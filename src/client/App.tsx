@@ -23,7 +23,7 @@ import { registerCss } from './css.ts'
 import { SessionRail } from './SessionRail.tsx'
 import { StatusBar } from './StatusBar.tsx'
 import { LiveTurnView } from './LiveTurnView.tsx'
-import { reduceDelta, type LiveTurn } from '../live-turn.ts'
+import { reduceDelta, type LiveTurn, type LiveTurnState } from '../live-turn.ts'
 import { TodoPin } from './TodoPin.tsx'
 import { TaskPanel } from './TaskPanel.tsx'
 import { Transcript } from './Transcript.tsx'
@@ -307,6 +307,16 @@ export function CcApp(props: { onClose(): void }): ReactElement {
   const current = sessions.find(session => session.id === currentId)
   const events = currentId !== undefined ? eventsBySession[currentId] ?? NO_EVENTS : NO_EVENTS
   const live = currentId !== undefined ? liveBySession[currentId]?.turn : undefined
+  /**
+   * Ref mirror of the current session's live turn, for「复制回合」: passing
+   * the turn itself as a Transcript prop would defeat its memo (every stream
+   * delta re-renders the whole column), while this identity-stable ref is
+   * only read at click time, when the effect below has long synced it.
+   */
+  const liveForCopyRef = useRef<LiveTurnState | undefined>(undefined)
+  useEffect(() => {
+    liveForCopyRef.current = live
+  })
 
   const fail = useCallback((cause: unknown): void => {
     setError(cause instanceof Error ? cause.message : String(cause))
@@ -1169,7 +1179,13 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                     pinnedRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80
                   }}
                 >
-                  <Transcript events={events} commands={commandsFor(current)} onFork={forkFrom} onRewind={rewindFrom} />
+                  <Transcript
+                    events={events}
+                    commands={commandsFor(current)}
+                    onFork={forkFrom}
+                    onRewind={rewindFrom}
+                    liveRef={liveForCopyRef}
+                  />
                   <LiveTurnView turn={live} />
                   {failedRetry !== undefined && current.status !== 'busy' && (
                     <div className="cc-retry-bar">
