@@ -127,16 +127,21 @@ class ResultModelE2E(unittest.TestCase):
     def test_021_nested_transcript_carries_report(self):
         # 子代理的最终报告必须出现在嵌套转录里（sidechain 终读修复：
         # 终态帧之后子代理才落盘的最后一条 assistant 消息不能被丢掉）。
-        snap = helpers.api(f'/sessions/{self.session_id}')
-        events = snap['events']
+        # 报告由终态后的延迟补读送达（最长 +4s），所以这里轮询等待。
         self.assertTrue(self.agent_use_id, "未拿到 Agent 调用的 toolUseId")
-        nested = [e for e in events
-                  if e['kind'] == 'subagent' and e.get('parentToolUseId') == self.agent_use_id
-                  and e.get('event', {}).get('kind') == 'assistant']
-        self.assertTrue(nested, 'Agent 卡下没有任何嵌套 assistant 事件')
-        last_text = nested[-1]['event']['text']
+        deadline = time.time() + 15
+        last_text = ''
+        while time.time() < deadline:
+            snap = helpers.api(f'/sessions/{self.session_id}')
+            nested = [e for e in snap['events']
+                      if e['kind'] == 'subagent' and e.get('parentToolUseId') == self.agent_use_id
+                      and e.get('event', {}).get('kind') == 'assistant']
+            if nested:
+                last_text = nested[-1]['event']['text']
+                break
+            time.sleep(1)
         self.assertIn('MODEL_PROBE_OK', last_text,
-                      f'嵌套转录的最后一条 assistant 不是子代理报告: {last_text[:200]}')
+                      f'15s 内嵌套转录仍未出现子代理最终报告: {last_text[:200]}')
 
     def test_030_page_shows_no_eternal_spinner(self):
         # 页面真相：回合结束后不允许任何工具行停留在 running 态。
