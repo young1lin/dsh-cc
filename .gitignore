@@ -7,5 +7,6 @@ docs-ref/
 replay-probe.txt
 .contract-probe/
 tests/integration/.env
+.agents/worktrees/
 __pycache__/
 *.pyc
