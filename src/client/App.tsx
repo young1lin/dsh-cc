@@ -35,7 +35,7 @@ import { connectEvents } from './api/http.ts'
 import { answerDialog, answerPermission, fetchCommands, reloadCommands } from './api/interaction.ts'
 import {
   backgroundTask, createSession, deleteSession, fetchSession, fetchSessions, renameSession,
-  rewindConversation, rewindPreview, sendMessage, stopSession, stopTask, type RewindResult,
+  rewindConversation, rewindPreview, sendMessage, sendTaskMessage, stopSession, stopTask, type RewindResult,
 } from './api/sessions.ts'
 import { fetchConfig } from './api/settings.ts'
 import { fetchContext, fetchGitInfo, fetchUsage, setPermissionMode, setEffort, type ContextUsage, type GitInfo, type UsageInfo } from './api/telemetry.ts'
@@ -471,7 +471,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
     fetchContext(id)
       .then(result => {
         if (currentIdRef.current === id && result.available && result.context !== undefined) {
-          setContext(result.context)
+          setContext({ ...result.context, persisted: result.persisted === true })
         }
       })
       .catch(() => {
@@ -815,7 +815,10 @@ export function CcApp(props: { onClose(): void }): ReactElement {
           // session's status bar shows these; a background session's frame
           // is dropped here and refetched on switch.
           if (message.sessionId !== currentIdRef.current) break
-          if (message.context !== undefined) setContext(message.context as ContextUsage)
+          // 实时帧永远盖掉持久化读数（persisted 归零）。
+          if (message.context !== undefined) {
+            setContext({ ...(message.context as ContextUsage), persisted: false })
+          }
           if (message.usage !== undefined) setUsage(message.usage as UsageInfo)
           // A turn may have moved the cwd's branch (a Bash git checkout);
           // the per-response frame is the moment to re-read the branch tag.
@@ -1084,6 +1087,11 @@ export function CcApp(props: { onClose(): void }): ReactElement {
     const id = currentIdRef.current
     if (id !== undefined) backgroundTask(id, taskId).catch(fail)
   }, [fail])
+  const messageTaskForCurrent = useCallback((taskId: string, text: string): Promise<void> => {
+    const id = currentIdRef.current
+    if (id === undefined) return Promise.reject(new Error('没有选中的会话'))
+    return sendTaskMessage(id, taskId, text).then(() => undefined)
+  }, [])
   // 回退入口：从 refs 读当前会话（Transcript 是 memo 组件，回调必须稳定，
   // 否则每帧流式重渲都会击穿整列转录的 memo）。
   const rewindFrom = useCallback((event: Extract<CcEvent, { kind: 'user' }>): void => {
@@ -1216,6 +1224,7 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                     commands={commandsFor(current)}
                     onRewind={rewindFrom}
                     liveRef={liveForCopyRef}
+                    settled={current.status !== 'busy'}
                   />
                   <LiveTurnView turn={live} />
                   {failedRetry !== undefined && current.status !== 'busy' && (
@@ -1258,8 +1267,11 @@ export function CcApp(props: { onClose(): void }): ReactElement {
                 </div>
                 <TaskPanel
                   tasks={tasksBySession[current.id] ?? NO_TASKS}
+                  events={events}
+                  cwd={current.cwd}
                   onStop={stopTaskForCurrent}
                   onBackground={backgroundTaskForCurrent}
+                  onMessage={messageTaskForCurrent}
                 />
                 <TodoPin key={current.id} events={events} />
                 <Composer

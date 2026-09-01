@@ -37,6 +37,7 @@ import { cardSummary, toolCard, type ToolCard } from './card-model.ts'
 import { TodoList } from './TodoList.tsx'
 import { asRecord, firstLine, unwrapToolErrorText, type ToolResult } from './wire.ts'
 import { TOOL_ROW_CSS } from './tool-row-css.ts'
+import type { CcEvent, SubagentEvent } from '../../types.ts'
 
 registerCss('tool-row', TOOL_ROW_CSS)
 
@@ -67,13 +68,18 @@ const TOOL_ICONS: Record<string, ReactNode> = {
   Agent: <IconAgentPresetOutline16 />,
 }
 
-/** Run state of the row, which drives the leading slot and the sweep. */
-type RowState = 'running' | 'ok' | 'error'
+/**
+ * Run state of the row, which drives the leading slot and the sweep. `lost`
+ * is the honest terminal for a call whose result never arrived — the turn is
+ * over, so spinning would lie about work still running.
+ */
+type RowState = 'running' | 'ok' | 'error' | 'lost'
 
 /** Screen-reader text for the states the dot and the sweep carry only in colour. */
 const STATE_STATUS: Record<RowState, string | null> = {
   running: '运行中',
   error: '失败',
+  lost: '无结果',
   ok: null,
 }
 
@@ -88,6 +94,15 @@ export interface ToolRowProps {
   summary: string
   /** The session workspace, which shortens paths and labels the terminal prompt. */
   cwd: string | undefined
+  /** Child envelopes owned by an Agent/Task call; absent for ordinary tools. */
+  subagentEvents?: Extract<CcEvent, { kind: 'subagent' }>[]
+  /**
+   * Whether the session's turn has settled. A call without a result spins
+   * only while work can still arrive; once the turn is over, the missing
+   * result is a record loss (a compacted or truncated tail), not pending
+   * work, and the row settles to a neutral「无结果」 instead of spinning.
+   */
+  settled?: boolean
 }
 
 /**
@@ -147,8 +162,14 @@ function GenericCard(props: { input: unknown; result: ToolResult | undefined }):
  * @param props.result - the settled result, for the generic fallback.
  * @returns the body element, or null when the call has nothing to expand into.
  */
-function CardBody(props: { card: ToolCard; input: unknown; result: ToolResult | undefined }): ReactElement | null {
-  const { card, input, result } = props
+function CardBody(props: {
+  card: ToolCard
+  input: unknown
+  result: ToolResult | undefined
+  subagentEvents: Extract<CcEvent, { kind: 'subagent' }>[]
+  cwd: string | undefined
+}): ReactElement | null {
+  const { card, input, result, subagentEvents, cwd } = props
   switch (card.kind) {
     case 'terminal':
       return (
@@ -180,8 +201,15 @@ function CardBody(props: { card: ToolCard; input: unknown; result: ToolResult | 
     case 'todo':
       return <TodoList items={card.todo.items} />
     case 'task':
+      if (subagentEvents.length > 0) {
+        return (
+          <div className="cc-task cc-subagent-transcript">
+            <SubagentTranscript events={subagentEvents} cwd={cwd} />
+          </div>
+        )
+      }
       return card.task.report === undefined
-        ? null
+        ? <div className="cc-task cc-subagent-waiting">子代理正在运行，活动会显示在这里…</div>
         : <div className="cc-task"><MarkdownText text={card.task.report} /></div>
     case 'plan':
       return <div className="cc-plan"><MarkdownText text={card.plan} /></div>
@@ -208,6 +236,7 @@ function Leading(props: { state: RowState; name: string }): ReactElement {
   }
 }
 
+
 /**
  * Render one tool call.
  *
@@ -221,9 +250,13 @@ function Leading(props: { state: RowState; name: string }): ReactElement {
 export const ToolRow = memo(function ToolRow(props: ToolRowProps): ReactElement {
   const { name, input, result, cwd } = props
   const [expanded, setExpanded] = useState(false)
-  const state: RowState = result === undefined ? 'running' : result.isError ? 'error' : 'ok'
+  const state: RowState = result === undefined
+    ? (props.settled === true ? 'lost' : 'running')
+    : result.isError ? 'error' : 'ok'
   const card = toolCard(name, input, result, cwd)
-  const body = <CardBody card={card} input={input} result={result} />
+  const body = (name === 'Task' || name === 'Agent')
+    ? <CardBody card={card} input={input} result={result} subagentEvents={props.subagentEvents ?? []} cwd={cwd} />
+    : <CardBody card={card} input={input} result={result} subagentEvents={[]} cwd={cwd} />
   const expandable = body !== null
   // A failed call's summary IS the failure: the first line of the error text
   // outranks both the arguments and anything the card would have said.
@@ -252,6 +285,7 @@ export const ToolRow = memo(function ToolRow(props: ToolRowProps): ReactElement 
             <span className="cc-tool-sep" aria-hidden />
             <span className="cc-tool-summary" data-error={failure !== null}>{summary}</span>
             {suffix !== null && <span className="cc-tool-suffix">{suffix}</span>}
+            {state === 'lost' && <span className="cc-tool-suffix">无结果</span>}
           </>
         )}
       >
@@ -260,3 +294,104 @@ export const ToolRow = memo(function ToolRow(props: ToolRowProps): ReactElement 
     </div>
   )
 })
+
+type NestedTool = {
+  k: 'tool'
+  id: string
+  key: number
+  call?: Extract<SubagentEvent, { kind: 'tool_use' }>
+  result?: Extract<SubagentEvent, { kind: 'tool_result' }>
+}
+
+type NestedItem = NestedTool | { k: 'event'; key: number; event: Exclude<SubagentEvent, { kind: 'tool_use' | 'tool_result' }> }
+
+/** Pair one subagent's tool calls/results without flattening them into the parent. */
+function projectSubagent(events: Extract<CcEvent, { kind: 'subagent' }>[]): NestedItem[] {
+  const items: NestedItem[] = []
+  const tools = new Map<string, NestedTool>()
+  for (const wrapper of events) {
+    const event = wrapper.event
+    if (event.kind === 'tool_use') {
+      const item: NestedTool = { k: 'tool', id: event.toolUseId, key: wrapper.seq, call: event }
+      tools.set(event.toolUseId, item)
+      items.push(item)
+    } else if (event.kind === 'tool_result') {
+      const pending = tools.get(event.toolUseId)
+      if (pending !== undefined) pending.result = event
+      // An orphan result (its tool_use never arrived) carries no readable
+      // identity; rendering it as a nameless placeholder row is pure noise.
+    } else {
+      items.push({ k: 'event', key: wrapper.seq, event })
+    }
+  }
+  return items
+}
+
+/** A compact identifier for one nested tool call. */
+function nestedSummary(input: unknown): string {
+  if (typeof input !== 'object' || input === null) return ''
+  const value = Object.values(input).find(entry => typeof entry === 'string')
+  return typeof value === 'string' ? value : ''
+}
+
+/**
+ * Render a depth-1 agent's own conversation and tools. Exported so the task
+ * detail layer and the durable parent Agent card show the exact same content.
+ * @param props.events - child envelopes for one parent tool use.
+ * @param props.cwd - owning session workspace.
+ * @returns the nested transcript.
+ */
+export function SubagentTranscript(props: {
+  events: Extract<CcEvent, { kind: 'subagent' }>[]
+  cwd: string | undefined
+}): ReactElement {
+  const items = projectSubagent(props.events)
+  // 第一条 user 事件是委派时的任务书（后续 user 才是用户从详情页补发的消息），
+  // 两者视觉语义不同：任务书是左侧引用块，补充是右对齐气泡。
+  let taskBriefShown = false
+  return (
+    <div className="cc-subagent-flow">
+      {items.map(item => {
+        if (item.k === 'tool') {
+          const name = item.call?.name ?? '工具'
+          return (
+            <ToolRow
+              key={`nested-tool:${item.id}:${item.key}`}
+              name={name}
+              input={item.call?.input}
+              result={item.result}
+              summary={nestedSummary(item.call?.input)}
+              cwd={props.cwd}
+            />
+          )
+        }
+        const event = item.event
+        switch (event.kind) {
+          case 'assistant':
+            return event.text !== ''
+              ? <div key={item.key} className="cc-subagent-assistant"><MarkdownText text={event.text} /></div>
+              : <div key={item.key} className="cc-subagent-error">{event.error ?? '子代理响应失败'}</div>
+          case 'thinking':
+            return (
+              <details key={item.key} className="cc-subagent-thinking">
+                <summary>思考过程</summary>
+                <div>{event.text}</div>
+              </details>
+            )
+          case 'user': {
+            if (!taskBriefShown) {
+              taskBriefShown = true
+              return (
+                <div key={item.key} className="cc-subagent-task">
+                  <div className="cc-subagent-task-label">任务</div>
+                  <div className="cc-subagent-task-body"><MarkdownText text={event.text} /></div>
+                </div>
+              )
+            }
+            return <div key={item.key} className="cc-subagent-user">{event.text}</div>
+          }
+        }
+      })}
+    </div>
+  )
+}

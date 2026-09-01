@@ -205,6 +205,51 @@ export const TOOL_ROW_CSS = `
 .cc-task :where(h1, h2, h3, h4) { margin: 0.7em 0 0.3em; }
 .cc-task :where(ul, ol) { margin: 0.4em 0; padding-left: 1.4em; }
 
+.cc-subagent-transcript {
+  max-height: 460px;
+  border-left: 3px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-1);
+}
+.cc-subagent-flow { display: flex; flex-direction: column; gap: 10px; }
+.cc-subagent-flow > .cc-tool { margin-left: 8px; }
+.cc-subagent-assistant { font: var(--dsw-font-xs-13); color: var(--dsw-alias-label-primary); }
+.cc-subagent-assistant :where(p) { margin: 0.35em 0; }
+.cc-subagent-thinking { font: var(--dsw-font-xs-13); color: var(--dsw-alias-label-tertiary); }
+.cc-subagent-thinking summary { cursor: pointer; color: var(--dsw-alias-label-secondary); }
+.cc-subagent-thinking > div { padding: 6px 0 0 14px; white-space: pre-wrap; }
+/* 委派任务书：左侧引用块，弱背景 + 内滚，与用户补充消息（气泡）区分。 */
+.cc-subagent-task {
+  padding: 8px 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1);
+}
+.cc-subagent-task-label {
+  margin-bottom: 4px;
+  font: var(--dsw-font-xxs-12);
+  color: var(--dsw-alias-label-caption);
+}
+.cc-subagent-task-body {
+  max-height: 200px;
+  overflow: auto;
+  font: var(--dsw-font-xs-13);
+  color: var(--dsw-alias-label-secondary);
+}
+.cc-subagent-task-body :where(p) { margin: 0.35em 0; }
+.cc-subagent-task-body :where(ol, ul) { margin: 0.35em 0; padding-left: 1.4em; }
+.cc-subagent-user {
+  align-self: flex-end;
+  max-width: 78%;
+  padding: 6px 12px;
+  border-radius: 14px 14px 4px 14px;
+  background: var(--dsw-specific-bubble);
+  font: var(--dsw-font-xs-13);
+  color: var(--dsw-alias-label-primary);
+  white-space: pre-wrap;
+}
+.cc-subagent-error { font: var(--dsw-font-xs-13); color: var(--dsw-alias-state-error-primary); }
+.cc-subagent-waiting { font: var(--dsw-font-xs-13); color: var(--dsw-alias-label-tertiary); }
+
 /* Run-state text for assistive technology: the dot and the sweep are both
    aria-hidden or colour-only. */
 .cc-sr {

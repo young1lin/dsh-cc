@@ -118,15 +118,22 @@ export interface ContextUsage {
   isAutoCompactEnabled?: boolean
   autoCompactThreshold?: number
   model?: string
+  /**
+   * 冷会话标记：true 表示这是会话行上持久化的上次读数（引擎已不在），
+   * 状态栏据此在提示里注明「上次记录」，避免被当成实时值。
+   */
+  persisted?: boolean
 }
 
 /**
  * GET /sessions/:id/context.
  * @param id - session id.
- * @returns the context breakdown, or availability false without a live process.
+ * @returns the context breakdown — live when a process runs, else the last
+ *   persisted reading (`persisted: true`); availability false only when
+ *   neither exists.
  */
-export function fetchContext(id: string): Promise<{ available: boolean; context?: ContextUsage }> {
-  return api<{ available: boolean; context?: ContextUsage }>(`/sessions/${id}/context`)
+export function fetchContext(id: string): Promise<{ available: boolean; persisted?: boolean; context?: ContextUsage }> {
+  return api<{ available: boolean; persisted?: boolean; context?: ContextUsage }>(`/sessions/${id}/context`)
 }
 
 /** One selectable model from the live CLI catalog. */

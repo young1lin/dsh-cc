@@ -267,6 +267,24 @@ function mapAssistantBlock(block: RawBlock): CcEventInput[] {
  */
 function mapUserBlock(block: RawBlock, nativeMessageId: string): CcEventInput[] {
   if (block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0) {
+    // Background-task completion is harness control context for the parent,
+    // not a human message — but its <result> body IS the subagent's final
+    // report, and the Agent card it belongs to shows it as the call's result
+    // (replacing the internal "launched" acknowledgement). A notification
+    // without a usable tool-use id stays dropped. The same drop applies to
+    // the plugin's own system-reminder forward instructions.
+    const trimmed = block.text.trimStart()
+    if (trimmed.startsWith('<task-notification>')) {
+      const note = parseTaskNotification(block.text)
+      if (note?.toolUseId === undefined) return []
+      return [{
+        kind: 'tool_result',
+        toolUseId: note.toolUseId,
+        text: note.result ?? note.summary ?? '',
+        isError: note.status !== undefined && note.status !== 'completed',
+      }]
+    }
+    if (trimmed.startsWith('<system-reminder>')) return []
     return [{ kind: 'user', text: block.text, nativeMessageId }]
   }
   if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
@@ -278,6 +296,45 @@ function mapUserBlock(block: RawBlock, nativeMessageId: string): CcEventInput[] 
     }]
   }
   return []
+}
+
+/** One parsed `<task-notification>` control message. */
+export interface TaskNotification {
+  /** The background task id, when the message carried one. */
+  taskId: string | undefined
+  /** The main-thread Agent/Task tool-use the notification answers. */
+  toolUseId: string | undefined
+  /** Terminal status: `completed`, `failed`, `stopped`. */
+  status: string | undefined
+  /** The CLI's one-line completion summary. */
+  summary: string | undefined
+  /** The subagent's final report — the payload the page renders. */
+  result: string | undefined
+}
+
+/**
+ * Parse a `<task-notification>` control message the CLI injects as a
+ * main-thread user text when background work settles. Both the live stream
+ * (engine) and the replayed transcript (this module) must surface the same
+ * result, so the extraction lives here once.
+ * @param text - the raw text block.
+ * @returns the parsed fields, or undefined when the text is not a notification.
+ */
+export function parseTaskNotification(text: string): TaskNotification | undefined {
+  if (!text.includes('<task-notification>')) return undefined
+  const field = (tag: string): string | undefined => {
+    const match = text.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`))
+    if (match === null) return undefined
+    const value = match[1]?.trim()
+    return value === '' ? undefined : value
+  }
+  return {
+    taskId: field('task-id'),
+    toolUseId: field('tool-use-id'),
+    status: field('status'),
+    summary: field('summary'),
+    result: field('result'),
+  }
 }
 
 /**

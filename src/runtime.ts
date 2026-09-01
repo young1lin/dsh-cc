@@ -40,6 +40,35 @@ import {
 
 const MAX_BODY_BYTES = 1024 * 1024
 
+/**
+ * Extract the persistable core of one telemetry context answer. The CLI's
+ * control-channel payload is passed through shaped-as-is; only a reading with
+ * real totals qualifies — a probe that failed or returned gibberish leaves the
+ * previously persisted snapshot untouched.
+ * @param value - the raw `context` half of a telemetry push.
+ * @returns the sidecar snapshot, or undefined when nothing usable arrived.
+ */
+function contextSnapshot(value: unknown): NonNullable<SessionMeta['lastContext']> | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const record = value as Record<string, unknown>
+  const totalTokens = record.totalTokens
+  const maxTokens = record.maxTokens
+  if (typeof totalTokens !== 'number' || typeof maxTokens !== 'number') return undefined
+  return {
+    recordedAt: new Date().toISOString(),
+    context: {
+      totalTokens,
+      maxTokens,
+      ...(typeof record.percentage === 'number' ? { percentage: record.percentage } : {}),
+      ...(Array.isArray(record.categories) ? { categories: record.categories } : {}),
+      ...(typeof record.isAutoCompactEnabled === 'boolean'
+        ? { isAutoCompactEnabled: record.isAutoCompactEnabled } : {}),
+      ...(typeof record.autoCompactThreshold === 'number'
+        ? { autoCompactThreshold: record.autoCompactThreshold } : {}),
+    },
+  }
+}
+
 /** Session id of the throwaway engine started only to read the model catalog. */
 const CATALOG_PROBE_ID = 'dsh-cc:catalog-probe'
 
@@ -1067,10 +1096,16 @@ export class CcRuntime {
           const session = this.store.get(id) ?? this.catalog.get(id)
           if (!session) return json(res, { error: '会话不存在' }, 404)
           const engine = this.liveEngine(session.id)
-          if (engine === undefined) return json(res, { available: false })
-          const context = await engine.getContextUsage()
-          if (context === undefined) return json(res, { available: false })
-          return json(res, { available: true, context })
+          if (engine !== undefined) {
+            const context = await engine.getContextUsage()
+            if (context !== undefined) return json(res, { available: true, context })
+          }
+          // 冷会话回退：渲染上次探测并持久化的读数（标记 persisted，页面
+          // 在提示里注明是记录值）。没有记录过才真的不可用。
+          if (session.lastContext !== undefined) {
+            return json(res, { available: true, persisted: true, context: session.lastContext.context })
+          }
+          return json(res, { available: false })
         }
         if (parts.length === 3 && parts[2] === 'models' && method === 'GET') {
           // Same adopting-race guard as the context route: the status bar's
@@ -1441,6 +1476,9 @@ export class CcRuntime {
           await this.patchMeta(session.id, { queued: this.queuedTotal(session.id) })
           return json(res, { item: queuedMessageView(removed) })
         }
+        if (parts.length === 5 && parts[2] === 'tasks' && parts[4] === 'messages' && method === 'POST') {
+          return await this.messageTask(id, parts[3] ?? '', req, res)
+        }
         if (parts.length === 5 && parts[2] === 'tasks' && method === 'POST') {
           return await this.controlTask(id, parts[3] ?? '', parts[4] ?? '', res)
         }
@@ -1740,11 +1778,31 @@ export class CcRuntime {
   }
 
   /**
-   * Stop or background one task of one session's live engine.
+   * Forward one user message from a live subagent detail view.
    * @param id - the session id.
-   * @param taskId - the task id from the table.
-   * @param action - `stop` or `background`.
+   * @param taskId - the live subagent task id.
+   * @param req - request containing the text.
    * @param res - the response to write.
+   */
+  private async messageTask(id: string, taskId: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const session = this.store.get(id) ?? this.catalog.get(id)
+    if (session === undefined) return json(res, { error: '会话不存在' }, 404)
+    const engine = this.liveEngine(session.id)
+    if (engine === undefined) return json(res, { error: '子代理已经结束或会话进程不存在' }, 404)
+    const body = await readJson(req)
+    const text = typeof body?.text === 'string' ? body.text.trim() : ''
+    if (text === '') return json(res, { error: '消息不能为空' }, 400)
+    await engine.sendTaskMessage(taskId, text)
+    await this.patchMeta(session.id, { status: 'busy' })
+    return json(res, { ok: true })
+  }
+
+  /**
+   * Apply stop/background to one live task.
+   * @param id - session id.
+   * @param taskId - live CLI task id.
+   * @param action - `stop` or `background`.
+   * @param res - HTTP response.
    */
   private async controlTask(id: string, taskId: string, action: string, res: ServerResponse): Promise<void> {
     const engine = this.liveEngine(id)
@@ -1796,6 +1854,12 @@ export class CcRuntime {
         this.broadcast({ t: 'tasks', sessionId, tasks: rows })
       },
       telemetry: payload => {
+        // 上下文读数落盘：冷会话（引擎已被挤出/进程关闭后）的状态栏仍然
+        // 能显示这个会话的上下窗占用量，而不是一片空白。
+        const snapshot = contextSnapshot(payload.context)
+        if (snapshot !== undefined) {
+          void this.patchMeta(sessionId, { lastContext: snapshot }).catch(() => {})
+        }
         this.broadcast({ t: 'telemetry', sessionId, ...payload })
       },
       onEngineFailure: async error => {

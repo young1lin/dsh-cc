@@ -2,7 +2,9 @@
  * The context-window occupancy meter: a bar segmented by the CLI's own
  * categories (everything but `Free space`, which is the bar's implicit
  * remainder), a hover breakdown of exact token counts, and — when the CLI
- * reports one — a marker for where auto-compaction kicks in.
+ * reports one — a marker for where auto-compaction kicks in. The slot
+ * carries a 1px inner ring so the bar reads as a bar even at 4% occupancy,
+ * where the colored segments shrink to a few pixels.
  *
  * @module dsh-cc/client/status/ContextMeter
  */
@@ -24,6 +26,9 @@ registerCss('status-context', `
   border-radius: 3px;
   overflow: hidden;
   background: var(--dsw-alias-bg-layer-3);
+  /* 低占比（4%）时彩色段只有几像素：一圈 1px 内描边把槽的轮廓
+     钉在状态栏底色上，整根条任何时候都读得出「这是一根进度条」。 */
+  box-shadow: inset 0 0 0 1px var(--dsw-alias-border-l2);
 }
 
 .cc-ctx-seg { height: 100%; }
@@ -98,9 +103,11 @@ export function ContextMeter(props: { context: ContextUsage }): ReactElement {
     ? Math.round((context.autoCompactThreshold / max) * 100)
     : undefined
   const detail = used.length > 0 ? buildDetail(context, used, thresholdPercent) : `已用 ${compact(context.totalTokens)}`
+  // 持久化读数（冷会话）如实注明：这是上次记录，不是实时值。
+  const label = context.persisted === true ? detail + '\n（上次记录的读数）' : detail
 
   return (
-    <Tooltip label={detail} side="bottom">
+    <Tooltip label={label} side="bottom">
       <span className="cc-ctx">
         <span className="cc-ctx-bar">
           {used.map(category => (

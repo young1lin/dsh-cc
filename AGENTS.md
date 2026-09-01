@@ -17,7 +17,10 @@ pnpm watch         # tsdown --watch，配合 link: 安装免重新 add
 node scripts/client-smoke.mjs                  # 构建后跑：stub 掉 __ModuleLoader__ 驱动 client.js 的 apply()
 node scripts/sse-capture.mjs <out> <ms> [port] # 抓 /cc/api/events 的 SSE 帧到 JSONL
 node scripts/cli-contract.mjs                  # 对着真 CLI 断言我们依赖的行为；升 SDK 后必跑
+python -m unittest discover -s tests/integration -v  # 集成回归（真实中转 + 3081 隔离实例；见 tests/integration/README.md）
 ```
+
+集成回归（`tests/integration/`，Python 标准库 unittest，不引入 JS 测试框架）对着真实链路活测：自动起停 3081 隔离实例、spawn 真 claude 进程走中转、Playwright 驱动真页面。密钥只在 `tests/integration/credentials.local.json`（已 gitignore，本地留存）；提交文件里不得出现本机绝对路径——路径一律由 `__file__` 推导或从凭据文件读取。改动任务栏/子代理/回退/转录渲染后必须跑对应用例类。
 
 - 本仓库**没有测试框架，也不要引入**。验证回路 = `pnpm typecheck` + `scripts/cli-contract.mjs` + 下面的实验室实例做活体验证。
 - **升 `@anthropic-ai/claude-agent-sdk` 后先跑 `cli-contract.mjs`。** 它读 dsh-cc 自己设置层里生效的预设（走中转，token 不进仓库），起一个真 query，把「回合中途的消息会不会被丢弃 / 整批会不会合并成一个回合 / CLI 会不会回显用户消息 / init 有哪些能力位 / `cancelAsyncMessage` 还在不在」逐条验一遍。这个脚本存在的理由：`engine.ts` 曾有一条注释写着「verified against the 0.3.220 payload」，三条断言全错，整个排队子系统建在上面 —— 注释里的「已验证」不可信，能跑的断言才可信。

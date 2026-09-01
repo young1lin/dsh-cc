@@ -28,6 +28,8 @@ import { mentionBlocks } from './mentions.ts'
 import { openEnvForSpawn } from './secret-box.ts'
 import { runShell } from './shell-run.ts'
 import { shellPolicyFor } from './shell-policy.ts'
+import { parseTaskNotification } from './native-transcript.ts'
+import { readSubagentTranscript, subagentTranscriptPath } from './subagent-transcript.ts'
 import type {
   AccountSummary,
   CcEventInput,
@@ -39,6 +41,7 @@ import type {
   SessionMeta,
   SlashCommand,
   StreamDelta,
+  SubagentEvent,
   TaskRow,
   TurnUsage,
 } from './types.ts'
@@ -267,6 +270,23 @@ export class SessionEngine {
   private readonly onUserDialog: OnUserDialog
   /** Block indices of the running turn whose block-start reached the page. */
   private readonly openBlocks = new Set<number>()
+  /** Nested tool-use id to its owning depth-1 Agent/Task tool-use id. */
+  private readonly subagentToolOwners = new Map<string, string>()
+  /**
+   * Depth-1 Agent call tool-use id to the model alias its input requested
+   * (`haiku`, `sonnet`, …; `inherit` and absence both mean the parent's
+   * model). Read when the CLI's task_started frame mints the row.
+   */
+  private readonly subagentModelByTool = new Map<string, string>()
+  /** Depth-1 agent task id to the CLI-resolved wire model its responses use. */
+  private readonly subagentModels = new Map<string, string>()
+  /** Post-terminal sidechain re-reads; the child's last write races the terminal frame. */
+  private readonly finalSubagentReads = new Set<ReturnType<typeof setTimeout>>()
+  /** Consumed native sidechain lines per live agent task. */
+  private readonly subagentLines = new Map<string, number>()
+  /** One in-flight sidechain read per agent task, with a trailing-edge replay. */
+  private readonly subagentReads = new Map<string, Promise<void>>()
+  private readonly subagentReadAgain = new Set<string>()
   /** Whether the running turn already published its turn-stop. */
   private turnStopped = false
   /**
@@ -309,7 +329,8 @@ export class SessionEngine {
    */
   private lifecycleSupported: boolean | undefined
   /** The session's live task table in start order; display state only. */
-  private readonly taskTable = new Map<string, TaskRow>()  /** Trailing CLI stderr, capped at STDERR_TAIL_LIMIT characters. */
+  private readonly taskTable = new Map<string, TaskRow>()
+  /** Trailing CLI stderr, capped at STDERR_TAIL_LIMIT characters. */
   private stderrTail = ''
   private started = false
   private closed = false
@@ -556,6 +577,7 @@ export class SessionEngine {
       this.publish({
         kind: 'user',
         text: entry.text,
+        nativeMessageId: entry.uuid,
         ...(entry.imageRefs.length > 0 ? { images: entry.imageRefs } : {}),
       })
     }
@@ -874,6 +896,33 @@ export class SessionEngine {
   }
 
   /**
+   * Continue one running subagent from its detail view. Claude Code exposes
+   * in-process Agent messaging to the parent through its SendMessage tool, not
+   * as a public SDK control call, so this queues a narrow parent instruction
+   * and mirrors the user's text immediately inside the nested transcript.
+   * @param taskId - the live CLI task id.
+   * @param text - the user's message to forward verbatim.
+   */
+  async sendTaskMessage(taskId: string, text: string): Promise<void> {
+    const row = this.taskTable.get(taskId)
+    if (row === undefined || row.toolUseId === undefined) throw new Error('子代理任务不存在或已经结束')
+    if (row.type !== 'subagent' && row.subagentType === undefined) throw new Error('该任务不是可对话的子代理')
+    const body = text.trim()
+    if (body === '') throw new Error('消息不能为空')
+    const target = row.description.trim() === '' ? row.id : `${row.description}（任务 ID ${row.id}）`
+    await this.send([
+      '<system-reminder>',
+      `用户正在子代理详情页继续与“${target}”对话。`,
+      '请立即使用 SendMessage 工具把下面 <subagent-message> 中的内容原样转发给该子代理；不要由主 Agent 代答。',
+      '</system-reminder>',
+      '<subagent-message>',
+      body,
+      '</subagent-message>',
+    ].join('\n'), [], { echo: false })
+    this.publishSubagent(row.toolUseId, { kind: 'user', text: body })
+  }
+
+  /**
    * Switch the permission posture of the running process; a recycled engine
    * reads the session's persisted override at spawn instead.
    * @param mode - the posture, or undefined to reset to the spawn default.
@@ -1175,6 +1224,8 @@ export class SessionEngine {
   async close(): Promise<void> {
     if (this.closed) return
     this.closed = true
+    for (const timer of this.finalSubagentReads) clearTimeout(timer)
+    this.finalSubagentReads.clear()
     for (const [requestId, resolve] of [...this.pending]) {
       this.pending.delete(requestId)
       resolve({ behavior: 'deny', message: '会话已关闭' })
@@ -1203,6 +1254,99 @@ export class SessionEngine {
     void this.hooks.emit(input).catch(error => {
       console.warn('dsh-cc: 事件发布失败', error)
     })
+  }
+
+  /**
+   * Persist one child event beneath the main Agent/Task call that owns it.
+   * @param parentToolUseId - the depth-1 Agent/Task tool-use id.
+   * @param event - the child event without main-transcript sequence metadata.
+   */
+  private publishSubagent(parentToolUseId: string, event: SubagentEvent): void {
+    this.publish({ kind: 'subagent', parentToolUseId, event })
+  }
+
+  /**
+   * Remember the model a depth-1 Agent/Task call asked for, so its task row
+   * can say which model the delegation runs on. `inherit` — and absence —
+   * mean the parent's model and are simply not recorded; the page renders
+   * that as the session's current model until the sidechain reader resolves
+   * the wire id.
+   * @param toolUseId - the main-thread Agent/Task tool-use id.
+   * @param name - the wire tool name.
+   * @param input - the call arguments as the model wrote them.
+   */
+  private recordSubagentModelAlias(toolUseId: string, name: string, input: unknown): void {
+    if (name !== 'Agent' && name !== 'Task') return
+    if (typeof input !== 'object' || input === null) return
+    const model = (input as Record<string, unknown>).model
+    if (typeof model !== 'string' || model === '' || model === 'inherit') return
+    this.subagentModelByTool.set(toolUseId, model)
+  }
+
+  /**
+   * Read newly appended native sidechain records for one background agent.
+   * Progress bursts coalesce behind one read; a request that lands during the
+   * read arms one trailing pass so no completed record is stranded.
+   * @param taskId - the depth-1 agent task id and sidechain file suffix.
+   * @param parentToolUseId - the owning main Agent/Task call.
+   */
+  private refreshSubagentTranscript(taskId: string, parentToolUseId: string): void {
+    if (this.subagentReads.has(taskId)) {
+      this.subagentReadAgain.add(taskId)
+      return
+    }
+    const sessionId = this.claudeSessionId
+    if (sessionId === undefined) return
+    const root = this.config.configDir !== ''
+      ? this.config.configDir
+      : process.env.CLAUDE_CONFIG_DIR ?? ''
+    if (root === '') return
+    const path = subagentTranscriptPath(root, this.startSpec.cwd, sessionId, taskId)
+    const work = (async () => {
+      const chunk = await readSubagentTranscript(path, this.subagentLines.get(taskId) ?? 0)
+      this.subagentLines.set(taskId, chunk.nextLine)
+      if (chunk.model !== undefined && !this.subagentModels.has(taskId)) {
+        this.subagentModels.set(taskId, chunk.model)
+        const row = this.taskTable.get(taskId)
+        if (row !== undefined && row.model !== chunk.model) {
+          this.taskTable.set(taskId, { ...row, model: chunk.model })
+          this.publishTasks()
+        }
+      }
+      for (const event of chunk.events) {
+        if (event.kind === 'tool_use') this.subagentToolOwners.set(event.toolUseId, parentToolUseId)
+        this.publishSubagent(parentToolUseId, event)
+      }
+    })().catch(error => {
+      console.warn('dsh-cc: 子代理转录读取失败', error)
+    }).finally(() => {
+      this.subagentReads.delete(taskId)
+      if (this.subagentReadAgain.delete(taskId)) this.refreshSubagentTranscript(taskId, parentToolUseId)
+    })
+    this.subagentReads.set(taskId, work)
+  }
+
+  /**
+   * Re-read one settled agent's sidechain a beat later. The child's final
+   * report is often flushed to the JSONL microseconds after the CLI fires the
+   * terminal frame — a read in the same tick strands it: the row is deleted,
+   * nothing ever refreshes again, and the Agent card's nested transcript ends
+   * at the last tool call with the result nobody can see. Two decaying reads
+   * (then nothing — the file is complete) close that race without keeping the
+   * task row alive.
+   * @param taskId - the settled agent's task id.
+   * @param parentToolUseId - the owning main-thread Agent/Task tool call.
+   */
+  private scheduleFinalSubagentRead(taskId: string, parentToolUseId: string): void {
+    for (const delay of [1_500, 4_000]) {
+      const timer = setTimeout(() => {
+        this.finalSubagentReads.delete(timer)
+        if (this.closed) return
+        this.refreshSubagentTranscript(taskId, parentToolUseId)
+      }, delay)
+      timer.unref?.()
+      this.finalSubagentReads.add(timer)
+    }
   }
 
   /**
@@ -1273,6 +1417,10 @@ export class SessionEngine {
       onUserDialog: this.onUserDialog,
       supportedDialogKinds: ['ask_user_question'],
       includePartialMessages: true,
+      // Forward the depth-1 subagent's prose/thinking as well as its tool
+      // blocks. We route those envelopes into the parent Agent card below;
+      // without this switch the SDK exposes only a flat heartbeat of tools.
+      forwardSubagentText: true,
       // Track file changes so the page can rewind tracked files to any user
       // message (rewindFiles below); without checkpoints there is nothing to
       // rewind to.
@@ -1322,6 +1470,12 @@ export class SessionEngine {
       return
     }
     switch (message.type) {
+      case 'tool_progress': {
+        if (message.parent_tool_use_id !== null) {
+          this.subagentToolOwners.set(message.tool_use_id, message.parent_tool_use_id)
+        }
+        return
+      }
       case 'stream_event': {
         this.onStreamEvent(message)
         return
@@ -1397,6 +1551,13 @@ export class SessionEngine {
         return
       }
       case 'assistant': {
+        const parentToolUseId = message.parent_tool_use_id
+        if (parentToolUseId !== null) {
+          // Child prose/thinking/tool_use are owned by the native sidechain
+          // reader (refreshSubagentTranscript); publishing the foreground
+          // window's envelopes too would render every block twice.
+          return
+        }
         const outcome = {
           ...(message.error !== undefined ? { error: message.error } : {}),
           ...(message.aborted === true ? { aborted: true } : {}),
@@ -1420,6 +1581,7 @@ export class SessionEngine {
           } else if (block.type === 'thinking' && block.thinking.trim().length > 0) {
             this.publish({ kind: 'thinking', text: block.thinking })
           } else if (block.type === 'tool_use') {
+            this.recordSubagentModelAlias(block.id, block.name, block.input)
             this.publish({ kind: 'tool_use', toolUseId: block.id, name: block.name, input: block.input })
           }
         }
@@ -1444,6 +1606,20 @@ export class SessionEngine {
         if ('isReplay' in message) return
         const content = message.message.content
         const blocks = typeof content === 'string' ? [{ type: 'text' as const, text: content }] : content
+        const parentToolUseId = message.parent_tool_use_id
+        // Child tool results and inter-agent notes belong under the Agent card
+        // and must not mutate the main turn's command/stream classification.
+        if (parentToolUseId !== null) {
+          // Inter-agent text (the child's prompt, the user's follow-up note)
+          // nests here; the child's own tool results are owned by the native
+          // sidechain reader and would arrive twice if forwarded too.
+          for (const block of blocks) {
+            if (block.type === 'text' && block.text.trim() !== '') {
+              this.publishSubagent(parentToolUseId, { kind: 'user', text: block.text })
+            }
+          }
+          return
+        }
         // The non-replay user echo refines the turn state seeded at send: a
         // command turn announces itself either way the CLI echoes it — the
         // raw `/cmd` text or the expanded `<command-name>` marker XML. A
@@ -1465,6 +1641,21 @@ export class SessionEngine {
               text,
               isError: block.is_error === true && !isAnswer,
             })
+          } else if (block.type === 'text' && block.text.includes('<task-notification>')) {
+            // A backgrounded subagent's final report reaches the main thread
+            // only inside this control message. Surface it as the Agent call's
+            // result — the page's projection replaces the internal "launched"
+            // acknowledgement with the last result for the same tool-use id —
+            // and never let the control text itself render as prose.
+            const note = parseTaskNotification(block.text)
+            if (note?.toolUseId !== undefined) {
+              this.publish({
+                kind: 'tool_result',
+                toolUseId: note.toolUseId,
+                text: note.result ?? note.summary ?? '',
+                isError: note.status !== undefined && note.status !== 'completed',
+              })
+            }
           }
         }
         return
@@ -1522,21 +1713,66 @@ export class SessionEngine {
   private onTaskMessage(message: Extract<SDKMessage, { type: 'system' }>): void {
     switch (message.subtype) {
       case 'task_started': {
+        // Bash/monitor tasks started by a child belong inside that child's
+        // transcript, never as peer rows in the main session task rail. The
+        // stream watcher usually registers the child's tool_use before it
+        // executes; when it has not (the common backgrounded case), any task
+        // starting while a depth-1 agent is running is treated as the child's.
+        // A main-thread background command concurrent with a live subagent is
+        // therefore hidden from the rail — its transcript Bash card still shows
+        // it, and the alternative is the child's tools polluting the rail on
+        // every backgrounded delegation.
+        const owner = message.tool_use_id === undefined ? undefined : this.subagentToolOwners.get(message.tool_use_id)
+        if (owner !== undefined) {
+          const agent = [...this.taskTable.values()].find(row => row.toolUseId === owner)
+          if (agent !== undefined) this.refreshSubagentTranscript(agent.id, owner)
+          return
+        }
+        const runningAgents = [...this.taskTable.values()].filter(row =>
+          (row.type === 'subagent' || row.subagentType !== undefined)
+          && row.status === 'running'
+          && row.toolUseId !== undefined)
+        if (runningAgents.length > 0) {
+          for (const agent of runningAgents) this.refreshSubagentTranscript(agent.id, agent.toolUseId as string)
+          return
+        }
         const previous = this.taskTable.get(message.task_id)
+        const type = message.task_type ?? (message.subagent_type !== undefined ? 'subagent' : 'task')
         this.taskTable.set(message.task_id, {
           id: message.task_id,
-          type: message.task_type ?? (message.subagent_type !== undefined ? 'subagent' : 'task'),
+          type,
           status: 'running',
           description: message.description,
           ...(message.tool_use_id !== undefined ? { toolUseId: message.tool_use_id } : {}),
           ...(message.subagent_type !== undefined ? { subagentType: message.subagent_type } : {}),
+          ...(message.tool_use_id !== undefined && this.subagentModelByTool.get(message.tool_use_id) !== undefined
+            ? { model: this.subagentModelByTool.get(message.tool_use_id) }
+            : {}),
           ...(message.prompt !== undefined ? { prompt: message.prompt } : {}),
           tokens: previous?.tokens ?? 0,
           toolUses: previous?.toolUses ?? 0,
           durationMs: previous?.durationMs ?? 0,
           ...(previous?.summary !== undefined ? { summary: previous.summary } : {}),
-          ...(previous?.isBackgrounded !== undefined ? { isBackgrounded: previous.isBackgrounded } : {}),
+          ...(previous?.isBackgrounded !== undefined
+            ? { isBackgrounded: previous.isBackgrounded }
+            : (type === 'subagent' || message.subagent_type !== undefined ? { isBackgrounded: true } : {})),
         })
+        // A foreground Agent tool blocks its parent call. This UI's task rail is
+        // explicitly a background-work affordance, so depth-1 subagents are
+        // detached as soon as the CLI gives us their originating tool id. The
+        // same edge arms the native sidechain reader.
+        if ((type === 'subagent' || message.subagent_type !== undefined) && message.tool_use_id !== undefined) {
+          this.refreshSubagentTranscript(message.task_id, message.tool_use_id)
+          void this.backgroundTask(message.tool_use_id).then(backgrounded => {
+            if (!backgrounded) return
+            const row = this.taskTable.get(message.task_id)
+            if (row === undefined) return
+            this.taskTable.set(message.task_id, { ...row, isBackgrounded: true })
+            this.publishTasks()
+          }).catch(error => {
+            console.warn('dsh-cc: 子代理自动转后台失败', error)
+          })
+        }
         break
       }
       case 'task_progress': {
@@ -1552,46 +1788,51 @@ export class SessionEngine {
           ...(message.subagent_type !== undefined ? { subagentType: message.subagent_type } : {}),
           ...(message.summary !== undefined ? { summary: message.summary } : {}),
         })
+        if (row.toolUseId !== undefined && (row.type === 'subagent' || row.subagentType !== undefined)) {
+          this.refreshSubagentTranscript(row.id, row.toolUseId)
+        }
         break
       }
       case 'task_updated': {
         const row = this.taskTable.get(message.task_id)
         if (row === undefined) break
         const patch = message.patch
-        this.taskTable.set(message.task_id, {
-          ...row,
-          ...(patch.status !== undefined ? { status: patch.status === 'pending' ? 'running' : patch.status } : {}),
-          ...(patch.description !== undefined ? { description: patch.description } : {}),
-          ...(patch.error !== undefined ? { error: patch.error } : {}),
-          ...(patch.is_backgrounded !== undefined ? { isBackgrounded: patch.is_backgrounded } : {}),
-        })
+        const status = patch.status === 'pending' ? 'running' : patch.status
+        if (status !== undefined && TERMINAL_TASK_STATUSES.includes(status as (typeof TERMINAL_TASK_STATUSES)[number])) {
+          if (row.toolUseId !== undefined && (row.type === 'subagent' || row.subagentType !== undefined)) {
+            this.refreshSubagentTranscript(row.id, row.toolUseId)
+            this.scheduleFinalSubagentRead(row.id, row.toolUseId)
+          }
+          this.taskTable.delete(message.task_id)
+        } else {
+          this.taskTable.set(message.task_id, {
+            ...row,
+            ...(status !== undefined ? { status } : {}),
+            ...(patch.description !== undefined ? { description: patch.description } : {}),
+            ...(patch.error !== undefined ? { error: patch.error } : {}),
+            ...(patch.is_backgrounded !== undefined ? { isBackgrounded: patch.is_backgrounded } : {}),
+          })
+        }
         break
       }
       case 'task_notification': {
+        // Terminal work no longer needs stop/background controls. Its complete
+        // nested transcript remains durably attached to the Agent tool card.
         const row = this.taskTable.get(message.task_id)
-        this.taskTable.set(message.task_id, {
-          id: message.task_id,
-          type: row?.type ?? 'task',
-          status: message.status,
-          description: row?.description ?? message.summary,
-          ...(row?.toolUseId !== undefined || message.tool_use_id !== undefined
-            ? { toolUseId: row?.toolUseId ?? message.tool_use_id }
-            : {}),
-          ...(row?.subagentType !== undefined ? { subagentType: row.subagentType } : {}),
-          ...(row?.prompt !== undefined ? { prompt: row.prompt } : {}),
-          tokens: message.usage?.total_tokens ?? row?.tokens ?? 0,
-          toolUses: message.usage?.tool_uses ?? row?.toolUses ?? 0,
-          durationMs: message.usage?.duration_ms ?? row?.durationMs ?? 0,
-          ...(row?.lastToolName !== undefined ? { lastToolName: row.lastToolName } : {}),
-          summary: message.summary,
-          ...(row?.isBackgrounded !== undefined ? { isBackgrounded: row.isBackgrounded } : {}),
-        })
+        const owner = row?.toolUseId ?? message.tool_use_id
+        if (owner !== undefined && (row === undefined || row.type === 'subagent' || row.subagentType !== undefined)) {
+          this.refreshSubagentTranscript(message.task_id, owner)
+          this.scheduleFinalSubagentRead(message.task_id, owner)
+        }
+        this.taskTable.delete(message.task_id)
         break
       }
       case 'background_tasks_changed': {
         // Level signal: reconcile membership only. Rows are never created
         // here — a level for a task whose start frame was missed would
-        // otherwise render a nameless ghost.
+        // otherwise render a nameless ghost. The level can transiently omit
+        // a parent while one of its own blocking tools runs, so completion is
+        // still removed only by the terminal edge/update above.
         for (const task of message.tasks) {
           const row = this.taskTable.get(task.task_id)
           if (row === undefined) continue
@@ -1610,13 +1851,34 @@ export class SessionEngine {
   }
 
   /**
-   * Publish one partial-message event as a StreamDelta. A subagent's turn
-   * (parent_tool_use_id is set) is dropped: the page renders one stream, and
-   * the subagent's output arrives with its Task tool result.
+   * Watch one depth-1 subagent's partial stream for tool openings only. The
+   * child's rendered content is owned by the native sidechain reader; this
+   * registration just lets a nested Bash's own task_started be recognized (and
+   * hidden from the main rail) before any JSONL line has landed.
+   * @param parentToolUseId - the owning main-thread Agent/Task tool call.
+   * @param event - one Messages API stream event from the child.
+   */
+  private onSubagentStreamEvent(
+    parentToolUseId: string,
+    event: SDKPartialAssistantMessage['event'],
+  ): void {
+    if (event.type !== 'content_block_start') return
+    const block = event.content_block
+    if (block.type === 'tool_use' || block.type === 'server_tool_use' || block.type === 'mcp_tool_use') {
+      this.subagentToolOwners.set(block.id, parentToolUseId)
+    }
+  }
+
+  /**
+   * Publish one partial-message event. Main-thread deltas feed the live turn;
+   * child deltas commit beneath their Agent card through the fold above.
    * @param message - the partial-message envelope from the SDK.
    */
   private onStreamEvent(message: SDKPartialAssistantMessage): void {
-    if (message.parent_tool_use_id !== null) return
+    if (message.parent_tool_use_id !== null) {
+      this.onSubagentStreamEvent(message.parent_tool_use_id, message.event)
+      return
+    }
     const event = message.event
     switch (event.type) {
       case 'message_start': {

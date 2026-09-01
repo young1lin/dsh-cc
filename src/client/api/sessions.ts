@@ -136,6 +136,20 @@ export function setSessionEnv(id: string, env: Record<string, string>): Promise<
 }
 
 /**
+ * Continue a running subagent through its detail composer.
+ * @param sessionId - the owning session.
+ * @param taskId - the live CLI task id.
+ * @param text - the user's text to forward.
+ * @returns the acknowledgement.
+ */
+export function sendTaskMessage(sessionId: string, taskId: string, text: string): Promise<{ ok: boolean }> {
+  return api<{ ok: boolean }>(`/sessions/${sessionId}/tasks/${taskId}/messages`, {
+    method: 'POST',
+    body: JSON.stringify({ text }),
+  })
+}
+
+/**
  * POST /sessions/:id/fork — copy the session into a new native session, up to
  * an optional message, and switch to it.
  * @param id - session id.

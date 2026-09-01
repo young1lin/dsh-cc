@@ -281,6 +281,8 @@ type Item =
     id: string
     call?: Extract<CcEvent, { kind: 'tool_use' }>
     result?: Extract<CcEvent, { kind: 'tool_result' }>
+    /** Depth-1 child events owned by this Agent/Task call. */
+    subagentEvents: Extract<CcEvent, { kind: 'subagent' }>[]
   }
 
 /**
@@ -296,7 +298,7 @@ export function projectTranscript(events: CcEvent[]): Item[] {
   const byToolUseId = new Map<string, Extract<Item, { k: 'tool' }>>()
   for (const event of events) {
     if (event.kind === 'tool_use') {
-      const item: Extract<Item, { k: 'tool' }> = { k: 'tool', id: event.toolUseId, call: event }
+      const item: Extract<Item, { k: 'tool' }> = { k: 'tool', id: event.toolUseId, call: event, subagentEvents: [] }
       byToolUseId.set(event.toolUseId, item)
       items.push(item)
       continue
@@ -307,7 +309,14 @@ export function projectTranscript(events: CcEvent[]): Item[] {
         pending.result = event
         continue
       }
-      items.push({ k: 'tool', id: event.toolUseId, result: event })
+      items.push({ k: 'tool', id: event.toolUseId, result: event, subagentEvents: [] })
+      continue
+    }
+    if (event.kind === 'subagent') {
+      const parent = byToolUseId.get(event.parentToolUseId)
+      if (parent !== undefined) parent.subagentEvents.push(event)
+      // A truncated tail may omit the parent call. The child frame still must
+      // not leak into the main-thread transcript as a peer message.
       continue
     }
     items.push({ k: 'event', event })
@@ -345,6 +354,7 @@ export function toolSummary(name: string, input: unknown): string {
     case 'WebSearch':
       return pick('query')
     case 'Task':
+    case 'Agent':
       return pick('description')
     case 'TodoWrite':
       return Array.isArray(args.todos) ? `${args.todos.length} 项` : ''
@@ -646,7 +656,7 @@ function EventItem(props: {
  * @param props.cwd - the session working directory.
  * @returns the row element.
  */
-function ToolItem(props: { item: Extract<Item, { k: 'tool' }>; cwd: string | undefined }): ReactElement {
+function ToolItem(props: { item: Extract<Item, { k: 'tool' }>; cwd: string | undefined; settled: boolean }): ReactElement {
   const { call, result } = props.item
   const name = call?.name ?? '工具'
   return (
@@ -659,6 +669,8 @@ function ToolItem(props: { item: Extract<Item, { k: 'tool' }>; cwd: string | und
       result={result}
       summary={call === undefined ? '' : toolSummary(name, call.input)}
       cwd={props.cwd}
+      subagentEvents={props.item.subagentEvents}
+      settled={props.settled}
     />
   )
 }
@@ -687,6 +699,12 @@ export const Transcript = memo(function Transcript(props: {
   commands: readonly SlashCommand[]
   onRewind?: (event: Extract<CcEvent, { kind: 'user' }>) => void
   liveRef?: { readonly current: LiveTurnState | undefined }
+  /**
+   * Whether the session's turn is over. Calls without results settle to a
+   * neutral「无结果」 instead of spinning — a missing result after the turn
+   * is a record loss, not work still in flight.
+   */
+  settled?: boolean
 }): ReactElement {
   const items = useMemo(() => projectTranscript(props.events), [props.events])
   const cwd = useMemo(() => sessionCwd(props.events), [props.events])
@@ -705,7 +723,7 @@ export const Transcript = memo(function Transcript(props: {
   return (
     <>
       {items.map((item, index) => item.k === 'tool'
-        ? <ToolItem key={`tool:${item.id}`} item={item} cwd={cwd} />
+        ? <ToolItem key={`tool:${item.id}`} item={item} cwd={cwd} settled={props.settled === true} />
         : <EventItem
             key={`event:${item.event.seq}:${index}`}
             event={item.event}

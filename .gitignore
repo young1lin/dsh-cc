@@ -6,3 +6,6 @@ lib/
 docs-ref/
 replay-probe.txt
 .contract-probe/
+tests/integration/credentials.local.json
+__pycache__/
+*.pyc

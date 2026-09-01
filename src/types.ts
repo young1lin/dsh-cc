@@ -184,6 +184,26 @@ export interface SessionMeta {
   permissionMode?: PermissionModeValue | ''
   /** Model id of the most recent successful turn; the fallback when a chosen model fails. */
   lastGoodModel?: string
+  /**
+   * Last context-window reading, probed after a completed model response and
+   * persisted here so a cold session (page reopened days later, engine gone)
+   * still shows how full its context window was. Live readouts come from the
+   * running process; this is the fallback the status bar renders, labeled as
+   * a recorded value.
+   */
+  lastContext?: {
+    /** When the reading was probed (ISO timestamp). */
+    recordedAt: string
+    /** The CLI's context answer verbatim: totals, percentage, categories. */
+    context: {
+      totalTokens: number
+      maxTokens: number
+      percentage?: number
+      categories?: unknown
+      isAutoCompactEnabled?: boolean
+      autoCompactThreshold?: number
+    }
+  }
   createdAt: string
   updatedAt: string
   /** Native Claude Code session id, learned from the init message; the resume anchor. */
@@ -333,6 +353,17 @@ export interface ImageRef {
   bytes: number
 }
 
+/**
+ * One event produced inside a depth-1 subagent. These stay nested under the
+ * parent Agent/Task tool call instead of masquerading as main-thread output.
+ */
+export type SubagentEvent =
+  | { kind: 'user'; text: string }
+  | { kind: 'assistant'; text: string; error?: string; aborted?: boolean }
+  | { kind: 'thinking'; text: string }
+  | { kind: 'tool_use'; toolUseId: string; name: string; input: unknown }
+  | { kind: 'tool_result'; toolUseId: string; text: string; isError: boolean }
+
 /** One transcript entry: one JSONL line and one SSE event payload. */
 export type CcEvent =
   | {
@@ -352,6 +383,14 @@ export type CcEvent =
   | { kind: 'thinking'; seq: number; ts: string; text: string }
   | { kind: 'tool_use'; seq: number; ts: string; toolUseId: string; name: string; input: unknown }
   | { kind: 'tool_result'; seq: number; ts: string; toolUseId: string; text: string; isError: boolean }
+  | {
+    kind: 'subagent'
+    seq: number
+    ts: string
+    /** The main-thread Agent/Task tool call that owns this nested event. */
+    parentToolUseId: string
+    event: SubagentEvent
+  }
   | { kind: 'system'; seq: number; ts: string; subtype: string; data: Record<string, unknown> }
   /**
    * A compaction boundary the CLI wrote into the native transcript: the
@@ -638,6 +677,15 @@ export interface TaskRow {
   toolUseId?: string
   /** Subagent preset name, for `subagent` tasks. */
   subagentType?: string
+  /**
+   * The model this subagent runs on. Filled in two steps: the delegating
+   * Agent call's own `model` argument (an alias such as `haiku`, absent =
+   * inherit the parent's model) arrives with the row, and the native
+   * sidechain reader upgrades it to the CLI's resolved wire id (e.g.
+   * `glm-5.3-flash[1m]`) once the child writes its first response. Absent
+   * on the page = the session's current model.
+   */
+  model?: string
   /** Joins the transcript Task/Bash card. */
   prompt?: string
   tokens: number

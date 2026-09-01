@@ -45,7 +45,7 @@ function sidecarOnly(kind: string, subtype: string | undefined): boolean {
   // Local-command output and loop banners are display-only in the CLI — it
   // never writes them to its transcript — so the sidecar is their only
   // durable home.
-  if (kind === 'commandOutput' || kind === 'notice') return true
+  if (kind === 'commandOutput' || kind === 'notice' || kind === 'subagent') return true
   return kind === 'system' && subtype !== 'init'
 }
 
