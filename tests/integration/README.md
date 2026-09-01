@@ -8,9 +8,9 @@
 
 1. `pnpm build`（测试对着 lib/ 产物，改完源码必须先构建）
 2. Git for Windows（bash 用于启动实例；自动探测常见安装位置，特殊位置可在
-   `credentials.local.json` 加 `"gitBash"` 字段指定）
+   `.env` 加 `GIT_BASH` 指定）
 3. `pip install playwright` + `playwright install chromium`
-4. 复制 `credentials.example.json` 为 `credentials.local.json` 填入真实中转配置。
+4. 复制 `.env.example` 为 `.env` 填入真实中转配置。
    **该文件已 gitignore，密钥只留在本机。** 缺它时用例整体 SKIP，不会误报失败。
 
 ## 运行

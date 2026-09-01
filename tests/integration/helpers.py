@@ -1,7 +1,7 @@
 """集成回归公共设施：本地凭据、实验室实例生命周期、/cc/api 客户端、UI 公共步骤。
 
 设计约定（见本目录 README.md）：
-- 密钥只从 credentials.local.json（已 gitignore）读取，绝不写进仓库任何文件。
+- 密钥只从 .env（已 gitignore）读取，绝不写进仓库任何文件。
 - 实验实例固定 127.0.0.1:3081（scripts/lab-port.patch.yml 覆盖），DSH_HOME 指向
   .lab-home/ 隔离副本，与用户 3080 实例互不可见。
 - 停止实例时必须同时清掉监听 3081 的 node 孤儿进程：进程树层面的 terminate
@@ -30,14 +30,45 @@ HOST_HEADER = {'Host': f'127.0.0.1:{PORT}'}
 
 
 def load_credentials():
-    """读取本地凭据；缺失时抛 FileNotFoundError，由用例转为 SkipTest。"""
-    path = HERE / 'credentials.local.json'
+    """读取 .env（已 gitignore）为凭据字典；缺失时抛 FileNotFoundError，由用例转为 SkipTest。
+
+    纯标准库实现：KEY=VALUE 逐行解析，空行与 # 注释跳过，值两端引号剥掉。
+    返回键名映射回原 camelCase 字段，LabServer / resolve_git_bash 零改动。
+    """
+    path = HERE / '.env'
     if not path.exists():
         raise FileNotFoundError(
-            f'缺少 {path}。复制 credentials.example.json 为 credentials.local.json '
+            f'缺少 {path}。复制 .env.example 为 .env '
             '并填入真实中转配置（该文件已 gitignore，不会进仓库）。'
         )
-    return json.loads(path.read_text('utf-8'))
+    raw = {}
+    for line in path.read_text('utf-8').splitlines():
+        text = line.strip()
+        if not text or text.startswith('#') or '=' not in text:
+            continue
+        key, _, value = text.partition('=')
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key in ENV_KEYS:
+            raw[ENV_KEYS[key]] = value
+    missing = sorted(env for env, field in ENV_KEYS.items() if field not in raw and env != 'GIT_BASH')
+    if missing:
+        raise FileNotFoundError(f'.env 缺少必填键：{", ".join(missing)}')
+    return raw
+
+
+# .env 大写下划线键 → 凭据字典字段名；GIT_BASH 可选，其余由 LabServer 直接取用。
+ENV_KEYS = {
+    'BASE_URL': 'baseUrl',
+    'AUTH_TOKEN': 'authToken',
+    'API_TIMEOUT_MS': 'apiTimeoutMs',
+    'MODEL': 'model',
+    'SMALL_FAST_MODEL': 'smallFastModel',
+    'SONNET_MODEL': 'sonnetModel',
+    'OPUS_MODEL': 'opusModel',
+    'HAIKU_MODEL': 'haikuModel',
+    'GIT_BASH': 'gitBash',
+}
 
 
 def resolve_git_bash(creds):
@@ -61,8 +92,8 @@ def resolve_git_bash(creds):
         if candidate and 'git' in candidate.lower() and Path(candidate).exists():
             return candidate
     raise FileNotFoundError(
-        '未找到 Git Bash。安装 Git for Windows，或在 credentials.local.json 加 '
-        '"gitBash": "<bash.exe 路径>"。'
+        '未找到 Git Bash。安装 Git for Windows，或在 .env 加 '
+        'GIT_BASH=<bash.exe 路径>。'
     )
 
 

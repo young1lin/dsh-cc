@@ -2,7 +2,7 @@
 
 对应本次改动的四项需求，全部走真实 GLM 中转 + 真实 claude 子进程。
 前置：pnpm build 已产出最新 lib/；Git Bash、Python playwright 可用；
-tests/integration/credentials.local.json 已配置。
+tests/integration/.env 已配置。
 
 @module tests.integration.test_subagent_e2e
 """

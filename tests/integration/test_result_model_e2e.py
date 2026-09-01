@@ -8,7 +8,7 @@
   把 <result> 注回主线程——它必须成为 Agent 卡的结果（替换内部 launch ack），
   刷新页面后依然挂在卡上（回放路径）。
 
-前置：pnpm build 已产出最新 lib/；credentials.local.json 已配置。
+前置：pnpm build 已产出最新 lib/；.env 已配置。
 
 @module tests.integration.test_result_model_e2e
 """
